@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { auth } from "@/auth";
 import { parseYouTubeChannelId } from "@/app/lib/api-validation";
 import {
   ExternalServiceError,
@@ -11,14 +12,14 @@ import {
   youtubeAuthorizationRequiredResponse,
 } from "@/app/lib/api-security";
 
-export async function GET(req: Request) {
+export const GET = auth(async function GET(req) {
   try {
-    const userId = await requireApiUserId();
+    const userId = await requireApiUserId(req.auth);
     if (!userId) return unauthorizedResponse();
 
     const { searchParams } = new URL(req.url);
     const channelId = parseYouTubeChannelId(searchParams.get("channelId"));
-    const accessToken = await getServerOAuthAccessToken(req);
+    const accessToken = await getServerOAuthAccessToken(req, userId);
     if (!accessToken) return youtubeAuthorizationRequiredResponse();
 
     const url = new URL("https://www.googleapis.com/youtube/v3/search");
@@ -57,4 +58,4 @@ export async function GET(req: Request) {
 
     return handleApiError("youtube-my-channel-videos", error);
   }
-}
+});

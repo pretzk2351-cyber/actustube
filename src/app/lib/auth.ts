@@ -1,6 +1,11 @@
 import type { NextAuthConfig } from "next-auth";
 import Google from "next-auth/providers/google";
 
+import {
+  getValidGoogleToken,
+  storeInitialGoogleToken,
+} from "./google-oauth-token";
+
 const authConfig: NextAuthConfig = {
   providers: [
     Google({
@@ -8,6 +13,8 @@ const authConfig: NextAuthConfig = {
       clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? "",
       authorization: {
         params: {
+          access_type: "offline",
+          prompt: "consent",
           scope:
             "openid email profile https://www.googleapis.com/auth/youtube.readonly",
         },
@@ -23,11 +30,32 @@ const authConfig: NextAuthConfig = {
   callbacks: {
     async jwt({ token, account, profile }) {
       if (account) {
-        token.accessToken = account.access_token;
+        storeInitialGoogleToken(token, account);
 
         if (profile && "picture" in profile) {
           token.picture = profile.picture;
         }
+
+        return token;
+      }
+
+      const googleToken = await getValidGoogleToken(token);
+
+      if (googleToken.status === "success") {
+        token.accessToken = googleToken.accessToken;
+        token.accessTokenExpiresAt = googleToken.accessTokenExpiresAt;
+        token.refreshToken = googleToken.refreshToken ?? token.refreshToken;
+        token.googleTokenError = undefined;
+      } else {
+        token.accessToken = undefined;
+        token.googleTokenError =
+          googleToken.status === "reauthentication_required"
+            ? "ReauthenticationRequired"
+            : googleToken.status === "configuration_error"
+              ? "ConfigurationError"
+              : googleToken.timedOut
+                ? "RefreshTimeout"
+                : "RefreshAccessTokenError";
       }
 
       return token;

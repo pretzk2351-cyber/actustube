@@ -1,8 +1,10 @@
 import { auth } from "@/auth";
+import type { Session } from "next-auth";
 import { getToken } from "next-auth/jwt";
 import { NextResponse } from "next/server";
 
 import { RequestValidationError } from "./api-validation";
+import { getValidGoogleToken } from "./google-oauth-token";
 
 export const YOUTUBE_API_TIMEOUT_MS = 10_000;
 export const OPENAI_API_TIMEOUT_MS = 30_000;
@@ -28,9 +30,16 @@ export class ExternalServiceTimeoutError extends Error {
   }
 }
 
-export async function requireApiUserId() {
-  const session = await auth();
-  const userId = session?.user?.id;
+export class ServerConfigurationError extends Error {
+  constructor() {
+    super("The server is not configured for this operation.");
+    this.name = "ServerConfigurationError";
+  }
+}
+
+export async function requireApiUserId(session?: Session | null) {
+  const currentSession = session === undefined ? await auth() : session;
+  const userId = currentSession?.user?.id;
 
   if (typeof userId !== "string" || userId.length === 0 || userId.length > 255) {
     return null;
@@ -83,6 +92,10 @@ export function handleApiError(context: string, error: unknown) {
       { error: "The external service request failed." },
       { status: 502 }
     );
+  }
+
+  if (error instanceof ServerConfigurationError) {
+    return serverConfigurationErrorResponse();
   }
 
   return NextResponse.json(
@@ -160,9 +173,12 @@ function cookieHeaderContains(cookieHeader: string, cookieName: string) {
   });
 }
 
-export async function getServerOAuthAccessToken(request: Request) {
+export async function getServerOAuthAccessToken(
+  request: Request,
+  expectedUserId: string
+) {
   const secret = getAuthSecrets();
-  if (!secret) return null;
+  if (!secret) throw new ServerConfigurationError();
 
   const cookieHeader = request.headers.get("cookie") ?? "";
   const cookieNames = ["__Secure-authjs.session-token", "authjs.session-token"];
@@ -176,15 +192,17 @@ export async function getServerOAuthAccessToken(request: Request) {
       cookieName,
       salt: cookieName,
     });
-    const accessToken = token?.accessToken;
+    if (!token || token.sub !== expectedUserId) continue;
 
-    if (
-      typeof accessToken === "string" &&
-      accessToken.length > 0 &&
-      accessToken.length <= 8_192
-    ) {
-      return accessToken;
+    const googleToken = await getValidGoogleToken(token);
+
+    if (googleToken.status === "success") return googleToken.accessToken;
+    if (googleToken.status === "reauthentication_required") return null;
+    if (googleToken.status === "configuration_error") {
+      throw new ServerConfigurationError();
     }
+    if (googleToken.timedOut) throw new ExternalServiceTimeoutError();
+    throw new ExternalServiceError();
   }
 
   return null;

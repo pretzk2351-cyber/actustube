@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { auth } from "@/auth";
 import {
   ExternalServiceError,
   fetchJsonWithTimeout,
@@ -10,12 +11,12 @@ import {
   youtubeAuthorizationRequiredResponse,
 } from "@/app/lib/api-security";
 
-export async function GET(request: Request) {
+export const GET = auth(async function GET(request) {
   try {
-    const userId = await requireApiUserId();
+    const userId = await requireApiUserId(request.auth);
     if (!userId) return unauthorizedResponse();
 
-    const accessToken = await getServerOAuthAccessToken(request);
+    const accessToken = await getServerOAuthAccessToken(request, userId);
     if (!accessToken) return youtubeAuthorizationRequiredResponse();
 
     const data = await fetchJsonWithTimeout<any>(
@@ -47,4 +48,4 @@ export async function GET(request: Request) {
 
     return handleApiError("youtube-my-channels", error);
   }
-}
+});
