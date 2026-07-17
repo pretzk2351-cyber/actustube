@@ -1,5 +1,22 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
+
+import {
+  isValidYouTubeChannelId,
+  isValidYouTubeVideoId,
+  parseYouTubeChannelId,
+  parseYouTubeChannelUrl,
+  readJsonObject,
+  RequestValidationError,
+} from "@/app/lib/api-validation";
+import {
+  ExternalServiceError,
+  fetchJsonWithTimeout,
+  handleApiError,
+  OPENAI_API_TIMEOUT_MS,
+  requireApiUserId,
+  serverConfigurationErrorResponse,
+  unauthorizedResponse,
+} from "@/app/lib/api-security";
 
 type Video = {
   videoId: string;
@@ -17,31 +34,51 @@ function parseDuration(d: string) {
   return (Number(m?.[1] || 0) * 60) + Number(m?.[2] || 0);
 }
 
-function extractHandle(url: string) {
-  const match = url.match(/@([A-Za-z0-9._-]+)/);
-  return match ? match[1] : null;
-}
-
 async function getChannelId(handle: string, key: string) {
-  const res = await fetch(
-    `https://www.googleapis.com/youtube/v3/channels?part=id&forHandle=${handle}&key=${key}`
-  );
-  const data = await res.json();
-  return data.items?.[0]?.id;
+  const url = new URL("https://www.googleapis.com/youtube/v3/channels");
+  url.searchParams.set("part", "id");
+  url.searchParams.set("forHandle", handle);
+  url.searchParams.set("key", key);
+
+  const data = await fetchJsonWithTimeout<any>(url, { cache: "no-store" });
+  const channelId = data.items?.[0]?.id;
+
+  if (typeof channelId !== "string" || !isValidYouTubeChannelId(channelId)) {
+    throw new ExternalServiceError();
+  }
+
+  return channelId;
 }
 
 async function getVideos(channelId: string, key: string) {
-  const list = await fetch(
-    `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&maxResults=50&order=date&type=video&key=${key}`
-  ).then((r) => r.json());
+  const listUrl = new URL("https://www.googleapis.com/youtube/v3/search");
+  listUrl.searchParams.set("part", "snippet");
+  listUrl.searchParams.set("channelId", channelId);
+  listUrl.searchParams.set("maxResults", "50");
+  listUrl.searchParams.set("order", "date");
+  listUrl.searchParams.set("type", "video");
+  listUrl.searchParams.set("key", key);
 
-  const ids = list.items.map((i: any) => i.id.videoId).join(",");
+  const list = await fetchJsonWithTimeout<any>(listUrl, { cache: "no-store" });
+  const items = Array.isArray(list.items) ? list.items : [];
+  const ids = items
+    .map((item: any) => item.id?.videoId)
+    .filter(
+      (videoId: unknown): videoId is string =>
+        typeof videoId === "string" && isValidYouTubeVideoId(videoId)
+    );
 
-  const detail = await fetch(
-    `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,statistics&id=${ids}&key=${key}`
-  ).then((r) => r.json());
+  if (ids.length === 0) return [];
 
-  return detail.items.map((v: any) => ({
+  const detailUrl = new URL("https://www.googleapis.com/youtube/v3/videos");
+  detailUrl.searchParams.set("part", "snippet,contentDetails,statistics");
+  detailUrl.searchParams.set("id", ids.join(","));
+  detailUrl.searchParams.set("key", key);
+
+  const detail = await fetchJsonWithTimeout<any>(detailUrl, { cache: "no-store" });
+  const detailItems = Array.isArray(detail.items) ? detail.items : [];
+
+  return detailItems.map((v: any) => ({
     videoId: v.id,
     title: v.snippet.title,
     thumbnail: v.snippet.thumbnails.medium.url,
@@ -124,53 +161,69 @@ function buildPrompt(n: number, s: number) {
 `;
 }
 
-async function analyze(prompt: string) {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+async function analyze(prompt: string, apiKey: string) {
+  const data = await fetchJsonWithTimeout<any>(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        messages: [{ role: "user", content: prompt }],
+      }),
+      cache: "no-store",
     },
-    body: JSON.stringify({
-      model: "gpt-4.1-mini",
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
+    OPENAI_API_TIMEOUT_MS
+  );
 
-  const data = await res.json();
-  return data.choices[0].message.content;
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content !== "string" || content.length === 0) {
+    throw new ExternalServiceError();
+  }
+
+  return content;
 }
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const key = process.env.YOUTUBE_API_KEY!;
+    const userId = await requireApiUserId();
+    if (!userId) return unauthorizedResponse();
+
+    const body = await readJsonObject(req, 8 * 1024);
+    const youtubeApiKey = process.env.YOUTUBE_API_KEY;
+    const openaiApiKey = process.env.OPENAI_API_KEY;
+
+    if (!youtubeApiKey || !openaiApiKey) {
+      return serverConfigurationErrorResponse();
+    }
 
     let channelId = "";
 
     // ===== URLモード =====
     if (body.mode === "manual_url") {
-      const handle = extractHandle(body.url);
-      if (!handle) throw new Error("URL形式が不正");
-      channelId = await getChannelId(handle, key);
+      const identifier = parseYouTubeChannelUrl(body.url);
+      channelId =
+        identifier.type === "channelId"
+          ? identifier.value
+          : await getChannelId(identifier.value, youtubeApiKey);
+    } else if (body.mode === "my_channel") {
+      // The user identity always comes from the server session. Only the channel
+      // identifier is accepted from the request and is validated independently.
+      channelId = parseYouTubeChannelId(body.channelId);
+    } else {
+      throw new RequestValidationError("mode must be manual_url or my_channel.");
     }
 
-    // ===== ログインモード =====
-    if (body.mode === "my_channel") {
-      const session = await auth();
-      if (!session) throw new Error("ログイン必要");
-      channelId = body.channelId;
-    }
-
-    if (!channelId) throw new Error("チャンネル取得失敗");
-
-    const videos = await getVideos(channelId, key);
+    const videos = await getVideos(channelId, youtubeApiKey);
     const { normal, shorts } = split(videos);
 
     const nScore = score(normal);
     const sScore = score(shorts);
 
-    const report = await analyze(buildPrompt(nScore, sScore));
+    const report = await analyze(buildPrompt(nScore, sScore), openaiApiKey);
 
     return NextResponse.json({
       normal,
@@ -180,7 +233,7 @@ export async function POST(req: Request) {
       priority: buildPriority(nScore, sScore),
       report,
     });
-  } catch (e: any) {
-    return NextResponse.json({ error: e.message });
+  } catch (error) {
+    return handleApiError("analyze", error);
   }
 }

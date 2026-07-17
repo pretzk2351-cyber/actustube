@@ -1,20 +1,24 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
 
-export async function GET() {
+import {
+  ExternalServiceError,
+  fetchJsonWithTimeout,
+  getServerOAuthAccessToken,
+  handleApiError,
+  requireApiUserId,
+  unauthorizedResponse,
+  youtubeAuthorizationRequiredResponse,
+} from "@/app/lib/api-security";
+
+export async function GET(request: Request) {
   try {
-    const session = await auth();
+    const userId = await requireApiUserId();
+    if (!userId) return unauthorizedResponse();
 
-    if (!session || !(session as any).accessToken) {
-      return NextResponse.json(
-        { error: "ログイン情報がありません" },
-        { status: 401 }
-      );
-    }
+    const accessToken = await getServerOAuthAccessToken(request);
+    if (!accessToken) return youtubeAuthorizationRequiredResponse();
 
-    const accessToken = (session as any).accessToken;
-
-    const res = await fetch(
+    const data = await fetchJsonWithTimeout<any>(
       "https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true",
       {
         headers: {
@@ -23,18 +27,6 @@ export async function GET() {
         cache: "no-store",
       }
     );
-
-    const data = await res.json();
-
-    if (!res.ok) {
-      return NextResponse.json(
-        {
-          error: "YouTubeチャンネル取得に失敗しました",
-          detail: data,
-        },
-        { status: 500 }
-      );
-    }
 
     const channels =
       data.items?.map((item: any) => ({
@@ -49,11 +41,10 @@ export async function GET() {
 
     return NextResponse.json({ channels });
   } catch (error) {
-    console.error("my-channels route error:", error);
+    if (error instanceof ExternalServiceError && error.isAuthorizationError) {
+      return youtubeAuthorizationRequiredResponse();
+    }
 
-    return NextResponse.json(
-      { error: "サーバーエラーが発生しました" },
-      { status: 500 }
-    );
+    return handleApiError("youtube-my-channels", error);
   }
 }

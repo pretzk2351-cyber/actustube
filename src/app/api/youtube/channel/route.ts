@@ -1,37 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 
+import {
+  isValidYouTubeChannelId,
+  isValidYouTubeVideoId,
+  parseYouTubeChannelUrl,
+} from "@/app/lib/api-validation";
+import {
+  ExternalServiceError,
+  fetchJsonWithTimeout,
+  handleApiError,
+  requireApiUserId,
+  serverConfigurationErrorResponse,
+  unauthorizedResponse,
+} from "@/app/lib/api-security";
+
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-
-type ChannelIdentifier =
-  | { type: "channelId"; value: string }
-  | { type: "handle"; value: string };
-
-function extractChannelIdentifier(input: string): ChannelIdentifier | null {
-  try {
-    const url = new URL(input);
-
-    if (
-      !url.hostname.includes("youtube.com") &&
-      !url.hostname.includes("youtu.be")
-    ) {
-      return null;
-    }
-
-    const parts = url.pathname.split("/").filter(Boolean);
-
-    if (parts[0] === "channel" && parts[1]) {
-      return { type: "channelId", value: parts[1] };
-    }
-
-    if (parts[0] && parts[0].startsWith("@")) {
-      return { type: "handle", value: parts[0] };
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
+const SERVER_PLAN = "free" as const;
+const PER_TYPE_LIMIT = 10;
+const FETCH_POOL_SIZE = 50;
 
 function parseISODurationToSeconds(duration: string) {
   const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
@@ -45,22 +31,8 @@ function parseISODurationToSeconds(duration: string) {
   return hours * 3600 + minutes * 60 + seconds;
 }
 
-async function safeJsonFetch(url: string) {
-  const res = await fetch(url, { cache: "no-store" });
-  const text = await res.text();
-
-  let data: any;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error("YouTube API がJSONを返しませんでした");
-  }
-
-  if (!res.ok) {
-    throw new Error(data?.error?.message || "YouTube API エラー");
-  }
-
-  return data;
+async function safeJsonFetch(url: URL) {
+  return fetchJsonWithTimeout<any>(url, { cache: "no-store" });
 }
 
 async function getChannelIdFromHandle(handle: string) {
@@ -69,11 +41,11 @@ async function getChannelIdFromHandle(handle: string) {
   url.searchParams.set("forHandle", handle.replace("@", ""));
   url.searchParams.set("key", YOUTUBE_API_KEY!);
 
-  const data = await safeJsonFetch(url.toString());
+  const data = await safeJsonFetch(url);
   const item = data.items?.[0];
 
-  if (!item?.id) {
-    throw new Error("ハンドルからチャンネルを特定できませんでした");
+  if (!item?.id || !isValidYouTubeChannelId(item.id)) {
+    throw new ExternalServiceError();
   }
 
   return item.id as string;
@@ -85,15 +57,23 @@ async function getChannelInfo(channelId: string) {
   url.searchParams.set("id", channelId);
   url.searchParams.set("key", YOUTUBE_API_KEY!);
 
-  const data = await safeJsonFetch(url.toString());
+  const data = await safeJsonFetch(url);
   const item = data.items?.[0];
 
   if (!item) {
-    throw new Error("チャンネルが見つかりませんでした");
+    throw new ExternalServiceError();
+  }
+
+  const uploadsPlaylistId = item.contentDetails?.relatedPlaylists?.uploads;
+  if (
+    typeof uploadsPlaylistId !== "string" ||
+    !/^[A-Za-z0-9_-]{1,64}$/.test(uploadsPlaylistId)
+  ) {
+    throw new ExternalServiceError();
   }
 
   return {
-    uploadsPlaylistId: item.contentDetails?.relatedPlaylists?.uploads ?? "",
+    uploadsPlaylistId,
     channelTitle: item.snippet?.title ?? "",
     channelDescription: item.snippet?.description ?? "",
     subscriberCount: item.statistics?.subscriberCount ?? "0",
@@ -105,8 +85,11 @@ async function getChannelInfo(channelId: string) {
 async function getUploadVideoIds(playlistId: string, limit: number) {
   let nextPageToken = "";
   const ids: string[] = [];
+  const maxPages = Math.ceil(limit / 50) + 1;
+  let pageCount = 0;
 
-  while (ids.length < limit) {
+  while (ids.length < limit && pageCount < maxPages) {
+    pageCount += 1;
     const playlistUrl = new URL(
       "https://www.googleapis.com/youtube/v3/playlistItems"
     );
@@ -119,16 +102,22 @@ async function getUploadVideoIds(playlistId: string, limit: number) {
       playlistUrl.searchParams.set("pageToken", nextPageToken);
     }
 
-    const data = await safeJsonFetch(playlistUrl.toString());
+    const data = await safeJsonFetch(playlistUrl);
     const items = data.items ?? [];
 
     ids.push(
       ...items
         .map((item: any) => item.contentDetails?.videoId)
-        .filter(Boolean)
+        .filter(
+          (videoId: unknown): videoId is string =>
+            typeof videoId === "string" && isValidYouTubeVideoId(videoId)
+        )
     );
 
-    nextPageToken = data.nextPageToken ?? "";
+    nextPageToken =
+      typeof data.nextPageToken === "string" && data.nextPageToken.length <= 512
+        ? data.nextPageToken
+        : "";
 
     if (!nextPageToken) break;
   }
@@ -152,7 +141,7 @@ async function getVideos(videoIds: string[]) {
     videosUrl.searchParams.set("id", chunk.join(","));
     videosUrl.searchParams.set("key", YOUTUBE_API_KEY!);
 
-    const data = await safeJsonFetch(videosUrl.toString());
+    const data = await safeJsonFetch(videosUrl);
     allVideos.push(...(data.items ?? []));
   }
 
@@ -178,42 +167,20 @@ async function getVideos(videoIds: string[]) {
 
 export async function GET(request: NextRequest) {
   try {
-    if (!YOUTUBE_API_KEY) {
-      return NextResponse.json(
-        { error: "YOUTUBE_API_KEY が設定されていません" },
-        { status: 500 }
-      );
-    }
+    const userId = await requireApiUserId();
+    if (!userId) return unauthorizedResponse();
 
     const input = request.nextUrl.searchParams.get("url");
-    const plan = request.nextUrl.searchParams.get("plan") ?? "free";
+    const parsed = parseYouTubeChannelUrl(input);
 
-    if (!input) {
-      return NextResponse.json(
-        { error: "チャンネルURLを指定してください" },
-        { status: 400 }
-      );
+    if (!YOUTUBE_API_KEY) {
+      return serverConfigurationErrorResponse();
     }
-
-    const parsed = extractChannelIdentifier(input);
-
-    if (!parsed) {
-      return NextResponse.json(
-        {
-          error:
-            "対応している形式は https://www.youtube.com/@handle または /channel/xxxx です",
-        },
-        { status: 400 }
-      );
-    }
-
-    const perTypeLimit = plan === "standard" ? 50 : 10;
-    const fetchPoolSize = plan === "standard" ? 120 : 50;
 
     const channelId =
       parsed.type === "channelId"
         ? parsed.value
-        : await getChannelIdFromHandle(parsed.value);
+        : await getChannelIdFromHandle(`@${parsed.value}`);
 
     const {
       uploadsPlaylistId,
@@ -226,7 +193,7 @@ export async function GET(request: NextRequest) {
 
     const uploadVideoIds = await getUploadVideoIds(
       uploadsPlaylistId,
-      fetchPoolSize
+      FETCH_POOL_SIZE
     );
     const allVideos = await getVideos(uploadVideoIds);
 
@@ -237,14 +204,14 @@ export async function GET(request: NextRequest) {
 
     const regularVideos = sortedByDate
       .filter((video) => !video.isShort)
-      .slice(0, perTypeLimit);
+      .slice(0, PER_TYPE_LIMIT);
 
     const shortVideos = sortedByDate
       .filter((video) => video.isShort)
-      .slice(0, perTypeLimit);
+      .slice(0, PER_TYPE_LIMIT);
 
     return NextResponse.json({
-      plan,
+      plan: SERVER_PLAN,
       channelId,
       channelTitle,
       channelDescription,
@@ -255,9 +222,6 @@ export async function GET(request: NextRequest) {
       shortVideos,
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "不明なエラーが発生しました";
-
-    return NextResponse.json({ error: message }, { status: 500 });
+    return handleApiError("youtube-channel", error);
   }
 }

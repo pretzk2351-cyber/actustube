@@ -1,31 +1,35 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
+
+import { parseYouTubeChannelId } from "@/app/lib/api-validation";
+import {
+  ExternalServiceError,
+  fetchJsonWithTimeout,
+  getServerOAuthAccessToken,
+  handleApiError,
+  requireApiUserId,
+  unauthorizedResponse,
+  youtubeAuthorizationRequiredResponse,
+} from "@/app/lib/api-security";
 
 export async function GET(req: Request) {
   try {
+    const userId = await requireApiUserId();
+    if (!userId) return unauthorizedResponse();
+
     const { searchParams } = new URL(req.url);
-    const channelId = searchParams.get("channelId");
+    const channelId = parseYouTubeChannelId(searchParams.get("channelId"));
+    const accessToken = await getServerOAuthAccessToken(req);
+    if (!accessToken) return youtubeAuthorizationRequiredResponse();
 
-    if (!channelId) {
-      return NextResponse.json(
-        { error: "channelIdがありません" },
-        { status: 400 }
-      );
-    }
+    const url = new URL("https://www.googleapis.com/youtube/v3/search");
+    url.searchParams.set("part", "snippet");
+    url.searchParams.set("channelId", channelId);
+    url.searchParams.set("maxResults", "10");
+    url.searchParams.set("order", "date");
+    url.searchParams.set("type", "video");
 
-    const session = await auth();
-
-    if (!session || !(session as any).accessToken) {
-      return NextResponse.json(
-        { error: "ログインが必要です" },
-        { status: 401 }
-      );
-    }
-
-    const accessToken = (session as any).accessToken;
-
-    const res = await fetch(
-      `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&maxResults=10&order=date&type=video`,
+    const data = await fetchJsonWithTimeout<any>(
+      url,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -33,18 +37,6 @@ export async function GET(req: Request) {
         cache: "no-store",
       }
     );
-
-    const data = await res.json();
-
-    if (!res.ok) {
-      return NextResponse.json(
-        {
-          error: "動画取得に失敗しました",
-          detail: data,
-        },
-        { status: 500 }
-      );
-    }
 
     const videos =
       data.items?.map((item: any) => ({
@@ -59,11 +51,10 @@ export async function GET(req: Request) {
 
     return NextResponse.json({ videos });
   } catch (error) {
-    console.error("videos route error:", error);
+    if (error instanceof ExternalServiceError && error.isAuthorizationError) {
+      return youtubeAuthorizationRequiredResponse();
+    }
 
-    return NextResponse.json(
-      { error: "サーバーエラーが発生しました" },
-      { status: 500 }
-    );
+    return handleApiError("youtube-my-channel-videos", error);
   }
 }
