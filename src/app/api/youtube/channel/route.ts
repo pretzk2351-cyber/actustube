@@ -19,6 +19,42 @@ const SERVER_PLAN = "free" as const;
 const PER_TYPE_LIMIT = 10;
 const FETCH_POOL_SIZE = 50;
 
+type YouTubeChannelListResponse = {
+  items?: Array<{
+    id?: string;
+    contentDetails?: { relatedPlaylists?: { uploads?: unknown } };
+    snippet?: { title?: string; description?: string };
+    statistics?: {
+      subscriberCount?: string;
+      videoCount?: string;
+      viewCount?: string;
+    };
+  }>;
+};
+
+type YouTubePlaylistItemsResponse = {
+  items?: Array<{ contentDetails?: { videoId?: unknown } }>;
+  nextPageToken?: unknown;
+};
+
+type YouTubeVideoItem = {
+  id?: string;
+  snippet?: {
+    title?: string;
+    publishedAt?: string;
+    thumbnails?: {
+      medium?: { url?: string };
+      default?: { url?: string };
+    };
+  };
+  statistics?: { viewCount?: string };
+  contentDetails?: { duration?: string };
+};
+
+type YouTubeVideoListResponse = {
+  items?: YouTubeVideoItem[];
+};
+
 function parseISODurationToSeconds(duration: string) {
   const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
 
@@ -31,8 +67,8 @@ function parseISODurationToSeconds(duration: string) {
   return hours * 3600 + minutes * 60 + seconds;
 }
 
-async function safeJsonFetch(url: URL) {
-  return fetchJsonWithTimeout<any>(url, { cache: "no-store" });
+async function safeJsonFetch<T>(url: URL) {
+  return fetchJsonWithTimeout<T>(url, { cache: "no-store" });
 }
 
 async function getChannelIdFromHandle(handle: string) {
@@ -41,14 +77,14 @@ async function getChannelIdFromHandle(handle: string) {
   url.searchParams.set("forHandle", handle.replace("@", ""));
   url.searchParams.set("key", YOUTUBE_API_KEY!);
 
-  const data = await safeJsonFetch(url);
+  const data = await safeJsonFetch<YouTubeChannelListResponse>(url);
   const item = data.items?.[0];
 
   if (!item?.id || !isValidYouTubeChannelId(item.id)) {
     throw new ExternalServiceError();
   }
 
-  return item.id as string;
+  return item.id;
 }
 
 async function getChannelInfo(channelId: string) {
@@ -57,7 +93,7 @@ async function getChannelInfo(channelId: string) {
   url.searchParams.set("id", channelId);
   url.searchParams.set("key", YOUTUBE_API_KEY!);
 
-  const data = await safeJsonFetch(url);
+  const data = await safeJsonFetch<YouTubeChannelListResponse>(url);
   const item = data.items?.[0];
 
   if (!item) {
@@ -102,12 +138,12 @@ async function getUploadVideoIds(playlistId: string, limit: number) {
       playlistUrl.searchParams.set("pageToken", nextPageToken);
     }
 
-    const data = await safeJsonFetch(playlistUrl);
+    const data = await safeJsonFetch<YouTubePlaylistItemsResponse>(playlistUrl);
     const items = data.items ?? [];
 
     ids.push(
       ...items
-        .map((item: any) => item.contentDetails?.videoId)
+        .map((item) => item.contentDetails?.videoId)
         .filter(
           (videoId: unknown): videoId is string =>
             typeof videoId === "string" && isValidYouTubeVideoId(videoId)
@@ -133,7 +169,7 @@ async function getVideos(videoIds: string[]) {
     chunks.push(videoIds.slice(i, i + 50));
   }
 
-  const allVideos: any[] = [];
+  const allVideos: YouTubeVideoItem[] = [];
 
   for (const chunk of chunks) {
     const videosUrl = new URL("https://www.googleapis.com/youtube/v3/videos");
@@ -141,11 +177,11 @@ async function getVideos(videoIds: string[]) {
     videosUrl.searchParams.set("id", chunk.join(","));
     videosUrl.searchParams.set("key", YOUTUBE_API_KEY!);
 
-    const data = await safeJsonFetch(videosUrl);
+    const data = await safeJsonFetch<YouTubeVideoListResponse>(videosUrl);
     allVideos.push(...(data.items ?? []));
   }
 
-  return allVideos.map((video: any) => {
+  return allVideos.map((video) => {
     const duration = video.contentDetails?.duration ?? "PT0S";
     const seconds = parseISODurationToSeconds(duration);
 

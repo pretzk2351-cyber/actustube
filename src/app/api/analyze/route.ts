@@ -29,6 +29,35 @@ type Video = {
   comment: number;
 };
 
+type YouTubeChannelListResponse = {
+  items?: Array<{ id?: unknown }>;
+};
+
+type YouTubeSearchResponse = {
+  items?: Array<{ id?: { videoId?: unknown } }>;
+};
+
+type YouTubeVideoListResponse = {
+  items?: Array<{
+    id: string;
+    snippet: {
+      title: string;
+      thumbnails: { medium: { url: string } };
+      publishedAt: string;
+    };
+    contentDetails: { duration: string };
+    statistics: {
+      viewCount?: string;
+      likeCount?: string;
+      commentCount?: string;
+    };
+  }>;
+};
+
+type OpenAIChatCompletionResponse = {
+  choices?: Array<{ message?: { content?: unknown } }>;
+};
+
 function parseDuration(d: string) {
   const m = d.match(/PT(?:(\d+)M)?(?:(\d+)S)?/);
   return (Number(m?.[1] || 0) * 60) + Number(m?.[2] || 0);
@@ -40,7 +69,9 @@ async function getChannelId(handle: string, key: string) {
   url.searchParams.set("forHandle", handle);
   url.searchParams.set("key", key);
 
-  const data = await fetchJsonWithTimeout<any>(url, { cache: "no-store" });
+  const data = await fetchJsonWithTimeout<YouTubeChannelListResponse>(url, {
+    cache: "no-store",
+  });
   const channelId = data.items?.[0]?.id;
 
   if (typeof channelId !== "string" || !isValidYouTubeChannelId(channelId)) {
@@ -59,10 +90,12 @@ async function getVideos(channelId: string, key: string) {
   listUrl.searchParams.set("type", "video");
   listUrl.searchParams.set("key", key);
 
-  const list = await fetchJsonWithTimeout<any>(listUrl, { cache: "no-store" });
+  const list = await fetchJsonWithTimeout<YouTubeSearchResponse>(listUrl, {
+    cache: "no-store",
+  });
   const items = Array.isArray(list.items) ? list.items : [];
   const ids = items
-    .map((item: any) => item.id?.videoId)
+    .map((item) => item.id?.videoId)
     .filter(
       (videoId: unknown): videoId is string =>
         typeof videoId === "string" && isValidYouTubeVideoId(videoId)
@@ -75,10 +108,12 @@ async function getVideos(channelId: string, key: string) {
   detailUrl.searchParams.set("id", ids.join(","));
   detailUrl.searchParams.set("key", key);
 
-  const detail = await fetchJsonWithTimeout<any>(detailUrl, { cache: "no-store" });
+  const detail = await fetchJsonWithTimeout<YouTubeVideoListResponse>(detailUrl, {
+    cache: "no-store",
+  });
   const detailItems = Array.isArray(detail.items) ? detail.items : [];
 
-  return detailItems.map((v: any) => ({
+  return detailItems.map((v) => ({
     videoId: v.id,
     title: v.snippet.title,
     thumbnail: v.snippet.thumbnails.medium.url,
@@ -162,7 +197,7 @@ function buildPrompt(n: number, s: number) {
 }
 
 async function analyze(prompt: string, apiKey: string) {
-  const data = await fetchJsonWithTimeout<any>(
+  const data = await fetchJsonWithTimeout<OpenAIChatCompletionResponse>(
     "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",

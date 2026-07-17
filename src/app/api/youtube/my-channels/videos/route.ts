@@ -12,6 +12,20 @@ import {
   youtubeAuthorizationRequiredResponse,
 } from "@/app/lib/api-security";
 
+type YouTubeVideoSearchResponse = {
+  items?: Array<{
+    id?: { videoId?: string };
+    snippet?: {
+      title?: string;
+      publishedAt?: string;
+      thumbnails?: {
+        default?: { url?: string };
+        medium?: { url?: string };
+      };
+    };
+  }>;
+};
+
 export const GET = auth(async function GET(req) {
   try {
     const userId = await requireApiUserId(req.auth);
@@ -29,7 +43,7 @@ export const GET = auth(async function GET(req) {
     url.searchParams.set("order", "date");
     url.searchParams.set("type", "video");
 
-    const data = await fetchJsonWithTimeout<any>(
+    const data = await fetchJsonWithTimeout<YouTubeVideoSearchResponse>(
       url,
       {
         headers: {
@@ -40,7 +54,7 @@ export const GET = auth(async function GET(req) {
     );
 
     const videos =
-      data.items?.map((item: any) => ({
+      data.items?.map((item) => ({
         videoId: item.id?.videoId ?? "",
         title: item.snippet?.title ?? "",
         thumbnail:

@@ -263,9 +263,7 @@ async function refreshGoogleToken(
   const existingRefresh = refreshesInFlight.get(key);
   if (existingRefresh) return existingRefresh;
 
-  let refresh: Promise<GoogleTokenResult>;
-
-  refresh = requestRefreshedGoogleToken(refreshToken).then((result) => {
+  const refresh = requestRefreshedGoogleToken(refreshToken).then((result) => {
     if (refreshesInFlight.get(key) !== refresh) return result;
 
     if (result.status === "success") {

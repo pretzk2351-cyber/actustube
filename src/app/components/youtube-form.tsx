@@ -36,6 +36,17 @@ type AIConsultResult = {
   nextSuggestions: string[];
 };
 
+type ChannelApiResponse = {
+  error?: string;
+  channelTitle: string;
+  regularVideos?: Video[];
+  shortVideos?: Video[];
+};
+
+type AIConsultApiResponse = AIConsultResult & {
+  error?: string;
+};
+
 function normalizeVideos(videos: Video[]): VideoWithMetrics[] {
   return videos.map((video) => ({
     ...video,
@@ -608,9 +619,9 @@ export function YouTubeForm() {
 
       const text = await res.text();
 
-      let data: any;
+      let data: ChannelApiResponse;
       try {
-        data = JSON.parse(text);
+        data = JSON.parse(text) as ChannelApiResponse;
       } catch {
         throw new Error(`YouTube APIの応答がJSONではありません。status=${res.status}`);
       }
@@ -665,9 +676,9 @@ export function YouTubeForm() {
 
       const text = await res.text();
 
-      let data: any;
+      let data: AIConsultApiResponse;
       try {
-        data = JSON.parse(text);
+        data = JSON.parse(text) as AIConsultApiResponse;
       } catch {
         throw new Error(`コンサル生成の応答がJSONではありません。status=${res.status}`);
       }

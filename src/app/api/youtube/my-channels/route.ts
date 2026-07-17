@@ -11,6 +11,20 @@ import {
   youtubeAuthorizationRequiredResponse,
 } from "@/app/lib/api-security";
 
+type YouTubeChannelListResponse = {
+  items?: Array<{
+    id?: string;
+    snippet?: {
+      title?: string;
+      description?: string;
+      thumbnails?: {
+        default?: { url?: string };
+        medium?: { url?: string };
+      };
+    };
+  }>;
+};
+
 export const GET = auth(async function GET(request) {
   try {
     const userId = await requireApiUserId(request.auth);
@@ -19,7 +33,7 @@ export const GET = auth(async function GET(request) {
     const accessToken = await getServerOAuthAccessToken(request, userId);
     if (!accessToken) return youtubeAuthorizationRequiredResponse();
 
-    const data = await fetchJsonWithTimeout<any>(
+    const data = await fetchJsonWithTimeout<YouTubeChannelListResponse>(
       "https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true",
       {
         headers: {
@@ -30,7 +44,7 @@ export const GET = auth(async function GET(request) {
     );
 
     const channels =
-      data.items?.map((item: any) => ({
+      data.items?.map((item) => ({
         id: item.id ?? "",
         title: item.snippet?.title ?? "",
         description: item.snippet?.description ?? "",
