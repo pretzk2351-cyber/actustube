@@ -73,7 +73,70 @@ async function bucketCounts(userId, metric) {
   `;
 }
 
+async function release(userId, reservationId) {
+  const rows = await database`
+    SELECT *
+    FROM public.release_usage_limits(
+      ${reservationId}::uuid,
+      ${userId}::uuid
+    )
+  `;
+  return rows[0];
+}
+
+async function finalize(userId, reservationId) {
+  const rows = await database`
+    SELECT public.finalize_usage_reservation(
+      ${reservationId}::uuid,
+      ${userId}::uuid
+    ) AS finalized
+  `;
+  return rows[0].finalized;
+}
+
 async function run() {
+  const releasedUser = await createUser();
+  const pendingRelease = await reserve(
+    releasedUser,
+    "channel_analysis",
+    "2026-07-18T12:00:00.000Z"
+  );
+  assert.equal(pendingRelease.allowed, true);
+  assert.ok(pendingRelease.reservation_id);
+  assert.deepEqual(await release(releasedUser, pendingRelease.reservation_id), {
+    released: true,
+    daily_used: 0,
+    monthly_used: 0,
+  });
+  assert.deepEqual(await release(releasedUser, pendingRelease.reservation_id), {
+    released: false,
+    daily_used: null,
+    monthly_used: null,
+  });
+  assert.deepEqual(await bucketCounts(releasedUser, "channel_analysis"), [
+    { periodKind: "day", usedCount: 0, limitSnapshot: 2 },
+    { periodKind: "month", usedCount: 0, limitSnapshot: 5 },
+  ]);
+
+  const finalizedUser = await createUser();
+  const pendingFinalize = await reserve(
+    finalizedUser,
+    "ai_consult",
+    "2026-07-18T12:00:00.000Z"
+  );
+  assert.equal(
+    await finalize(finalizedUser, pendingFinalize.reservation_id),
+    true
+  );
+  assert.equal(
+    (await release(finalizedUser, pendingFinalize.reservation_id)).released,
+    false
+  );
+  assert.deepEqual(await bucketCounts(finalizedUser, "ai_consult"), [
+    { periodKind: "day", usedCount: 1, limitSnapshot: 1 },
+    { periodKind: "month", usedCount: 1, limitSnapshot: 3 },
+  ]);
+
   const concurrentUser = await createUser();
   const concurrent = await Promise.all(
     Array.from({ length: 10 }, () =>
@@ -179,6 +242,8 @@ async function run() {
     channelAnalysisLimits: { daily: 2, monthly: 5 },
     aiConsultLimits: { daily: 1, monthly: 3 },
     stateDenialsVerified: true,
+    oneTimeReleaseVerified: true,
+    successfulFinalizationVerified: true,
   });
 }
 

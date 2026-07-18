@@ -1,6 +1,6 @@
 import { auth } from "@/auth";
 import type { Session } from "next-auth";
-import { getToken } from "next-auth/jwt";
+import { getToken, type JWT } from "next-auth/jwt";
 import { NextResponse } from "next/server";
 
 import { RequestValidationError } from "./api-validation";
@@ -8,6 +8,8 @@ import { getValidGoogleToken } from "./google-oauth-token";
 
 export const YOUTUBE_API_TIMEOUT_MS = 10_000;
 export const OPENAI_API_TIMEOUT_MS = 30_000;
+const INTERNAL_USER_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class ExternalServiceError extends Error {
   readonly status: number | null;
@@ -173,9 +175,9 @@ function cookieHeaderContains(cookieHeader: string, cookieName: string) {
   });
 }
 
-export async function getServerOAuthAccessToken(
+async function findServerJwtToken(
   request: Request,
-  expectedUserId: string
+  accepts: (token: JWT) => boolean
 ) {
   const secret = getAuthSecrets();
   if (!secret) throw new ServerConfigurationError();
@@ -192,8 +194,47 @@ export async function getServerOAuthAccessToken(
       cookieName,
       salt: cookieName,
     });
-    if (!token || token.internalUserId !== expectedUserId) continue;
+    if (token && accepts(token)) return token;
+  }
 
+  return null;
+}
+
+export async function getServerUsageIdentity(
+  request: Request,
+  expectedUserId: string
+) {
+  const token = await findServerJwtToken(
+    request,
+    (candidate) => candidate.internalUserId === expectedUserId
+  );
+  const sessionVersion = token?.sessionVersion;
+
+  if (
+    !token ||
+    typeof token.internalUserId !== "string" ||
+    !INTERNAL_USER_ID_PATTERN.test(token.internalUserId) ||
+    !Number.isSafeInteger(sessionVersion) ||
+    (sessionVersion as number) < 1
+  ) {
+    return null;
+  }
+
+  return {
+    userId: token.internalUserId,
+    sessionVersion: sessionVersion as number,
+  };
+}
+
+export async function getServerOAuthAccessToken(
+  request: Request,
+  expectedUserId: string
+) {
+  const token = await findServerJwtToken(
+    request,
+    (candidate) => candidate.internalUserId === expectedUserId
+  );
+  if (token) {
     const googleToken = await getValidGoogleToken(token);
 
     if (googleToken.status === "success") return googleToken.accessToken;

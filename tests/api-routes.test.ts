@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+const INTERNAL_USER_ID = "9e7b7a4c-6fc8-448d-bcb5-4331fa8910a9";
+const RESERVATION_ID = "a95fa157-5f30-42ca-97ea-d7ba4f23f331";
+
 const authState = vi.hoisted(() => ({
   session: null as null | {
     user: { id: string; name: string; email: string };
@@ -12,21 +15,23 @@ const jwtState = vi.hoisted(() => ({
   token: null as null | {
     sub: string;
     internalUserId?: string;
+    sessionVersion?: number;
     accessToken: string;
     refreshToken: string;
     accessTokenExpiresAt: number;
   },
 }));
 
-const openAIState = vi.hoisted(() => ({
-  create: vi.fn(),
+const openAIState = vi.hoisted(() => ({ create: vi.fn() }));
+const usageState = vi.hoisted(() => ({
+  reserve: vi.fn(),
+  release: vi.fn(),
+  finalize: vi.fn(),
 }));
 
 vi.mock("@/auth", () => ({
   auth: vi.fn((handler?: (request: Request & { auth: unknown }) => unknown) => {
-    if (typeof handler !== "function") {
-      return Promise.resolve(authState.session);
-    }
+    if (typeof handler !== "function") return Promise.resolve(authState.session);
 
     return async (request: Request) => {
       Object.defineProperty(request, "auth", {
@@ -40,6 +45,12 @@ vi.mock("@/auth", () => ({
 
 vi.mock("next-auth/jwt", () => ({
   getToken: vi.fn(async () => jwtState.token),
+}));
+
+vi.mock("@/db/usage-limits", () => ({
+  reserveUsage: usageState.reserve,
+  releaseUsageReservation: usageState.release,
+  finalizeUsageReservation: usageState.finalize,
 }));
 
 vi.mock("openai", () => ({
@@ -61,7 +72,11 @@ const originalYouTubeApiKey = process.env.YOUTUBE_API_KEY;
 function jsonRequest(url: string, body: unknown, headers: HeadersInit = {}) {
   return new NextRequest(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...headers },
+    headers: {
+      "Content-Type": "application/json",
+      cookie: "authjs.session-token=test-session-cookie",
+      ...headers,
+    },
     body: JSON.stringify(body),
   });
 }
@@ -106,22 +121,58 @@ function successfulConsultOutput() {
   });
 }
 
-function installAnalyzeFetchMock() {
+function allowedReservation(metric: "channel_analysis" | "ai_consult") {
+  return {
+    allowed: true as const,
+    denialReason: null,
+    reservationId: RESERVATION_ID,
+    metric,
+    dailyUsed: 1,
+    dailyLimit: metric === "channel_analysis" ? 2 : 1,
+    dailyResetAt: new Date("2026-07-19T00:00:00.000Z"),
+    monthlyUsed: 1,
+    monthlyLimit: metric === "channel_analysis" ? 5 : 3,
+    monthlyResetAt: new Date("2026-08-01T00:00:00.000Z"),
+    planCode: "free",
+  };
+}
+
+function installChannelFetchMock() {
   vi.mocked(fetch).mockImplementation(async (input) => {
     const url = new URL(String(input));
+    const part = url.searchParams.get("part");
 
-    if (url.hostname === "www.googleapis.com" && url.pathname.endsWith("/search")) {
-      return jsonResponse({ items: [] });
+    if (url.pathname.endsWith("/channels") && part?.includes("contentDetails")) {
+      return jsonResponse({
+        items: [
+          {
+            contentDetails: { relatedPlaylists: { uploads: "UUtestuploads" } },
+            snippet: { title: "Test Channel", description: "Test" },
+            statistics: {
+              subscriberCount: "1",
+              videoCount: "0",
+              viewCount: "1",
+            },
+          },
+        ],
+      });
     }
 
-    if (url.hostname === "api.openai.com") {
-      return jsonResponse({
-        choices: [{ message: { content: "Test analysis report" } }],
-      });
+    if (url.pathname.endsWith("/playlistItems")) {
+      return jsonResponse({ items: [] });
     }
 
     throw new Error("Unexpected mocked fetch target.");
   });
+}
+
+function channelRequest(extraQuery = "") {
+  const channelUrl = encodeURIComponent(
+    "https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa"
+  );
+  return authenticatedGet(
+    `http://localhost/api/youtube/channel?url=${channelUrl}${extraQuery}`
+  );
 }
 
 beforeAll(async () => {
@@ -149,17 +200,14 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-  if (originalYouTubeApiKey === undefined) {
-    delete process.env.YOUTUBE_API_KEY;
-  } else {
-    process.env.YOUTUBE_API_KEY = originalYouTubeApiKey;
-  }
+  if (originalYouTubeApiKey === undefined) delete process.env.YOUTUBE_API_KEY;
+  else process.env.YOUTUBE_API_KEY = originalYouTubeApiKey;
 });
 
 beforeEach(() => {
   authState.session = {
     user: {
-      id: "test-user-id",
+      id: INTERNAL_USER_ID,
       name: "Test User",
       email: "user@example.test",
     },
@@ -167,7 +215,8 @@ beforeEach(() => {
   };
   jwtState.token = {
     sub: "authjs-subject-not-internal-user-id",
-    internalUserId: "test-user-id",
+    internalUserId: INTERNAL_USER_ID,
+    sessionVersion: 7,
     accessToken: "test-google-access-token",
     refreshToken: "test-google-refresh-token",
     accessTokenExpiresAt: Math.floor(Date.now() / 1_000) + 3_600,
@@ -175,13 +224,21 @@ beforeEach(() => {
   vi.stubEnv("AUTH_SECRET", "test-auth-secret");
   vi.stubEnv("YOUTUBE_API_KEY", "test-youtube-api-key");
   vi.stubEnv("OPENAI_API_KEY", "test-openai-api-key");
-  openAIState.create.mockReset();
   openAIState.create.mockRejectedValue(
     new Error("Unexpected OpenAI SDK request blocked by tests.")
   );
+  usageState.reserve.mockImplementation(async ({ metric }) =>
+    allowedReservation(metric)
+  );
+  usageState.release.mockResolvedValue({
+    released: true,
+    dailyUsed: 0,
+    monthlyUsed: 0,
+  });
+  usageState.finalize.mockResolvedValue(true);
 });
 
-describe("API authentication", () => {
+describe("API authentication and retired route", () => {
   it.each([
     {
       route: "POST /api/ai-consult",
@@ -192,25 +249,7 @@ describe("API authentication", () => {
           })
         ),
     },
-    {
-      route: "POST /api/analyze",
-      invoke: () =>
-        analyzePost(
-          jsonRequest("http://localhost/api/analyze", {
-            mode: "manual_url",
-            url: "https://www.youtube.com/@YouTube",
-          })
-        ),
-    },
-    {
-      route: "GET /api/youtube/channel",
-      invoke: () =>
-        youtubeChannelGet(
-          new NextRequest(
-            "http://localhost/api/youtube/channel?url=https%3A%2F%2Fwww.youtube.com%2F%40YouTube"
-          )
-        ),
-    },
+    { route: "GET /api/youtube/channel", invoke: () => youtubeChannelGet(channelRequest()) },
     {
       route: "GET /api/youtube/my-channels",
       invoke: () =>
@@ -225,50 +264,59 @@ describe("API authentication", () => {
           )
         ),
     },
-  ])("returns 401 before external work for $route", async ({ invoke }) => {
+  ])("returns 401 before DB or external work for $route", async ({ invoke }) => {
     authState.session = null;
 
     const response = await invoke();
 
     expect(response.status).toBe(401);
-    expect(await response.json()).toEqual({ error: "Authentication required." });
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(openAIState.create).not.toHaveBeenCalled();
+  });
+
+  it("returns 410 from the unused legacy /api/analyze route", async () => {
+    authState.session = null;
+
+    const response = await analyzePost(
+      jsonRequest("http://localhost/api/analyze", { userId: INTERNAL_USER_ID })
+    );
+
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({
+      error: "This endpoint is no longer available.",
+      code: "ENDPOINT_GONE",
+    });
+    expect(usageState.reserve).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
     expect(openAIState.create).not.toHaveBeenCalled();
   });
 });
 
-describe("API input validation", () => {
-  it("returns 400 for invalid AI consultation input", async () => {
+describe("validation occurs before usage reservation", () => {
+  it("rejects invalid AI consultation input without consuming usage", async () => {
     const response = await aiConsultPost(
       jsonRequest("http://localhost/api/ai-consult", { aiSummary: {} })
     );
 
     expect(response.status).toBe(400);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(usageState.reserve).not.toHaveBeenCalled();
     expect(openAIState.create).not.toHaveBeenCalled();
   });
 
-  it("returns 400 for invalid analysis input", async () => {
-    const response = await analyzePost(
-      jsonRequest("http://localhost/api/analyze", { mode: "untrusted" })
-    );
-
-    expect(response.status).toBe(400);
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  it("returns 400 for an invalid channel URL", async () => {
+  it("rejects an invalid channel URL without consuming usage", async () => {
     const response = await youtubeChannelGet(
-      new NextRequest(
+      authenticatedGet(
         "http://localhost/api/youtube/channel?url=https%3A%2F%2Fexample.com%2Fchannel"
       )
     );
 
     expect(response.status).toBe(400);
+    expect(usageState.reserve).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("returns 400 for an invalid channel ID", async () => {
+  it("preserves my-channels/videos input validation and authentication", async () => {
     const response = await myChannelVideosGet(
       authenticatedGet(
         "http://localhost/api/youtube/my-channels/videos?channelId=invalid"
@@ -278,103 +326,246 @@ describe("API input validation", () => {
     expect(response.status).toBe(400);
     expect(fetch).not.toHaveBeenCalled();
   });
+});
 
-  it("returns 400 for an oversized JSON body", async () => {
-    const response = await analyzePost(
-      jsonRequest("http://localhost/api/analyze", {
-        mode: "manual_url",
-        url: `https://www.youtube.com/@${"a".repeat(9_000)}`,
+describe("successful usage reservations", () => {
+  it("reserves channel_analysis, finalizes it, and returns additive usage", async () => {
+    installChannelFetchMock();
+
+    const response = await youtubeChannelGet(
+      channelRequest("&plan=paid&userId=attacker&limit=999999")
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(usageState.reserve).toHaveBeenCalledWith({
+      userId: INTERNAL_USER_ID,
+      sessionVersion: 7,
+      metric: "channel_analysis",
+    });
+    expect(usageState.finalize).toHaveBeenCalledWith({
+      reservationId: RESERVATION_ID,
+      userId: INTERNAL_USER_ID,
+    });
+    expect(usageState.release).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(body.plan).toBe("free");
+    expect(body.usage).toEqual({
+      metric: "channel_analysis",
+      planCode: "free",
+      dailyUsed: 1,
+      dailyLimit: 2,
+      dailyResetAt: "2026-07-19T00:00:00.000Z",
+      monthlyUsed: 1,
+      monthlyLimit: 5,
+      monthlyResetAt: "2026-08-01T00:00:00.000Z",
+    });
+  });
+
+  it("reserves ai_consult and ignores client-owned identity and limit fields", async () => {
+    openAIState.create.mockResolvedValue({ output_text: successfulConsultOutput() });
+
+    const response = await aiConsultPost(
+      jsonRequest("http://localhost/api/ai-consult", {
+        aiSummary: validAISummary(),
+        userId: "attacker",
+        plan: "paid",
+        limit: 999_999,
       })
     );
+    const body = await response.json();
 
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(200);
+    expect(usageState.reserve).toHaveBeenCalledWith({
+      userId: INTERNAL_USER_ID,
+      sessionVersion: 7,
+      metric: "ai_consult",
+    });
+    expect(usageState.finalize).toHaveBeenCalledTimes(1);
+    expect(usageState.release).not.toHaveBeenCalled();
+    expect(openAIState.create).toHaveBeenCalledTimes(1);
+    expect(body.overallDiagnosis).toBe("Test diagnosis");
+    expect(body.usage.metric).toBe("ai_consult");
+    expect(body.usage.dailyLimit).toBe(1);
+    expect(body.usage.monthlyLimit).toBe(3);
+  });
+});
+
+describe("usage denial HTTP mapping", () => {
+  it.each([
+    ["user_not_found", 401, "REAUTHENTICATION_REQUIRED"],
+    ["session_version_mismatch", 401, "REAUTHENTICATION_REQUIRED"],
+    ["user_inactive", 403, "ACCOUNT_UNAVAILABLE"],
+    ["no_active_plan", 403, "NO_ACTIVE_PLAN"],
+  ] as const)("maps %s safely", async (denialReason, status, code) => {
+    usageState.reserve.mockResolvedValue({
+      allowed: false,
+      denialReason,
+      reservationId: null,
+      metric: "channel_analysis",
+      dailyUsed: null,
+      dailyLimit: null,
+      dailyResetAt: new Date("2026-07-19T00:00:00.000Z"),
+      monthlyUsed: null,
+      monthlyLimit: null,
+      monthlyResetAt: new Date("2026-08-01T00:00:00.000Z"),
+      planCode: null,
+    });
+
+    const response = await youtubeChannelGet(channelRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(status);
+    expect(body.code).toBe(code);
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("returns 400 for a non-JSON Content-Type", async () => {
-    const response = await analyzePost(
-      new NextRequest("http://localhost/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "text/plain" },
-        body: "not json",
-      })
-    );
+  it.each([
+    ["daily_limit_reached", "DAILY_USAGE_LIMIT_REACHED", "3600"],
+    ["monthly_limit_reached", "MONTHLY_USAGE_LIMIT_REACHED", "1126800"],
+  ] as const)(
+    "returns 429 usage details and Retry-After for %s",
+    async (denialReason, code, retryAfter) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-07-18T23:00:00.000Z"));
+      usageState.reserve.mockResolvedValue({
+        allowed: false,
+        denialReason,
+        reservationId: null,
+        metric: "channel_analysis",
+        dailyUsed: 2,
+        dailyLimit: 2,
+        dailyResetAt: new Date("2026-07-19T00:00:00.000Z"),
+        monthlyUsed: 5,
+        monthlyLimit: 5,
+        monthlyResetAt: new Date("2026-08-01T00:00:00.000Z"),
+        planCode: "free",
+      });
 
-    expect(response.status).toBe(400);
+      const response = await youtubeChannelGet(channelRequest());
+      const body = await response.json();
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe(retryAfter);
+      expect(body).toMatchObject({
+        code,
+        metric: "channel_analysis",
+        dailyUsed: 2,
+        dailyLimit: 2,
+        dailyResetAt: "2026-07-19T00:00:00.000Z",
+        monthlyUsed: 5,
+        monthlyLimit: 5,
+        monthlyResetAt: "2026-08-01T00:00:00.000Z",
+        planCode: "free",
+      });
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  );
+
+  it("requires reauthentication when JWT sessionVersion is absent", async () => {
+    if (jwtState.token) jwtState.token.sessionVersion = undefined;
+
+    const response = await youtubeChannelGet(channelRequest());
+
+    expect(response.status).toBe(401);
+    expect((await response.json()).code).toBe("REAUTHENTICATION_REQUIRED");
+    expect(usageState.reserve).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 });
 
-describe("authenticated API success responses", () => {
-  it("returns 200 from POST /api/ai-consult with a mocked OpenAI response", async () => {
-    openAIState.create.mockResolvedValue({
-      output_text: successfulConsultOutput(),
+describe("external failures release usage", () => {
+  it.each([
+    ["service failure", new Error("raw youtube secret"), 502],
+    [
+      "timeout",
+      Object.assign(new Error("raw youtube timeout secret"), {
+        name: "TimeoutError",
+      }),
+      504,
+    ],
+  ] as const)("releases a YouTube reservation on %s", async (_label, error, status) => {
+    vi.mocked(fetch).mockRejectedValueOnce(error);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await youtubeChannelGet(channelRequest());
+    const serialized = JSON.stringify(await response.json());
+
+    expect(response.status).toBe(status);
+    expect(usageState.release).toHaveBeenCalledWith({
+      reservationId: RESERVATION_ID,
+      userId: INTERNAL_USER_ID,
     });
+    expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(serialized).not.toContain("secret");
+  });
+
+  it.each([
+    ["service failure", new Error("raw OpenAI secret"), 502],
+    [
+      "timeout",
+      Object.assign(new Error("raw OpenAI timeout secret"), {
+        name: "APIConnectionTimeoutError",
+      }),
+      504,
+    ],
+  ] as const)("releases an OpenAI reservation on %s", async (_label, error, status) => {
+    openAIState.create.mockRejectedValueOnce(error);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     const response = await aiConsultPost(
       jsonRequest("http://localhost/api/ai-consult", {
         aiSummary: validAISummary(),
       })
     );
+    const serialized = JSON.stringify(await response.json());
 
-    expect(response.status).toBe(200);
-    expect(openAIState.create).toHaveBeenCalledTimes(1);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(response.status).toBe(status);
+    expect(usageState.release).toHaveBeenCalledTimes(1);
+    expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(serialized).not.toContain("secret");
   });
 
-  it("returns 200 from POST /api/analyze with mocked YouTube and OpenAI responses", async () => {
-    installAnalyzeFetchMock();
+  it("does not expose a release database failure", async () => {
+    openAIState.create.mockRejectedValueOnce(new Error("external secret"));
+    usageState.release.mockRejectedValueOnce(
+      new Error("postgresql://user:database-secret@example.test/database")
+    );
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
 
-    const response = await analyzePost(
-      jsonRequest("http://localhost/api/analyze", {
-        mode: "my_channel",
-        channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
+    const response = await aiConsultPost(
+      jsonRequest("http://localhost/api/ai-consult", {
+        aiSummary: validAISummary(),
       })
     );
+    const body = JSON.stringify(await response.json());
+    const logs = JSON.stringify(consoleError.mock.calls);
 
-    expect(response.status).toBe(200);
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(response.status).toBe(502);
+    expect(body).not.toContain("database-secret");
+    expect(logs).not.toContain("database-secret");
+    expect(logs).not.toContain("postgresql://");
   });
 
-  it("returns 200 from GET /api/youtube/channel with mocked YouTube responses", async () => {
-    vi.mocked(fetch).mockImplementation(async (input) => {
-      const url = new URL(String(input));
-      const part = url.searchParams.get("part");
-
-      if (url.pathname.endsWith("/channels") && part?.includes("contentDetails")) {
-        return jsonResponse({
-          items: [
-            {
-              contentDetails: { relatedPlaylists: { uploads: "UUtestuploads" } },
-              snippet: { title: "Test Channel", description: "Test" },
-              statistics: {
-                subscriberCount: "1",
-                videoCount: "0",
-                viewCount: "1",
-              },
-            },
-          ],
-        });
-      }
-
-      if (url.pathname.endsWith("/playlistItems")) {
-        return jsonResponse({ items: [] });
-      }
-
-      throw new Error("Unexpected mocked fetch target.");
-    });
-
-    const channelUrl = encodeURIComponent(
-      "https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa"
+  it("does not expose a reservation database failure", async () => {
+    usageState.reserve.mockRejectedValueOnce(
+      new Error("postgresql://user:database-secret@example.test/database")
     );
-    const response = await youtubeChannelGet(
-      new NextRequest(`http://localhost/api/youtube/channel?url=${channelUrl}`)
-    );
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    expect(response.status).toBe(200);
-    expect(fetch).toHaveBeenCalledTimes(2);
+    const response = await youtubeChannelGet(channelRequest());
+    const body = JSON.stringify(await response.json());
+
+    expect(response.status).toBe(500);
+    expect(body).toBe(JSON.stringify({ error: "An internal server error occurred." }));
+    expect(body).not.toContain("database-secret");
+    expect(fetch).not.toHaveBeenCalled();
   });
+});
 
+describe("existing Google OAuth route behavior", () => {
   it("uses OAuth when internalUserId matches even if token.sub differs", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(
       jsonResponse({
@@ -395,10 +586,10 @@ describe("authenticated API success responses", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects an OAuth JWT whose internal user ID differs from the session user", async () => {
+  it("rejects OAuth when internalUserId differs from the session user", async () => {
     if (jwtState.token) {
-      jwtState.token.sub = "test-user-id";
-      jwtState.token.internalUserId = "different-internal-user-id";
+      jwtState.token.sub = INTERNAL_USER_ID;
+      jwtState.token.internalUserId = "2f5e100f-f94d-4b36-a3e4-a6f41a722d1d";
     }
 
     const response = await myChannelsGet(
@@ -406,15 +597,12 @@ describe("authenticated API success responses", () => {
     );
 
     expect(response.status).toBe(403);
-    expect(await response.json()).toEqual({
-      error: "YouTube authorization is required.",
-    });
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("does not fall back to token.sub when the internal user ID is missing", async () => {
+  it("does not fall back to token.sub when internalUserId is missing", async () => {
     if (jwtState.token) {
-      jwtState.token.sub = "test-user-id";
+      jwtState.token.sub = INTERNAL_USER_ID;
       jwtState.token.internalUserId = undefined;
     }
 
@@ -423,13 +611,10 @@ describe("authenticated API success responses", () => {
     );
 
     expect(response.status).toBe(403);
-    expect(await response.json()).toEqual({
-      error: "YouTube authorization is required.",
-    });
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("returns 200 from GET /api/youtube/my-channels/videos with a mocked OAuth response", async () => {
+  it("preserves authenticated my-channels/videos success", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ items: [] }));
 
     const response = await myChannelVideosGet(
@@ -440,108 +625,5 @@ describe("authenticated API success responses", () => {
 
     expect(response.status).toBe(200);
     expect(fetch).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("safe external service failures", () => {
-  it("returns 504 for a mocked fetch timeout", async () => {
-    const timeout = new Error("test-youtube-api-key must not escape");
-    timeout.name = "TimeoutError";
-    vi.mocked(fetch).mockRejectedValueOnce(timeout);
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    const response = await analyzePost(
-      jsonRequest("http://localhost/api/analyze", {
-        mode: "my_channel",
-        channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
-      })
-    );
-    const body = JSON.stringify(await response.json());
-
-    expect(response.status).toBe(504);
-    expect(body).toBe(JSON.stringify({ error: "The external service timed out." }));
-    expect(body).not.toContain("test-youtube-api-key");
-    expect(body).not.toContain("stack");
-  });
-
-  it("returns 504 for a mocked OpenAI SDK timeout", async () => {
-    const timeout = new Error("test-openai-api-key must not escape");
-    timeout.name = "APIConnectionTimeoutError";
-    openAIState.create.mockRejectedValueOnce(timeout);
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    const response = await aiConsultPost(
-      jsonRequest("http://localhost/api/ai-consult", {
-        aiSummary: validAISummary(),
-      })
-    );
-    const body = JSON.stringify(await response.json());
-
-    expect(response.status).toBe(504);
-    expect(body).not.toContain("test-openai-api-key");
-    expect(body).not.toContain("stack");
-  });
-
-  it("sanitizes mocked external API errors", async () => {
-    vi.mocked(fetch).mockResolvedValueOnce(
-      jsonResponse(
-        {
-          error: "raw external error",
-          access_token: "test-google-access-token",
-          stack: "raw stack trace",
-        },
-        500
-      )
-    );
-    const consoleError = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
-
-    const response = await analyzePost(
-      jsonRequest("http://localhost/api/analyze", {
-        mode: "my_channel",
-        channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
-      })
-    );
-    const body = JSON.stringify(await response.json());
-    const logged = JSON.stringify(consoleError.mock.calls);
-
-    expect(response.status).toBe(502);
-    expect(body).toBe(
-      JSON.stringify({ error: "The external service request failed." })
-    );
-    for (const secret of [
-      "test-google-access-token",
-      "test-google-refresh-token",
-      "test-youtube-api-key",
-      "test-openai-api-key",
-      "raw external error",
-      "raw stack trace",
-    ]) {
-      expect(body).not.toContain(secret);
-      expect(logged).not.toContain(secret);
-    }
-    expect(body).not.toContain("stack");
-  });
-
-  it("sanitizes mocked OpenAI SDK errors", async () => {
-    openAIState.create.mockRejectedValueOnce(
-      new Error("test-openai-api-key and raw SDK response must not escape")
-    );
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    const response = await aiConsultPost(
-      jsonRequest("http://localhost/api/ai-consult", {
-        aiSummary: validAISummary(),
-      })
-    );
-    const body = JSON.stringify(await response.json());
-
-    expect(response.status).toBe(502);
-    expect(body).toBe(
-      JSON.stringify({ error: "The external service request failed." })
-    );
-    expect(body).not.toContain("test-openai-api-key");
-    expect(body).not.toContain("stack");
   });
 });

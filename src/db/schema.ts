@@ -192,6 +192,32 @@ export const userUsageBuckets = pgTable(
   ]
 );
 
+export const usageReservationLeases = pgTable(
+  "usage_reservation_leases",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    metric: usageMetricEnum("metric").notNull(),
+    dailyPeriodStart: timestamp("daily_period_start", {
+      withTimezone: true,
+    }).notNull(),
+    monthlyPeriodStart: timestamp("monthly_period_start", {
+      withTimezone: true,
+    }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    index("usage_reservation_leases_user_metric_idx").on(
+      table.userId,
+      table.metric
+    ),
+  ]
+);
+
 export type UserStatus = (typeof userStatusEnum.enumValues)[number];
 export type UserRecord = typeof users.$inferSelect;
 export type NewUserRecord = typeof users.$inferInsert;
@@ -199,3 +225,5 @@ export type OAuthAccountRecord = typeof oauthAccounts.$inferSelect;
 export type PlanRecord = typeof plans.$inferSelect;
 export type UserPlanAssignmentRecord = typeof userPlanAssignments.$inferSelect;
 export type UserUsageBucketRecord = typeof userUsageBuckets.$inferSelect;
+export type UsageReservationLeaseRecord =
+  typeof usageReservationLeases.$inferSelect;

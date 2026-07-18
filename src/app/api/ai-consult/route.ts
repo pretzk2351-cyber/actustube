@@ -12,6 +12,11 @@ import {
   serverConfigurationErrorResponse,
   unauthorizedResponse,
 } from "@/app/lib/api-security";
+import {
+  publicUsage,
+  reserveApiUsage,
+  runWithUsageReservation,
+} from "@/app/lib/usage-limit-api";
 
 const consultSchema = {
   name: "youtube_consult_result",
@@ -91,52 +96,70 @@ ${JSON.stringify(aiSummary, null, 2)}
 </analysis_data>
 `;
 
-    const response = await client.responses
-      .create({
-        model: "gpt-5.4-mini",
-        store: false,
-        max_output_tokens: 2_000,
-        input: [
-          {
-            role: "system",
-            content: systemPrompt,
-          },
-          {
-            role: "user",
-            content: userPrompt,
-          },
-        ],
-        text: {
-          format: {
-            type: "json_schema",
-            name: consultSchema.name,
-            schema: consultSchema.schema,
-            strict: true,
-          },
-        },
-      })
-      .catch((error: unknown) => {
-        if (isTimeoutError(error)) {
-          throw new ExternalServiceTimeoutError();
+    const usageResult = await reserveApiUsage(request, userId, "ai_consult");
+    if (!usageResult.allowed) return usageResult.response;
+
+    const parsed = await runWithUsageReservation(
+      usageResult.reservation,
+      userId,
+      async () => {
+        const response = await client.responses
+          .create({
+            model: "gpt-5.4-mini",
+            store: false,
+            max_output_tokens: 2_000,
+            input: [
+              {
+                role: "system",
+                content: systemPrompt,
+              },
+              {
+                role: "user",
+                content: userPrompt,
+              },
+            ],
+            text: {
+              format: {
+                type: "json_schema",
+                name: consultSchema.name,
+                schema: consultSchema.schema,
+                strict: true,
+              },
+            },
+          })
+          .catch((error: unknown) => {
+            if (isTimeoutError(error)) {
+              throw new ExternalServiceTimeoutError();
+            }
+
+            throw new ExternalServiceError();
+          });
+
+        const outputText = response.output_text;
+
+        if (!outputText) {
+          throw new ExternalServiceError();
         }
 
-        throw new ExternalServiceError();
-      });
+        let output: unknown;
+        try {
+          output = JSON.parse(outputText);
+        } catch {
+          throw new ExternalServiceError();
+        }
 
-    const outputText = response.output_text;
+        if (!output || typeof output !== "object" || Array.isArray(output)) {
+          throw new ExternalServiceError();
+        }
 
-    if (!outputText) {
-      throw new ExternalServiceError();
-    }
+        return output as Record<string, unknown>;
+      }
+    );
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(outputText);
-    } catch {
-      throw new ExternalServiceError();
-    }
-
-    return NextResponse.json(parsed);
+    return NextResponse.json({
+      ...parsed,
+      usage: publicUsage(usageResult.reservation),
+    });
   } catch (error) {
     return handleApiError("ai-consult", error);
   }

@@ -13,6 +13,11 @@ import {
   serverConfigurationErrorResponse,
   unauthorizedResponse,
 } from "@/app/lib/api-security";
+import {
+  publicUsage,
+  reserveApiUsage,
+  runWithUsageReservation,
+} from "@/app/lib/usage-limit-api";
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const SERVER_PLAN = "free" as const;
@@ -213,49 +218,68 @@ export async function GET(request: NextRequest) {
       return serverConfigurationErrorResponse();
     }
 
-    const channelId =
-      parsed.type === "channelId"
-        ? parsed.value
-        : await getChannelIdFromHandle(`@${parsed.value}`);
-
-    const {
-      uploadsPlaylistId,
-      channelTitle,
-      channelDescription,
-      subscriberCount,
-      videoCount,
-      viewCount,
-    } = await getChannelInfo(channelId);
-
-    const uploadVideoIds = await getUploadVideoIds(
-      uploadsPlaylistId,
-      FETCH_POOL_SIZE
+    const usageResult = await reserveApiUsage(
+      request,
+      userId,
+      "channel_analysis"
     );
-    const allVideos = await getVideos(uploadVideoIds);
+    if (!usageResult.allowed) return usageResult.response;
 
-    const sortedByDate = [...allVideos].sort(
-      (a, b) =>
-        new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime()
+    const result = await runWithUsageReservation(
+      usageResult.reservation,
+      userId,
+      async () => {
+        const channelId =
+          parsed.type === "channelId"
+            ? parsed.value
+            : await getChannelIdFromHandle(`@${parsed.value}`);
+
+        const {
+          uploadsPlaylistId,
+          channelTitle,
+          channelDescription,
+          subscriberCount,
+          videoCount,
+          viewCount,
+        } = await getChannelInfo(channelId);
+
+        const uploadVideoIds = await getUploadVideoIds(
+          uploadsPlaylistId,
+          FETCH_POOL_SIZE
+        );
+        const allVideos = await getVideos(uploadVideoIds);
+
+        const sortedByDate = [...allVideos].sort(
+          (a, b) =>
+            new Date(b.publishedAt).getTime() -
+            new Date(a.publishedAt).getTime()
+        );
+
+        const regularVideos = sortedByDate
+          .filter((video) => !video.isShort)
+          .slice(0, PER_TYPE_LIMIT);
+
+        const shortVideos = sortedByDate
+          .filter((video) => video.isShort)
+          .slice(0, PER_TYPE_LIMIT);
+
+        return {
+          plan: SERVER_PLAN,
+          channelId,
+          channelTitle,
+          channelDescription,
+          subscriberCount,
+          videoCount,
+          viewCount,
+          regularVideos,
+          shortVideos,
+        };
+      }
     );
-
-    const regularVideos = sortedByDate
-      .filter((video) => !video.isShort)
-      .slice(0, PER_TYPE_LIMIT);
-
-    const shortVideos = sortedByDate
-      .filter((video) => video.isShort)
-      .slice(0, PER_TYPE_LIMIT);
 
     return NextResponse.json({
-      plan: SERVER_PLAN,
-      channelId,
-      channelTitle,
-      channelDescription,
-      subscriberCount,
-      videoCount,
-      viewCount,
-      regularVideos,
-      shortVideos,
+      ...result,
+      usage: publicUsage(usageResult.reservation),
     });
   } catch (error) {
     return handleApiError("youtube-channel", error);

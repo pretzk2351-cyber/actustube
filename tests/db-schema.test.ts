@@ -9,6 +9,7 @@ import { FREE_PLAN } from "@/db/free-plan";
 import {
   oauthAccounts,
   plans,
+  usageReservationLeases,
   usageMetricEnum,
   userPlanAssignments,
   users,
@@ -36,20 +37,26 @@ function usageReservationMigrationSql() {
   return migrationSql(2);
 }
 
+function usageReleaseMigrationSql() {
+  return migrationSql(3);
+}
+
 describe("database schema", () => {
-  it("defines all five stage-one tables", () => {
+  it("defines the five foundation tables and the internal reservation lease table", () => {
     expect([
       getTableConfig(users).name,
       getTableConfig(oauthAccounts).name,
       getTableConfig(plans).name,
       getTableConfig(userPlanAssignments).name,
       getTableConfig(userUsageBuckets).name,
+      getTableConfig(usageReservationLeases).name,
     ]).toEqual([
       "users",
       "oauth_accounts",
       "plans",
       "user_plan_assignments",
       "user_usage_buckets",
+      "usage_reservation_leases",
     ]);
   });
 
@@ -89,6 +96,7 @@ describe("database schema", () => {
       initialMigrationSql(),
       conflictFixMigrationSql(),
       usageReservationMigrationSql(),
+      usageReleaseMigrationSql(),
     ].join("\n");
 
     for (const forbidden of [
@@ -125,8 +133,12 @@ describe("database schema", () => {
     expect(sql).toContain('ON CONFLICT ("code") DO UPDATE');
   });
 
-  it("keeps both applied migrations unchanged", () => {
-    const hashes = [initialMigrationSql(), conflictFixMigrationSql()].map(
+  it("keeps all three applied migrations unchanged", () => {
+    const hashes = [
+      initialMigrationSql(),
+      conflictFixMigrationSql(),
+      usageReservationMigrationSql(),
+    ].map(
       (migration) =>
         createHash("sha256")
           .update(migration.replaceAll("\r\n", "\n"))
@@ -136,6 +148,7 @@ describe("database schema", () => {
     expect(hashes).toEqual([
       "9bc21d6a4f264ae7e77d790a19cc3165b18c694f02c2c6d7ccdb0d066f36b368",
       "daff8ea267f0bfbc010ae3f09f888b901b6c9d1d887069bf78e6adff924d0a7e",
+      "123418538b6aef85a0d4f105792334835e289954ee980c985385cd1107daa4ce",
     ]);
   });
 
@@ -305,5 +318,100 @@ describe("database schema", () => {
     expect(firstConflictPosition).toBeGreaterThan(directivePosition);
     expect(sql).not.toMatch(/https?:\/\//);
     expect(sql).not.toMatch(/\b(?:email|provider_account_id|access_token)\b/i);
+  });
+
+  it("adds one-time reservation leases without changing usage bucket limits", () => {
+    const sql = usageReleaseMigrationSql();
+    const table = getTableConfig(usageReservationLeases);
+
+    expect(table.name).toBe("usage_reservation_leases");
+    expect(table.columns.map((column) => column.name)).toEqual([
+      "id",
+      "user_id",
+      "metric",
+      "daily_period_start",
+      "monthly_period_start",
+      "created_at",
+    ]);
+    expect(sql).toContain('CREATE TABLE "usage_reservation_leases"');
+    expect(sql).toContain("ON DELETE cascade");
+    expect(sql).toContain('"reservation_id" uuid');
+    expect(sql).not.toMatch(/ALTER TABLE "user_usage_buckets"/);
+    expect(sql).not.toMatch(/ALTER TABLE "plans"/);
+  });
+
+  it("preserves all stage-two checks in the recreated reservation function", () => {
+    const sql = usageReleaseMigrationSql();
+
+    expect(sql).toContain(
+      "date_trunc('day', v_now AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+    );
+    expect(sql).toContain(
+      "date_trunc('month', v_now AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+    );
+    expect(sql).toContain("FROM public.users AS u");
+    expect(sql).toContain("IF v_user_status <> 'active' THEN");
+    expect(sql).toContain(
+      "IF v_database_session_version <> p_session_version THEN"
+    );
+    expect(sql).toContain("FROM public.user_plan_assignments AS upa");
+    expect(sql).toContain("AND upa.starts_at <= v_now");
+    expect(sql).toContain(
+      "AND (upa.ends_at IS NULL OR upa.ends_at > v_now)"
+    );
+    expect(sql).toContain("AND p.active = true");
+    expect(sql).toContain("IF v_daily_used >= v_daily_limit THEN");
+    expect(sql).toContain("IF v_monthly_used >= v_monthly_limit THEN");
+    expect(
+      sql.match(
+        /ON CONFLICT \(user_id, metric, period_kind, period_start\)/g
+      )
+    ).toHaveLength(2);
+    expect(sql).toContain(
+      "'usage:' || p_user_id::text || ':' || p_metric::text"
+    );
+  });
+
+  it("releases daily and monthly usage atomically and only once", () => {
+    const sql = usageReleaseMigrationSql();
+    const releaseStart = sql.indexOf(
+      'CREATE FUNCTION "public"."release_usage_limits"'
+    );
+    const releaseSql = sql.slice(releaseStart);
+
+    expect(releaseStart).toBeGreaterThan(-1);
+    expect(releaseSql).toContain("FOR UPDATE OF r");
+    expect(releaseSql).toContain("pg_advisory_xact_lock");
+    expect(releaseSql).toContain(
+      "'usage:' || p_user_id::text || ':' || v_metric::text"
+    );
+    expect(releaseSql.match(/GREATEST\(b\.used_count - 1, 0\)/g)).toHaveLength(
+      2
+    );
+    expect(releaseSql).toContain(
+      "DELETE FROM public.usage_reservation_leases AS r"
+    );
+    expect(releaseSql).toContain(
+      "RETURN QUERY SELECT false, NULL::integer, NULL::integer"
+    );
+  });
+
+  it("keeps reservation lifecycle functions securely scoped", () => {
+    const sql = usageReleaseMigrationSql();
+
+    expect(sql.match(/SECURITY INVOKER/g)).toHaveLength(3);
+    expect(sql.match(/SET search_path = public, pg_temp/g)).toHaveLength(3);
+    expect(sql).toContain(
+      'REVOKE ALL ON FUNCTION "public"."reserve_usage_limits"'
+    );
+    expect(sql).toContain(
+      'REVOKE ALL ON FUNCTION "public"."release_usage_limits"(uuid, uuid) FROM PUBLIC'
+    );
+    expect(sql).toContain(
+      'REVOKE ALL ON FUNCTION "public"."finalize_usage_reservation"(uuid, uuid) FROM PUBLIC'
+    );
+    expect(sql).not.toMatch(/https?:\/\//);
+    expect(sql).not.toMatch(/\b(?:email|provider_account_id|access_token)\b/i);
+    expect(sql).not.toMatch(/plpgsql\.variable_conflict/i);
   });
 });

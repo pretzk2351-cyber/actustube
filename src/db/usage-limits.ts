@@ -32,6 +32,7 @@ type UsageReservationBase = {
 export type UsageReservationAllowed = UsageReservationBase & {
   allowed: true;
   denialReason: null;
+  reservationId: string;
   dailyUsed: number;
   dailyLimit: number;
   monthlyUsed: number;
@@ -42,6 +43,7 @@ export type UsageReservationAllowed = UsageReservationBase & {
 export type UsageReservationDenied = UsageReservationBase & {
   allowed: false;
   denialReason: UsageDenialReason;
+  reservationId: null;
   dailyUsed: number | null;
   dailyLimit: number | null;
   monthlyUsed: number | null;
@@ -54,6 +56,17 @@ export type UsageReservationResult =
   | UsageReservationDenied;
 
 type DatabaseExecutor = Pick<Database, "execute">;
+
+export type UsageReservationReference = {
+  reservationId: string;
+  userId: string;
+};
+
+export type UsageReleaseResult = {
+  released: boolean;
+  dailyUsed: number | null;
+  monthlyUsed: number | null;
+};
 
 export class InvalidUsageReservationInputError extends Error {
   constructor() {
@@ -69,6 +82,16 @@ export class UsageReservationPersistenceError extends Error {
   }
 }
 
+export class UsageReservationLifecyclePersistenceError extends Error {
+  constructor() {
+    super("Usage reservation state could not be updated.");
+    this.name = "UsageReservationLifecyclePersistenceError";
+  }
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function isUsageMetric(value: unknown): value is UsageMetric {
   return USAGE_METRICS.some((metric) => metric === value);
 }
@@ -79,13 +102,19 @@ function isDenialReason(value: unknown): value is UsageDenialReason {
 
 function normalizeInput(input: UsageReservationInput) {
   if (
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      input.userId
-    ) ||
+    !UUID_PATTERN.test(input.userId) ||
     !Number.isSafeInteger(input.sessionVersion) ||
     input.sessionVersion < 1 ||
     !isUsageMetric(input.metric)
   ) {
+    throw new InvalidUsageReservationInputError();
+  }
+
+  return input;
+}
+
+function normalizeReservationReference(input: UsageReservationReference) {
+  if (!UUID_PATTERN.test(input.reservationId) || !UUID_PATTERN.test(input.userId)) {
     throw new InvalidUsageReservationInputError();
   }
 
@@ -121,6 +150,7 @@ function parseResult(row: unknown): UsageReservationResult {
   const allowed = candidate.allowed;
   const denialReason = candidate.denialReason;
   const planCode = candidate.planCode;
+  const reservationId = candidate.reservationId;
 
   if (
     typeof allowed !== "boolean" ||
@@ -129,7 +159,9 @@ function parseResult(row: unknown): UsageReservationResult {
     (planCode !== null &&
       (typeof planCode !== "string" ||
         planCode.length === 0 ||
-        planCode.length > 32))
+        planCode.length > 32)) ||
+    (reservationId !== null &&
+      (typeof reservationId !== "string" || !UUID_PATTERN.test(reservationId)))
   ) {
     throw new UsageReservationPersistenceError();
   }
@@ -145,6 +177,7 @@ function parseResult(row: unknown): UsageReservationResult {
     monthlyLimit: optionalNonnegativeInteger(candidate.monthlyLimit),
     monthlyResetAt: parseTimestamp(candidate.monthlyResetAt),
     planCode: planCode as string | null,
+    reservationId: reservationId as string | null,
   };
 
   if (allowed) {
@@ -153,11 +186,16 @@ function parseResult(row: unknown): UsageReservationResult {
       result.dailyLimit === null ||
       result.monthlyUsed === null ||
       result.monthlyLimit === null ||
-      result.planCode === null
+      result.planCode === null ||
+      result.reservationId === null
     ) {
       throw new UsageReservationPersistenceError();
     }
     return result as UsageReservationAllowed;
+  }
+
+  if (result.reservationId !== null) {
+    throw new UsageReservationPersistenceError();
   }
 
   return result as UsageReservationDenied;
@@ -179,7 +217,8 @@ export function buildUsageReservationQuery(
       "monthly_used" AS "monthlyUsed",
       "monthly_limit" AS "monthlyLimit",
       "monthly_reset_at" AS "monthlyResetAt",
-      "plan_code" AS "planCode"
+      "plan_code" AS "planCode",
+      "reservation_id" AS "reservationId"
     FROM "public"."reserve_usage_limits"(
       ${normalized.userId}::uuid,
       ${normalized.sessionVersion}::integer,
@@ -217,4 +256,114 @@ export async function reserveUsage(
 ): Promise<UsageReservationResult> {
   normalizeInput(input);
   return reserveUsageWithDatabase(getDatabase(), input);
+}
+
+export function buildReleaseUsageQuery(
+  input: UsageReservationReference
+): SQL {
+  const normalized = normalizeReservationReference(input);
+
+  return sql`
+    SELECT
+      "released",
+      "daily_used" AS "dailyUsed",
+      "monthly_used" AS "monthlyUsed"
+    FROM "public"."release_usage_limits"(
+      ${normalized.reservationId}::uuid,
+      ${normalized.userId}::uuid
+    )
+  `;
+}
+
+export async function releaseUsageReservationWithDatabase(
+  database: DatabaseExecutor,
+  input: UsageReservationReference
+): Promise<UsageReleaseResult> {
+  const query = buildReleaseUsageQuery(input);
+
+  try {
+    const row = (await database.execute(query)).rows[0];
+    if (!row || typeof row !== "object") {
+      throw new UsageReservationLifecyclePersistenceError();
+    }
+
+    const candidate = row as Record<string, unknown>;
+    if (typeof candidate.released !== "boolean") {
+      throw new UsageReservationLifecyclePersistenceError();
+    }
+
+    const dailyUsed = optionalNonnegativeInteger(candidate.dailyUsed);
+    const monthlyUsed = optionalNonnegativeInteger(candidate.monthlyUsed);
+    if (
+      candidate.released
+        ? dailyUsed === null || monthlyUsed === null
+        : dailyUsed !== null || monthlyUsed !== null
+    ) {
+      throw new UsageReservationLifecyclePersistenceError();
+    }
+
+    return { released: candidate.released, dailyUsed, monthlyUsed };
+  } catch (error) {
+    if (
+      error instanceof InvalidUsageReservationInputError ||
+      error instanceof UsageReservationLifecyclePersistenceError
+    ) {
+      throw error;
+    }
+    throw new UsageReservationLifecyclePersistenceError();
+  }
+}
+
+export async function releaseUsageReservation(
+  input: UsageReservationReference
+): Promise<UsageReleaseResult> {
+  normalizeReservationReference(input);
+  return releaseUsageReservationWithDatabase(getDatabase(), input);
+}
+
+export function buildFinalizeUsageReservationQuery(
+  input: UsageReservationReference
+): SQL {
+  const normalized = normalizeReservationReference(input);
+
+  return sql`
+    SELECT "public"."finalize_usage_reservation"(
+      ${normalized.reservationId}::uuid,
+      ${normalized.userId}::uuid
+    ) AS "finalized"
+  `;
+}
+
+export async function finalizeUsageReservationWithDatabase(
+  database: DatabaseExecutor,
+  input: UsageReservationReference
+): Promise<boolean> {
+  const query = buildFinalizeUsageReservationQuery(input);
+
+  try {
+    const row = (await database.execute(query)).rows[0];
+    if (
+      !row ||
+      typeof row !== "object" ||
+      typeof (row as Record<string, unknown>).finalized !== "boolean"
+    ) {
+      throw new UsageReservationLifecyclePersistenceError();
+    }
+    return (row as Record<string, boolean>).finalized;
+  } catch (error) {
+    if (
+      error instanceof InvalidUsageReservationInputError ||
+      error instanceof UsageReservationLifecyclePersistenceError
+    ) {
+      throw error;
+    }
+    throw new UsageReservationLifecyclePersistenceError();
+  }
+}
+
+export async function finalizeUsageReservation(
+  input: UsageReservationReference
+): Promise<boolean> {
+  normalizeReservationReference(input);
+  return finalizeUsageReservationWithDatabase(getDatabase(), input);
 }
