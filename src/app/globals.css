@@ -24,6 +24,40 @@ select {
   font: inherit;
 }
 
+.ai-consult-button {
+  border: 1px solid #111111;
+  background: #111111;
+  color: #ffffff;
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.14);
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    box-shadow 150ms ease,
+    transform 150ms ease;
+}
+
+@media (hover: hover) {
+  .ai-consult-button:not(:disabled):hover {
+    background: #2a2a2a;
+    box-shadow: 0 14px 30px rgba(0, 0, 0, 0.2);
+    transform: translateY(-1px);
+  }
+}
+
+.ai-consult-button:focus-visible {
+  outline: 3px solid #d90429;
+  outline-offset: 3px;
+}
+
+.ai-consult-button:disabled {
+  border-color: #cbd0d7;
+  background: #e5e7eb;
+  color: #4b5563;
+  box-shadow: none;
+  cursor: not-allowed;
+  transform: none;
+}
+
 img {
   max-width: 100%;
   display: block;

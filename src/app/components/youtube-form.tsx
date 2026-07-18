@@ -2,6 +2,13 @@
 
 import { useMemo, useState } from "react";
 
+import {
+  canRequestAIConsult,
+  evaluateChannelAnalysisResponse,
+  getSafeClientApiErrorMessage,
+  isAIConsultButtonDisabled,
+} from "@/app/lib/youtube-form-flow";
+
 type Video = {
   id: string;
   title: string;
@@ -36,16 +43,13 @@ type AIConsultResult = {
   nextSuggestions: string[];
 };
 
-type ChannelApiResponse = {
-  error?: string;
+type ChannelAnalysisResult = {
   channelTitle: string;
-  regularVideos?: Video[];
-  shortVideos?: Video[];
+  regularVideos: Video[];
+  shortVideos: Video[];
 };
 
-type AIConsultApiResponse = AIConsultResult & {
-  error?: string;
-};
+const EMPTY_VIDEOS: Video[] = [];
 
 function normalizeVideos(videos: Video[]): VideoWithMetrics[] {
   return videos.map((video) => ({
@@ -445,12 +449,21 @@ const styles = {
   consultButton: {
     padding: "15px 20px",
     borderRadius: "16px",
-    border: "1px solid #111111",
-    backgroundColor: "#111111",
-    color: "#ffffff",
     fontWeight: 800,
-    cursor: "pointer",
-    boxShadow: "0 12px 26px rgba(0,0,0,0.14)",
+  } as const,
+  consultAction: {
+    position: "relative" as const,
+  } as const,
+  consultHint: {
+    position: "absolute" as const,
+    top: "calc(100% + 5px)",
+    left: 0,
+    margin: 0,
+    color: "#4b5563",
+    fontSize: "12px",
+    fontWeight: 700,
+    lineHeight: 1.4,
+    whiteSpace: "nowrap" as const,
   } as const,
   section: {
     backgroundColor: "#ffffff",
@@ -590,9 +603,8 @@ const styles = {
 export function YouTubeForm() {
   const [channelInput, setChannelInput] = useState("@");
   const [loading, setLoading] = useState(false);
-  const [channelTitle, setChannelTitle] = useState("");
-  const [regularVideos, setRegularVideos] = useState<Video[]>([]);
-  const [shortVideos, setShortVideos] = useState<Video[]>([]);
+  const [analysisResult, setAnalysisResult] =
+    useState<ChannelAnalysisResult | null>(null);
   const [error, setError] = useState("");
   const [consultLoading, setConsultLoading] = useState(false);
   const [consultError, setConsultError] = useState("");
@@ -602,13 +614,22 @@ export function YouTubeForm() {
   const currentPlan = hasActiveSubscription ? "standard" : "free";
 
   const fullUrl = `https://www.youtube.com/${channelInput.replace(/^\/+/, "")}`;
+  const channelTitle = analysisResult?.channelTitle ?? "";
+  const regularVideos = analysisResult?.regularVideos ?? EMPTY_VIDEOS;
+  const shortVideos = analysisResult?.shortVideos ?? EMPTY_VIDEOS;
+
+  const handleChannelInputChange = (value: string) => {
+    setChannelInput(value);
+    setAnalysisResult(null);
+    setConsult(null);
+    setError("");
+    setConsultError("");
+  };
 
   const handleFetch = async () => {
     setLoading(true);
     setError("");
-    setChannelTitle("");
-    setRegularVideos([]);
-    setShortVideos([]);
+    setAnalysisResult(null);
     setConsult(null);
     setConsultError("");
 
@@ -619,22 +640,27 @@ export function YouTubeForm() {
 
       const text = await res.text();
 
-      let data: ChannelApiResponse;
+      let data: unknown;
       try {
-        data = JSON.parse(text) as ChannelApiResponse;
+        data = JSON.parse(text) as unknown;
       } catch {
-        throw new Error(`YouTube APIの応答がJSONではありません。status=${res.status}`);
+        setError("チャンネル分析に失敗しました。時間をおいてもう一度お試しください。");
+        return;
       }
 
-      if (!res.ok) {
-        throw new Error(data.error || "取得に失敗しました");
+      const decision = evaluateChannelAnalysisResponse(res.status, data);
+      if (!decision.accepted) {
+        setError(decision.message);
+        return;
       }
 
-      setChannelTitle(data.channelTitle);
-      setRegularVideos(data.regularVideos ?? []);
-      setShortVideos(data.shortVideos ?? []);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "エラーが発生しました");
+      setAnalysisResult({
+        channelTitle: decision.analysis.channelTitle.trim(),
+        regularVideos: (decision.analysis.regularVideos ?? []) as Video[],
+        shortVideos: (decision.analysis.shortVideos ?? []) as Video[],
+      });
+    } catch {
+      setError("チャンネル分析に失敗しました。時間をおいてもう一度お試しください。");
     } finally {
       setLoading(false);
     }
@@ -644,20 +670,34 @@ export function YouTubeForm() {
   const shortAnalysis = getAnalysis(shortVideos);
 
   const consultPayload = useMemo(
-    () =>
-      buildAISummary(
+    () => {
+      if (!analysisResult) return null;
+
+      const candidate = buildAISummary(
         channelTitle,
         regularVideos,
         shortVideos,
         regularAnalysis,
         shortAnalysis
-      ),
-    [channelTitle, regularVideos, shortVideos, regularAnalysis, shortAnalysis]
+      );
+
+      return canRequestAIConsult(candidate) ? candidate : null;
+    },
+    [
+      analysisResult,
+      channelTitle,
+      regularVideos,
+      shortVideos,
+      regularAnalysis,
+      shortAnalysis,
+    ]
   );
 
   const handleConsult = async () => {
     if (!consultPayload) {
-      setConsultError("分析データがありません");
+      setConsultError(
+        "有効な分析結果がありません。チャンネルを再分析してください。"
+      );
       return;
     }
 
@@ -676,21 +716,27 @@ export function YouTubeForm() {
 
       const text = await res.text();
 
-      let data: AIConsultApiResponse;
+      let data: unknown;
       try {
-        data = JSON.parse(text) as AIConsultApiResponse;
+        data = JSON.parse(text) as unknown;
       } catch {
-        throw new Error(`コンサル生成の応答がJSONではありません。status=${res.status}`);
+        setConsultError(
+          "AI提案の生成に失敗しました。時間をおいてもう一度お試しください。"
+        );
+        return;
       }
 
       if (!res.ok) {
-        throw new Error(data.error || "コンサル生成に失敗しました");
+        setConsultError(
+          getSafeClientApiErrorMessage(res.status, data, "ai_consult")
+        );
+        return;
       }
 
-      setConsult(data);
-    } catch (err) {
+      setConsult(data as AIConsultResult);
+    } catch {
       setConsultError(
-        err instanceof Error ? err.message : "コンサル生成エラーが発生しました"
+        "AI提案の生成に失敗しました。時間をおいてもう一度お試しください。"
       );
     } finally {
       setConsultLoading(false);
@@ -716,6 +762,11 @@ export function YouTubeForm() {
     () => getPerformanceBands(shortVideos, shortAnalysis),
     [shortVideos, shortAnalysis]
   );
+  const consultDisabled = isAIConsultButtonDisabled({
+    hasValidAnalysis: consultPayload !== null,
+    analysisLoading: loading,
+    consultLoading,
+  });
 
   return (
     <div style={styles.page}>
@@ -725,21 +776,42 @@ export function YouTubeForm() {
           <input
             type="text"
             value={channelInput}
-            onChange={(e) => setChannelInput(e.target.value)}
+            onChange={(e) => handleChannelInputChange(e.target.value)}
+            disabled={loading || consultLoading}
             placeholder="@チャンネル名"
             style={styles.input}
           />
         </div>
 
-        <button onClick={handleFetch} style={styles.button}>
+        <button
+          onClick={handleFetch}
+          style={styles.button}
+          disabled={loading || consultLoading}
+        >
           {loading ? "分析中..." : "分析する"}
         </button>
 
-        {consultPayload && (
-          <button onClick={handleConsult} style={styles.consultButton}>
-            {consultLoading ? "提案を整理中..." : "提案を見る"}
+        <div style={styles.consultAction}>
+          <button
+            type="button"
+            className="ai-consult-button"
+            onClick={handleConsult}
+            style={styles.consultButton}
+            disabled={consultDisabled}
+            aria-disabled={consultDisabled}
+            aria-busy={consultLoading}
+            aria-describedby={
+              consultPayload ? undefined : "ai-consult-availability-hint"
+            }
+          >
+            {consultLoading ? "提案を作成中..." : "提案を見る"}
           </button>
-        )}
+          {!consultPayload && (
+            <p id="ai-consult-availability-hint" style={styles.consultHint}>
+              チャンネル分析後に利用できます
+            </p>
+          )}
+        </div>
       </div>
 
       {error && <div style={styles.errorBox}>{error}</div>}
