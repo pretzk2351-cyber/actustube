@@ -8,6 +8,13 @@
       "when": 1784282648595,
       "tag": "0000_crazy_spyke",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1784375886279,
+      "tag": "0001_fix_google_oauth_account_variable_conflict",
+      "breakpoints": true
     }
   ]
 }

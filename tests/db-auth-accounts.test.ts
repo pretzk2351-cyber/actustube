@@ -50,6 +50,9 @@ describe("Google account persistence", () => {
     const normalizedSql = built.sql.toLowerCase();
 
     expect(normalizedSql).toContain('"sync_google_oauth_account"');
+    expect(normalizedSql).toContain('"user_id" as "userid"');
+    expect(normalizedSql).toContain('"account_status" as "status"');
+    expect(normalizedSql).toContain('"session_version" as "sessionversion"');
     expect(built.params).toContain("google-account-123");
     expect(normalizedSql).not.toContain("access_token");
     expect(normalizedSql).not.toContain("refresh_token");
