@@ -15,6 +15,13 @@
       "when": 1784375886279,
       "tag": "0001_fix_google_oauth_account_variable_conflict",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784383276018,
+      "tag": "0002_add_atomic_usage_reservation",
+      "breakpoints": true
     }
   ]
 }

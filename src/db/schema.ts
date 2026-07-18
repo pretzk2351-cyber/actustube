@@ -31,7 +31,7 @@ export const planAssignmentSourceEnum = pgEnum("plan_assignment_source", [
 ]);
 
 export const usageMetricEnum = pgEnum("usage_metric", [
-  "analysis",
+  "channel_analysis",
   "ai_consult",
 ]);
 

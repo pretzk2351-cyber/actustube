@@ -9,6 +9,7 @@ import { FREE_PLAN } from "@/db/free-plan";
 import {
   oauthAccounts,
   plans,
+  usageMetricEnum,
   userPlanAssignments,
   users,
   userUsageBuckets,
@@ -29,6 +30,10 @@ function initialMigrationSql() {
 
 function conflictFixMigrationSql() {
   return migrationSql(1);
+}
+
+function usageReservationMigrationSql() {
+  return migrationSql(2);
 }
 
 describe("database schema", () => {
@@ -80,7 +85,11 @@ describe("database schema", () => {
     const serializedSchema = JSON.stringify(
       getTableConfig(oauthAccounts).columns.map((column) => column.name)
     );
-    const sql = `${initialMigrationSql()}\n${conflictFixMigrationSql()}`;
+    const sql = [
+      initialMigrationSql(),
+      conflictFixMigrationSql(),
+      usageReservationMigrationSql(),
+    ].join("\n");
 
     for (const forbidden of [
       "access_token",
@@ -116,13 +125,18 @@ describe("database schema", () => {
     expect(sql).toContain('ON CONFLICT ("code") DO UPDATE');
   });
 
-  it("keeps the applied initial migration unchanged", () => {
-    const normalizedSql = initialMigrationSql().replaceAll("\r\n", "\n");
-    const hash = createHash("sha256").update(normalizedSql).digest("hex");
-
-    expect(hash).toBe(
-      "9bc21d6a4f264ae7e77d790a19cc3165b18c694f02c2c6d7ccdb0d066f36b368"
+  it("keeps both applied migrations unchanged", () => {
+    const hashes = [initialMigrationSql(), conflictFixMigrationSql()].map(
+      (migration) =>
+        createHash("sha256")
+          .update(migration.replaceAll("\r\n", "\n"))
+          .digest("hex")
     );
+
+    expect(hashes).toEqual([
+      "9bc21d6a4f264ae7e77d790a19cc3165b18c694f02c2c6d7ccdb0d066f36b368",
+      "daff8ea267f0bfbc010ae3f09f888b901b6c9d1d887069bf78e6adff924d0a7e",
+    ]);
   });
 
   it("resolves the function-local ON CONFLICT ambiguity without changing its return contract", () => {
@@ -182,5 +196,114 @@ describe("database schema", () => {
     expect(fixSql).toContain(
       "ON CONFLICT (user_id) WHERE status = 'active' DO NOTHING"
     );
+  });
+
+  it("defines only the two approved usage metrics and free limits", () => {
+    const sql = usageReservationMigrationSql();
+    const snapshot = readFileSync(
+      resolve(process.cwd(), "drizzle/meta/0002_snapshot.json"),
+      "utf8"
+    );
+
+    expect(usageMetricEnum.enumValues).toEqual([
+      "channel_analysis",
+      "ai_consult",
+    ]);
+    expect(sql).toContain(
+      `ALTER TYPE "public"."usage_metric" RENAME VALUE 'analysis' TO 'channel_analysis'`
+    );
+    expect(snapshot).toContain('"channel_analysis"');
+    expect(snapshot).not.toMatch(/^\s*"analysis",?$/m);
+    expect(sql).toContain(
+      "WHEN 'channel_analysis' THEN p.analysis_daily_limit"
+    );
+    expect(sql).toContain(
+      "WHEN 'channel_analysis' THEN p.analysis_monthly_limit"
+    );
+    expect(sql).toContain("WHEN 'ai_consult' THEN p.ai_daily_limit");
+    expect(sql).toContain("WHEN 'ai_consult' THEN p.ai_monthly_limit");
+    expect(FREE_PLAN.analysisDailyLimit).toBe(2);
+    expect(FREE_PLAN.analysisMonthlyLimit).toBe(5);
+    expect(FREE_PLAN.aiDailyLimit).toBe(1);
+    expect(FREE_PLAN.aiMonthlyLimit).toBe(3);
+  });
+
+  it("calculates day and month periods explicitly in UTC", () => {
+    const sql = usageReservationMigrationSql();
+
+    expect(sql).toContain(
+      "date_trunc('day', v_now AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+    );
+    expect(sql).toContain(
+      "date_trunc('month', v_now AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+    );
+    expect(sql).toContain("v_daily_start + interval '1 day'");
+    expect(sql).toContain("v_monthly_start + interval '1 month'");
+  });
+
+  it("keeps user, session, and active-plan validation inside PostgreSQL", () => {
+    const sql = usageReservationMigrationSql();
+
+    expect(sql).toContain("FROM public.users AS u");
+    expect(sql).toContain("WHERE u.id = p_user_id");
+    expect(sql).toContain("IF v_user_status <> 'active' THEN");
+    expect(sql).toContain(
+      "IF v_database_session_version <> p_session_version THEN"
+    );
+    expect(sql).toContain("FROM public.user_plan_assignments AS upa");
+    expect(sql).toContain(
+      "INNER JOIN public.plans AS p ON p.code = upa.plan_code"
+    );
+    expect(sql).toContain("AND upa.status = 'active'");
+    expect(sql).toContain("AND upa.starts_at <= v_now");
+    expect(sql).toContain(
+      "AND (upa.ends_at IS NULL OR upa.ends_at > v_now)"
+    );
+    expect(sql).toContain("AND p.active = true");
+  });
+
+  it("reserves daily and monthly buckets atomically under one advisory lock", () => {
+    const sql = usageReservationMigrationSql();
+    const dailyDenial = sql.indexOf("IF v_daily_used >= v_daily_limit THEN");
+    const monthlyDenial = sql.indexOf(
+      "IF v_monthly_used >= v_monthly_limit THEN"
+    );
+    const dailyWrite = sql.indexOf(
+      "INSERT INTO public.user_usage_buckets AS daily_bucket"
+    );
+    const monthlyWrite = sql.indexOf(
+      "INSERT INTO public.user_usage_buckets AS monthly_bucket"
+    );
+
+    expect(sql).toContain("pg_advisory_xact_lock");
+    expect(sql).toContain(
+      "'usage:' || p_user_id::text || ':' || p_metric::text"
+    );
+    expect(dailyDenial).toBeGreaterThan(-1);
+    expect(monthlyDenial).toBeGreaterThan(dailyDenial);
+    expect(dailyWrite).toBeGreaterThan(monthlyDenial);
+    expect(monthlyWrite).toBeGreaterThan(dailyWrite);
+    expect(sql.match(/ON CONFLICT \(user_id, metric, period_kind, period_start\)/g)).toHaveLength(
+      2
+    );
+    expect(sql).toContain("limit_snapshot = EXCLUDED.limit_snapshot");
+  });
+
+  it("keeps the reservation function scoped and unambiguous", () => {
+    const sql = usageReservationMigrationSql();
+    const directivePosition = sql.indexOf("#variable_conflict use_column");
+    const firstConflictPosition = sql.indexOf(
+      "ON CONFLICT (user_id, metric, period_kind, period_start)"
+    );
+
+    expect(sql).toContain('SECURITY INVOKER');
+    expect(sql).toContain("SET search_path = public, pg_temp");
+    expect(sql).toContain(
+      'REVOKE ALL ON FUNCTION "public"."reserve_usage_limits"'
+    );
+    expect(directivePosition).toBeGreaterThan(-1);
+    expect(firstConflictPosition).toBeGreaterThan(directivePosition);
+    expect(sql).not.toMatch(/https?:\/\//);
+    expect(sql).not.toMatch(/\b(?:email|provider_account_id|access_token)\b/i);
   });
 });
