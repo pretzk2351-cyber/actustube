@@ -8,14 +8,19 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
+    "@neondatabase/serverless": "1.1.0",
+    "drizzle-orm": "0.45.2",
     "next": "15.5.20",
     "next-auth": "^5.0.0-beta.25",
     "openai": "^6.1.0",
     "react": "19.0.0",
     "react-dom": "19.0.0",
+    "server-only": "0.0.1",
     "stripe": "^18.0.0"
   },
   "devDependencies": {
@@ -23,12 +28,16 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "drizzle-kit": "0.31.10",
     "eslint": "^9",
     "eslint-config-next": "15.5.20",
     "typescript": "^5",
     "vitest": "^4.1.10"
   },
   "overrides": {
-    "postcss": "8.5.19"
+    "postcss": "8.5.19",
+    "@esbuild-kit/core-utils": {
+      "esbuild": "0.25.12"
+    }
   }
 }

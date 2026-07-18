@@ -11,6 +11,7 @@ const authState = vi.hoisted(() => ({
 const jwtState = vi.hoisted(() => ({
   token: null as null | {
     sub: string;
+    internalUserId?: string;
     accessToken: string;
     refreshToken: string;
     accessTokenExpiresAt: number;
@@ -165,7 +166,8 @@ beforeEach(() => {
     expires: "2099-01-01T00:00:00.000Z",
   };
   jwtState.token = {
-    sub: "test-user-id",
+    sub: "authjs-subject-not-internal-user-id",
+    internalUserId: "test-user-id",
     accessToken: "test-google-access-token",
     refreshToken: "test-google-refresh-token",
     accessTokenExpiresAt: Math.floor(Date.now() / 1_000) + 3_600,
@@ -373,7 +375,7 @@ describe("authenticated API success responses", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it("returns 200 from GET /api/youtube/my-channels with a mocked OAuth response", async () => {
+  it("uses OAuth when internalUserId matches even if token.sub differs", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(
       jsonResponse({
         items: [
@@ -391,6 +393,40 @@ describe("authenticated API success responses", () => {
 
     expect(response.status).toBe(200);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an OAuth JWT whose internal user ID differs from the session user", async () => {
+    if (jwtState.token) {
+      jwtState.token.sub = "test-user-id";
+      jwtState.token.internalUserId = "different-internal-user-id";
+    }
+
+    const response = await myChannelsGet(
+      authenticatedGet("http://localhost/api/youtube/my-channels")
+    );
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: "YouTube authorization is required.",
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back to token.sub when the internal user ID is missing", async () => {
+    if (jwtState.token) {
+      jwtState.token.sub = "test-user-id";
+      jwtState.token.internalUserId = undefined;
+    }
+
+    const response = await myChannelsGet(
+      authenticatedGet("http://localhost/api/youtube/my-channels")
+    );
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: "YouTube authorization is required.",
+    });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("returns 200 from GET /api/youtube/my-channels/videos with a mocked OAuth response", async () => {

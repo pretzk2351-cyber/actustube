@@ -192,7 +192,7 @@ export async function getServerOAuthAccessToken(
       cookieName,
       salt: cookieName,
     });
-    if (!token || token.sub !== expectedUserId) continue;
+    if (!token || token.internalUserId !== expectedUserId) continue;
 
     const googleToken = await getValidGoogleToken(token);
 

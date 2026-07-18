@@ -13,6 +13,9 @@ declare module "next-auth/jwt" {
     accessToken?: string;
     refreshToken?: string;
     accessTokenExpiresAt?: number;
+    internalUserId?: string;
+    accountStatus?: "active" | "suspended" | "deleted";
+    sessionVersion?: number;
     googleTokenError?:
       | "ReauthenticationRequired"
       | "ConfigurationError"

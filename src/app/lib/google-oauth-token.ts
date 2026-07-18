@@ -78,16 +78,16 @@ function fingerprint(value: string) {
   return createHash("sha256").update(value).digest("base64url");
 }
 
-function getSubjectCachePrefix(subject: unknown) {
-  return typeof subject === "string" && subject.length > 0
-    ? fingerprint(subject)
+function getInternalUserCachePrefix(internalUserId: unknown) {
+  return typeof internalUserId === "string" && internalUserId.length > 0
+    ? internalUserId
     : null;
 }
 
 function getCacheKey(token: JWT, refreshToken: string) {
-  const subjectPrefix = getSubjectCachePrefix(token.sub);
-  return subjectPrefix
-    ? `${subjectPrefix}:${fingerprint(refreshToken)}`
+  const internalUserPrefix = getInternalUserCachePrefix(token.internalUserId);
+  return internalUserPrefix
+    ? `${internalUserPrefix}:${fingerprint(refreshToken)}`
     : null;
 }
 
@@ -286,11 +286,11 @@ async function refreshGoogleToken(
   }
 }
 
-export function clearGoogleTokenCache(subject: unknown) {
-  const subjectPrefix = getSubjectCachePrefix(subject);
-  if (!subjectPrefix) return;
+export function clearGoogleTokenCache(internalUserId: unknown) {
+  const internalUserPrefix = getInternalUserCachePrefix(internalUserId);
+  if (!internalUserPrefix) return;
 
-  const keyPrefix = `${subjectPrefix}:`;
+  const keyPrefix = `${internalUserPrefix}:`;
 
   for (const key of accessTokenCache.keys()) {
     if (key.startsWith(keyPrefix)) accessTokenCache.delete(key);
@@ -306,7 +306,7 @@ export function clearGoogleTokenCache(subject: unknown) {
 }
 
 export function storeInitialGoogleToken(token: JWT, account: Account) {
-  clearGoogleTokenCache(token.sub);
+  clearGoogleTokenCache(token.internalUserId);
 
   token.accessToken = isBoundedToken(account.access_token)
     ? account.access_token
@@ -325,6 +325,10 @@ export function storeInitialGoogleToken(token: JWT, account: Account) {
 }
 
 export async function getValidGoogleToken(token: JWT): Promise<GoogleTokenResult> {
+  if (!getInternalUserCachePrefix(token.internalUserId)) {
+    return { status: "reauthentication_required" };
+  }
+
   const accessToken = token.accessToken;
   const accessTokenExpiresAt = token.accessTokenExpiresAt;
 

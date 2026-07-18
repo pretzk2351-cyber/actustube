@@ -8,16 +8,18 @@ import {
 
 const NOW = new Date("2026-07-17T00:00:00.000Z");
 const NOW_SECONDS = Math.floor(NOW.getTime() / 1_000);
-const subjects = new Set<string>();
-let subjectSequence = 0;
+const internalUserIds = new Set<string>();
+let userSequence = 0;
 
 function createToken(overrides: Partial<JWT> = {}): JWT {
-  subjectSequence += 1;
-  const sub = `test-user-${subjectSequence}`;
-  subjects.add(sub);
+  userSequence += 1;
+  const internalUserId =
+    overrides.internalUserId ?? `internal-user-${userSequence}`;
+  internalUserIds.add(internalUserId);
 
   return {
-    sub,
+    sub: `authjs-subject-${userSequence}`,
+    internalUserId,
     accessToken: "test-access-token-old",
     refreshToken: "test-refresh-token-old",
     accessTokenExpiresAt: NOW_SECONDS - 1,
@@ -56,8 +58,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const subject of subjects) clearGoogleTokenCache(subject);
-  subjects.clear();
+  for (const internalUserId of internalUserIds) {
+    clearGoogleTokenCache(internalUserId);
+  }
+  internalUserIds.clear();
 });
 
 describe("getValidGoogleToken", () => {
@@ -143,6 +147,18 @@ describe("getValidGoogleToken", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("requires reauthentication without falling back to token.sub when internalUserId is missing", async () => {
+    const result = await getValidGoogleToken(
+      createToken({
+        sub: "authjs-subject-must-not-be-used",
+        internalUserId: undefined,
+      })
+    );
+
+    expect(result).toEqual({ status: "reauthentication_required" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("maps invalid_grant to a safe reauthentication result", async () => {
     mockTokenResponse(
       {
@@ -187,7 +203,7 @@ describe("getValidGoogleToken", () => {
     });
   });
 
-  it("coalesces concurrent refreshes for one user in a single process", async () => {
+  it("coalesces concurrent refreshes with the same internal user ID and refresh token", async () => {
     let resolveFetch: ((response: Response) => void) | undefined;
     vi.mocked(fetch).mockImplementationOnce(
       () =>
@@ -195,10 +211,19 @@ describe("getValidGoogleToken", () => {
           resolveFetch = resolve;
         })
     );
-    const token = createToken();
+    const firstToken = createToken({
+      sub: "first-authjs-subject",
+      internalUserId: "shared-internal-user",
+      refreshToken: "shared-refresh-token",
+    });
+    const secondToken = createToken({
+      sub: "second-authjs-subject",
+      internalUserId: "shared-internal-user",
+      refreshToken: "shared-refresh-token",
+    });
 
-    const first = getValidGoogleToken(token);
-    const second = getValidGoogleToken(token);
+    const first = getValidGoogleToken(firstToken);
+    const second = getValidGoogleToken(secondToken);
     await Promise.resolve();
 
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -216,6 +241,37 @@ describe("getValidGoogleToken", () => {
     const [firstResult, secondResult] = await Promise.all([first, second]);
     expect(firstResult).toEqual(secondResult);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not share concurrent refreshes between different internal users", async () => {
+    mockSuccessfulRefresh({ access_token: "test-access-token-user-one" });
+    mockSuccessfulRefresh({ access_token: "test-access-token-user-two" });
+    const sharedRefreshToken = "test-shared-refresh-token";
+    const firstToken = createToken({
+      sub: "shared-authjs-subject",
+      internalUserId: "internal-user-one",
+      refreshToken: sharedRefreshToken,
+    });
+    const secondToken = createToken({
+      sub: "shared-authjs-subject",
+      internalUserId: "internal-user-two",
+      refreshToken: sharedRefreshToken,
+    });
+
+    const [firstResult, secondResult] = await Promise.all([
+      getValidGoogleToken(firstToken),
+      getValidGoogleToken(secondToken),
+    ]);
+
+    expect(firstResult).toMatchObject({
+      status: "success",
+      accessToken: "test-access-token-user-one",
+    });
+    expect(secondResult).toMatchObject({
+      status: "success",
+      accessToken: "test-access-token-user-two",
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("does not expose tokens, client secret, or raw Google details in failures", async () => {
