@@ -28,6 +28,7 @@ const usageState = vi.hoisted(() => ({
   release: vi.fn(),
   finalize: vi.fn(),
 }));
+const staleRecoveryState = vi.hoisted(() => ({ recover: vi.fn() }));
 
 vi.mock("@/auth", () => ({
   auth: vi.fn((handler?: (request: Request & { auth: unknown }) => unknown) => {
@@ -51,6 +52,11 @@ vi.mock("@/db/usage-limits", () => ({
   reserveUsage: usageState.reserve,
   releaseUsageReservation: usageState.release,
   finalizeUsageReservation: usageState.finalize,
+}));
+
+vi.mock("@/app/lib/stale-reservation-recovery", () => ({
+  OPPORTUNISTIC_RECOVERY_BATCH_SIZE: 25,
+  recoverExpiredUsageReservations: staleRecoveryState.recover,
 }));
 
 vi.mock("openai", () => ({
@@ -236,6 +242,7 @@ beforeEach(() => {
     monthlyUsed: 0,
   });
   usageState.finalize.mockResolvedValue(true);
+  staleRecoveryState.recover.mockResolvedValue({ recovered: 0 });
 });
 
 describe("API authentication and retired route", () => {
@@ -343,6 +350,7 @@ describe("successful usage reservations", () => {
       sessionVersion: 7,
       metric: "channel_analysis",
     });
+    expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
     expect(usageState.finalize).toHaveBeenCalledWith({
       reservationId: RESERVATION_ID,
       userId: INTERNAL_USER_ID,
@@ -388,6 +396,26 @@ describe("successful usage reservations", () => {
     expect(body.usage.metric).toBe("ai_consult");
     expect(body.usage.dailyLimit).toBe(1);
     expect(body.usage.monthlyLimit).toBe(3);
+  });
+
+  it("continues normal usage when opportunistic recovery fails", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    staleRecoveryState.recover.mockRejectedValue(
+      new Error("postgresql://user:secret@example.test/database")
+    );
+    installChannelFetchMock();
+
+    const response = await youtubeChannelGet(channelRequest());
+
+    expect(response.status).toBe(200);
+    expect(usageState.reserve).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(
+      "usage-reservation-opportunistic-recovery failed",
+      { errorName: "Error" }
+    );
+    expect(JSON.stringify(await response.json())).not.toContain(
+      "secret@example"
+    );
   });
 });
 

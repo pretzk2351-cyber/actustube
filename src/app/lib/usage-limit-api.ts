@@ -10,6 +10,10 @@ import {
 } from "@/db/usage-limits";
 
 import { getServerUsageIdentity } from "./api-security";
+import {
+  OPPORTUNISTIC_RECOVERY_BATCH_SIZE,
+  recoverExpiredUsageReservations,
+} from "./stale-reservation-recovery";
 
 export type PublicUsage = {
   metric: UsageMetric;
@@ -120,6 +124,12 @@ export async function reserveApiUsage(
   const identity = await getServerUsageIdentity(request, sessionUserId);
   if (!identity) {
     return { allowed: false, response: reauthenticationRequiredResponse() };
+  }
+
+  try {
+    await recoverExpiredUsageReservations(OPPORTUNISTIC_RECOVERY_BATCH_SIZE);
+  } catch (error) {
+    logSafeLifecycleError("usage-reservation-opportunistic-recovery", error);
   }
 
   const reservation = await reserveUsage({
