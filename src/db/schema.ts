@@ -1,9 +1,12 @@
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   check,
+  foreignKey,
   index,
   integer,
+  jsonb,
   pgEnum,
   pgTable,
   text,
@@ -12,6 +15,11 @@ import {
   uuid,
   varchar,
 } from "drizzle-orm/pg-core";
+
+import type {
+  AIConsultSnapshot,
+  ChannelAnalysisSnapshot,
+} from "@/app/lib/weekly-cycle-types";
 
 export const userStatusEnum = pgEnum("user_status", [
   "active",
@@ -39,6 +47,11 @@ export const usagePeriodKindEnum = pgEnum("usage_period_kind", [
   "day",
   "month",
 ]);
+
+export const improvementActionStatusEnum = pgEnum(
+  "improvement_action_status",
+  ["planned", "completed", "skipped"]
+);
 
 const auditTimestamps = {
   createdAt: timestamp("created_at", { withTimezone: true })
@@ -219,6 +232,105 @@ export const usageReservationLeases = pgTable(
   ]
 );
 
+export const analysisRuns = pgTable(
+  "analysis_runs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    channelId: varchar("channel_id", { length: 24 }).notNull(),
+    channelTitle: varchar("channel_title", { length: 200 }).notNull(),
+    snapshotVersion: integer("snapshot_version").default(1).notNull(),
+    analysisSnapshot: jsonb("analysis_snapshot")
+      .$type<ChannelAnalysisSnapshot>()
+      .notNull(),
+    regularVideoCount: integer("regular_video_count").notNull(),
+    shortVideoCount: integer("short_video_count").notNull(),
+    regularAverageViews: bigint("regular_average_views", {
+      mode: "number",
+    }).notNull(),
+    shortAverageViews: bigint("short_average_views", {
+      mode: "number",
+    }).notNull(),
+    aiConsultSnapshot: jsonb("ai_consult_snapshot").$type<AIConsultSnapshot>(),
+    analyzedAt: timestamp("analyzed_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    aiConsultCreatedAt: timestamp("ai_consult_created_at", {
+      withTimezone: true,
+    }),
+    ...auditTimestamps,
+  },
+  (table) => [
+    uniqueIndex("analysis_runs_id_user_unique").on(table.id, table.userId),
+    index("analysis_runs_user_analyzed_idx").on(
+      table.userId,
+      table.analyzedAt,
+      table.id
+    ),
+    check("analysis_runs_channel_id_valid", sql`length(${table.channelId}) = 24`),
+    check(
+      "analysis_runs_counts_nonnegative",
+      sql`${table.regularVideoCount} >= 0
+        AND ${table.shortVideoCount} >= 0
+        AND ${table.regularAverageViews} >= 0
+        AND ${table.shortAverageViews} >= 0`
+    ),
+    check(
+      "analysis_runs_ai_consult_timestamp_consistent",
+      sql`(${table.aiConsultSnapshot} IS NULL AND ${table.aiConsultCreatedAt} IS NULL)
+        OR (${table.aiConsultSnapshot} IS NOT NULL AND ${table.aiConsultCreatedAt} IS NOT NULL)`
+    ),
+  ]
+);
+
+export const improvementActions = pgTable(
+  "improvement_actions",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    analysisRunId: uuid("analysis_run_id").notNull(),
+    title: varchar("title", { length: 200 }).notNull(),
+    description: text("description").notNull(),
+    status: improvementActionStatusEnum("status").default("planned").notNull(),
+    resultNote: text("result_note"),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    ...auditTimestamps,
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.analysisRunId, table.userId],
+      foreignColumns: [analysisRuns.id, analysisRuns.userId],
+      name: "improvement_actions_owned_analysis_fk",
+    }).onDelete("cascade"),
+    uniqueIndex("improvement_actions_analysis_run_unique").on(
+      table.analysisRunId
+    ),
+    uniqueIndex("improvement_actions_one_planned_per_user")
+      .on(table.userId)
+      .where(sql`${table.status} = 'planned'`),
+    index("improvement_actions_user_updated_idx").on(
+      table.userId,
+      table.updatedAt
+    ),
+    check(
+      "improvement_actions_text_valid",
+      sql`length(btrim(${table.title})) > 0
+        AND length(${table.description}) <= 2000
+        AND (${table.resultNote} IS NULL OR length(${table.resultNote}) <= 2000)`
+    ),
+    check(
+      "improvement_actions_result_consistent",
+      sql`(${table.status} = 'planned' AND ${table.resultNote} IS NULL AND ${table.completedAt} IS NULL)
+        OR (${table.status} = 'completed' AND ${table.resultNote} IS NOT NULL AND length(btrim(${table.resultNote})) > 0 AND ${table.completedAt} IS NOT NULL)
+        OR (${table.status} = 'skipped' AND ${table.resultNote} IS NOT NULL AND length(btrim(${table.resultNote})) > 0 AND ${table.completedAt} IS NULL)`
+    ),
+  ]
+);
+
 export type UserStatus = (typeof userStatusEnum.enumValues)[number];
 export type UserRecord = typeof users.$inferSelect;
 export type NewUserRecord = typeof users.$inferInsert;
@@ -228,3 +340,5 @@ export type UserPlanAssignmentRecord = typeof userPlanAssignments.$inferSelect;
 export type UserUsageBucketRecord = typeof userUsageBuckets.$inferSelect;
 export type UsageReservationLeaseRecord =
   typeof usageReservationLeases.$inferSelect;
+export type AnalysisRunRecord = typeof analysisRuns.$inferSelect;
+export type ImprovementActionRecord = typeof improvementActions.$inferSelect;

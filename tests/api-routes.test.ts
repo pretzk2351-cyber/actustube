@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 
 const INTERNAL_USER_ID = "9e7b7a4c-6fc8-448d-bcb5-4331fa8910a9";
 const RESERVATION_ID = "a95fa157-5f30-42ca-97ea-d7ba4f23f331";
+const ANALYSIS_RUN_ID = "3ecce3e0-2dd5-4b57-9a4a-f26b4c7793b3";
 
 const authState = vi.hoisted(() => ({
   session: null as null | {
@@ -29,6 +30,20 @@ const usageState = vi.hoisted(() => ({
   finalize: vi.fn(),
 }));
 const staleRecoveryState = vi.hoisted(() => ({ recover: vi.fn() }));
+const weeklyCycleState = vi.hoisted(() => ({
+  finalizeChannel: vi.fn(),
+  finalizeAI: vi.fn(),
+  analysisBelongs: vi.fn(),
+  list: vi.fn(),
+  create: vi.fn(),
+  update: vi.fn(),
+  identityValid: vi.fn(),
+}));
+const weeklyCycleErrors = vi.hoisted(() => ({
+  NotFound: class WeeklyCycleNotFoundError extends Error {},
+  Conflict: class WeeklyCycleConflictError extends Error {},
+  Persistence: class WeeklyCyclePersistenceError extends Error {},
+}));
 
 vi.mock("@/auth", () => ({
   auth: vi.fn((handler?: (request: Request & { auth: unknown }) => unknown) => {
@@ -59,6 +74,20 @@ vi.mock("@/app/lib/stale-reservation-recovery", () => ({
   recoverExpiredUsageReservations: staleRecoveryState.recover,
 }));
 
+vi.mock("@/db/weekly-cycle", () => ({
+  finalizeChannelAnalysis: weeklyCycleState.finalizeChannel,
+  finalizeAIConsult: weeklyCycleState.finalizeAI,
+  analysisRunBelongsToUser: weeklyCycleState.analysisBelongs,
+  listWeeklyCycles: weeklyCycleState.list,
+  createImprovementAction: weeklyCycleState.create,
+  updateImprovementAction: weeklyCycleState.update,
+  weeklyCycleIdentityIsValid: weeklyCycleState.identityValid,
+  decodeHistoryCursor: vi.fn(() => null),
+  WeeklyCycleNotFoundError: weeklyCycleErrors.NotFound,
+  WeeklyCycleConflictError: weeklyCycleErrors.Conflict,
+  WeeklyCyclePersistenceError: weeklyCycleErrors.Persistence,
+}));
+
 vi.mock("openai", () => ({
   default: class MockOpenAI {
     responses = { create: openAIState.create };
@@ -72,6 +101,12 @@ let analyzePost: RouteHandler;
 let youtubeChannelGet: RouteHandler;
 let myChannelsGet: RouteHandler;
 let myChannelVideosGet: RouteHandler;
+let weeklyCycleGet: RouteHandler;
+let weeklyActionPost: RouteHandler;
+let weeklyActionPatch: (
+  request: NextRequest,
+  context: { params: Promise<{ actionId: string }> }
+) => Promise<Response>;
 
 const originalYouTubeApiKey = process.env.YOUTUBE_API_KEY;
 
@@ -190,12 +225,18 @@ beforeAll(async () => {
     youtubeChannelRoute,
     myChannelsRoute,
     myChannelVideosRoute,
+    weeklyCycleRoute,
+    weeklyActionRoute,
+    weeklyActionUpdateRoute,
   ] = await Promise.all([
     import("@/app/api/ai-consult/route"),
     import("@/app/api/analyze/route"),
     import("@/app/api/youtube/channel/route"),
     import("@/app/api/youtube/my-channels/route"),
     import("@/app/api/youtube/my-channels/videos/route"),
+    import("@/app/api/weekly-cycle/route"),
+    import("@/app/api/weekly-cycle/actions/route"),
+    import("@/app/api/weekly-cycle/actions/[actionId]/route"),
   ]);
 
   aiConsultPost = aiConsultRoute.POST;
@@ -203,6 +244,9 @@ beforeAll(async () => {
   youtubeChannelGet = youtubeChannelRoute.GET;
   myChannelsGet = myChannelsRoute.GET as unknown as RouteHandler;
   myChannelVideosGet = myChannelVideosRoute.GET as unknown as RouteHandler;
+  weeklyCycleGet = weeklyCycleRoute.GET;
+  weeklyActionPost = weeklyActionRoute.POST;
+  weeklyActionPatch = weeklyActionUpdateRoute.PATCH;
 });
 
 afterAll(() => {
@@ -243,6 +287,37 @@ beforeEach(() => {
   });
   usageState.finalize.mockResolvedValue(true);
   staleRecoveryState.recover.mockResolvedValue({ recovered: 0 });
+  weeklyCycleState.finalizeChannel.mockResolvedValue(ANALYSIS_RUN_ID);
+  weeklyCycleState.finalizeAI.mockResolvedValue(true);
+  weeklyCycleState.analysisBelongs.mockResolvedValue(true);
+  weeklyCycleState.list.mockResolvedValue({
+    items: [],
+    plannedAction: null,
+    nextCursor: null,
+  });
+  weeklyCycleState.create.mockResolvedValue({
+    id: "267c7d5d-d722-4a64-bcf2-13058333109c",
+    analysisRunId: ANALYSIS_RUN_ID,
+    title: "Improve the opening",
+    description: "Show the result first",
+    status: "planned",
+    resultNote: null,
+    createdAt: "2026-07-19T00:00:00.000Z",
+    updatedAt: "2026-07-19T00:00:00.000Z",
+    completedAt: null,
+  });
+  weeklyCycleState.update.mockResolvedValue({
+    id: "267c7d5d-d722-4a64-bcf2-13058333109c",
+    analysisRunId: ANALYSIS_RUN_ID,
+    title: "Improve the opening",
+    description: "Show the result first",
+    status: "completed",
+    resultNote: "Retention improved",
+    createdAt: "2026-07-19T00:00:00.000Z",
+    updatedAt: "2026-07-20T00:00:00.000Z",
+    completedAt: "2026-07-20T00:00:00.000Z",
+  });
+  weeklyCycleState.identityValid.mockResolvedValue(true);
 });
 
 describe("API authentication and retired route", () => {
@@ -300,6 +375,144 @@ describe("API authentication and retired route", () => {
   });
 });
 
+describe("weekly improvement cycle APIs", () => {
+  it.each([
+    {
+      name: "history",
+      invoke: () => weeklyCycleGet(authenticatedGet("http://localhost/api/weekly-cycle")),
+    },
+    {
+      name: "action creation",
+      invoke: () =>
+        weeklyActionPost(
+          jsonRequest("http://localhost/api/weekly-cycle/actions", {
+            analysisRunId: ANALYSIS_RUN_ID,
+            title: "Improve the opening",
+            description: "Show the result first",
+          })
+        ),
+    },
+    {
+      name: "action update",
+      invoke: () =>
+        weeklyActionPatch(
+          jsonRequest(
+            "http://localhost/api/weekly-cycle/actions/267c7d5d-d722-4a64-bcf2-13058333109c",
+            { status: "completed", resultNote: "Retention improved" }
+          ),
+          {
+            params: Promise.resolve({
+              actionId: "267c7d5d-d722-4a64-bcf2-13058333109c",
+            }),
+          }
+        ),
+    },
+  ])("returns 401 for unauthenticated $name", async ({ invoke }) => {
+    authState.session = null;
+    const response = await invoke();
+    expect(response.status).toBe(401);
+    expect(weeklyCycleState.list).not.toHaveBeenCalled();
+    expect(weeklyCycleState.create).not.toHaveBeenCalled();
+    expect(weeklyCycleState.update).not.toHaveBeenCalled();
+  });
+
+  it("uses only the authenticated internal user ID for history and action writes", async () => {
+    await weeklyCycleGet(authenticatedGet("http://localhost/api/weekly-cycle?limit=10"));
+    await weeklyActionPost(
+      jsonRequest("http://localhost/api/weekly-cycle/actions", {
+        analysisRunId: ANALYSIS_RUN_ID,
+        title: "Improve the opening",
+        description: "Show the result first",
+        userId: "attacker",
+      })
+    );
+    await weeklyActionPatch(
+      jsonRequest(
+        "http://localhost/api/weekly-cycle/actions/267c7d5d-d722-4a64-bcf2-13058333109c",
+        { status: "completed", resultNote: "Retention improved", userId: "attacker" }
+      ),
+      {
+        params: Promise.resolve({
+          actionId: "267c7d5d-d722-4a64-bcf2-13058333109c",
+        }),
+      }
+    );
+
+    expect(weeklyCycleState.list).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: INTERNAL_USER_ID, limit: 10 })
+    );
+    expect(weeklyCycleState.create).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: INTERNAL_USER_ID, analysisRunId: ANALYSIS_RUN_ID })
+    );
+    expect(weeklyCycleState.update).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: INTERNAL_USER_ID, status: "completed" })
+    );
+  });
+
+  it("rejects a stale or inactive persisted identity", async () => {
+    weeklyCycleState.identityValid.mockResolvedValueOnce(false);
+    const response = await weeklyCycleGet(
+      authenticatedGet("http://localhost/api/weekly-cycle")
+    );
+
+    expect(response.status).toBe(401);
+    expect(weeklyCycleState.list).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when an analysis or action is not owned by the user", async () => {
+    weeklyCycleState.create.mockRejectedValueOnce(new weeklyCycleErrors.NotFound());
+    const createResponse = await weeklyActionPost(
+      jsonRequest("http://localhost/api/weekly-cycle/actions", {
+        analysisRunId: ANALYSIS_RUN_ID,
+        title: "Other user's analysis",
+        description: "",
+      })
+    );
+
+    weeklyCycleState.update.mockRejectedValueOnce(new weeklyCycleErrors.NotFound());
+    const updateResponse = await weeklyActionPatch(
+      jsonRequest(
+        "http://localhost/api/weekly-cycle/actions/267c7d5d-d722-4a64-bcf2-13058333109c",
+        { status: "skipped", resultNote: "Not applicable" }
+      ),
+      {
+        params: Promise.resolve({
+          actionId: "267c7d5d-d722-4a64-bcf2-13058333109c",
+        }),
+      }
+    );
+
+    expect(createResponse.status).toBe(404);
+    expect(updateResponse.status).toBe(404);
+  });
+
+  it("rejects invalid status and reports planned-action conflicts", async () => {
+    const invalid = await weeklyActionPatch(
+      jsonRequest(
+        "http://localhost/api/weekly-cycle/actions/267c7d5d-d722-4a64-bcf2-13058333109c",
+        { status: "invalid", resultNote: "x" }
+      ),
+      {
+        params: Promise.resolve({
+          actionId: "267c7d5d-d722-4a64-bcf2-13058333109c",
+        }),
+      }
+    );
+    expect(invalid.status).toBe(400);
+    expect(weeklyCycleState.update).not.toHaveBeenCalled();
+
+    weeklyCycleState.create.mockRejectedValueOnce(new weeklyCycleErrors.Conflict());
+    const conflict = await weeklyActionPost(
+      jsonRequest("http://localhost/api/weekly-cycle/actions", {
+        analysisRunId: ANALYSIS_RUN_ID,
+        title: "Second planned action",
+        description: "",
+      })
+    );
+    expect(conflict.status).toBe(409);
+  });
+});
+
 describe("validation occurs before usage reservation", () => {
   it("rejects invalid AI consultation input without consuming usage", async () => {
     const response = await aiConsultPost(
@@ -351,13 +564,21 @@ describe("successful usage reservations", () => {
       metric: "channel_analysis",
     });
     expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
-    expect(usageState.finalize).toHaveBeenCalledWith({
-      reservationId: RESERVATION_ID,
-      userId: INTERNAL_USER_ID,
-    });
+    expect(weeklyCycleState.finalizeChannel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reservationId: RESERVATION_ID,
+        userId: INTERNAL_USER_ID,
+        snapshot: expect.objectContaining({
+          channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
+          channelTitle: "Test Channel",
+        }),
+      })
+    );
+    expect(usageState.finalize).not.toHaveBeenCalled();
     expect(usageState.release).not.toHaveBeenCalled();
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(body.plan).toBe("free");
+    expect(body.analysisRunId).toBe(ANALYSIS_RUN_ID);
     expect(body.usage).toEqual({
       metric: "channel_analysis",
       planCode: "free",
@@ -376,6 +597,7 @@ describe("successful usage reservations", () => {
     const response = await aiConsultPost(
       jsonRequest("http://localhost/api/ai-consult", {
         aiSummary: validAISummary(),
+        analysisRunId: ANALYSIS_RUN_ID,
         userId: "attacker",
         plan: "paid",
         limit: 999_999,
@@ -389,7 +611,18 @@ describe("successful usage reservations", () => {
       sessionVersion: 7,
       metric: "ai_consult",
     });
-    expect(usageState.finalize).toHaveBeenCalledTimes(1);
+    expect(weeklyCycleState.analysisBelongs).toHaveBeenCalledWith(
+      INTERNAL_USER_ID,
+      ANALYSIS_RUN_ID
+    );
+    expect(weeklyCycleState.finalizeAI).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reservationId: RESERVATION_ID,
+        userId: INTERNAL_USER_ID,
+        analysisRunId: ANALYSIS_RUN_ID,
+      })
+    );
+    expect(usageState.finalize).not.toHaveBeenCalled();
     expect(usageState.release).not.toHaveBeenCalled();
     expect(openAIState.create).toHaveBeenCalledTimes(1);
     expect(body.overallDiagnosis).toBe("Test diagnosis");
@@ -525,6 +758,7 @@ describe("external failures release usage", () => {
       userId: INTERNAL_USER_ID,
     });
     expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeChannel).not.toHaveBeenCalled();
     expect(serialized).not.toContain("secret");
   });
 
@@ -544,6 +778,7 @@ describe("external failures release usage", () => {
     const response = await aiConsultPost(
       jsonRequest("http://localhost/api/ai-consult", {
         aiSummary: validAISummary(),
+        analysisRunId: ANALYSIS_RUN_ID,
       })
     );
     const serialized = JSON.stringify(await response.json());
@@ -551,6 +786,7 @@ describe("external failures release usage", () => {
     expect(response.status).toBe(status);
     expect(usageState.release).toHaveBeenCalledTimes(1);
     expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeAI).not.toHaveBeenCalled();
     expect(serialized).not.toContain("secret");
   });
 
@@ -566,6 +802,7 @@ describe("external failures release usage", () => {
     const response = await aiConsultPost(
       jsonRequest("http://localhost/api/ai-consult", {
         aiSummary: validAISummary(),
+        analysisRunId: ANALYSIS_RUN_ID,
       })
     );
     const body = JSON.stringify(await response.json());
@@ -590,6 +827,40 @@ describe("external failures release usage", () => {
     expect(body).toBe(JSON.stringify({ error: "An internal server error occurred." }));
     expect(body).not.toContain("database-secret");
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing or other-user analysis before AI usage or external work", async () => {
+    weeklyCycleState.analysisBelongs.mockResolvedValueOnce(false);
+
+    const response = await aiConsultPost(
+      jsonRequest("http://localhost/api/ai-consult", {
+        aiSummary: validAISummary(),
+        analysisRunId: ANALYSIS_RUN_ID,
+      })
+    );
+
+    expect(response.status).toBe(404);
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(openAIState.create).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeAI).not.toHaveBeenCalled();
+  });
+
+  it("releases usage when atomic history finalization fails", async () => {
+    installChannelFetchMock();
+    weeklyCycleState.finalizeChannel.mockRejectedValueOnce(
+      new Error("postgresql://user:database-secret@example.test/database")
+    );
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await youtubeChannelGet(channelRequest());
+    const body = JSON.stringify(await response.json());
+
+    expect(response.status).toBe(500);
+    expect(usageState.release).toHaveBeenCalledWith({
+      reservationId: RESERVATION_ID,
+      userId: INTERNAL_USER_ID,
+    });
+    expect(body).not.toContain("database-secret");
   });
 });
 

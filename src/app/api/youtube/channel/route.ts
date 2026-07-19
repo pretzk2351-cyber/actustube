@@ -18,6 +18,8 @@ import {
   reserveApiUsage,
   runWithUsageReservation,
 } from "@/app/lib/usage-limit-api";
+import type { ChannelAnalysisSnapshot } from "@/app/lib/weekly-cycle-types";
+import { finalizeChannelAnalysis } from "@/db/weekly-cycle";
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const SERVER_PLAN = "free" as const;
@@ -225,6 +227,7 @@ export async function GET(request: NextRequest) {
     );
     if (!usageResult.allowed) return usageResult.response;
 
+    let analysisRunId: string | null = null;
     const result = await runWithUsageReservation(
       usageResult.reservation,
       userId,
@@ -273,12 +276,27 @@ export async function GET(request: NextRequest) {
           viewCount,
           regularVideos,
           shortVideos,
-        };
+        } satisfies ChannelAnalysisSnapshot;
+      },
+      {
+        finalize: async (snapshot) => {
+          analysisRunId = await finalizeChannelAnalysis({
+            reservationId: usageResult.reservation.reservationId,
+            userId,
+            snapshot,
+          });
+          return true;
+        },
       }
     );
 
+    if (!analysisRunId) {
+      throw new Error("AnalysisHistoryFinalizationFailed");
+    }
+
     return NextResponse.json({
       ...result,
+      analysisRunId,
       usage: publicUsage(usageResult.reservation),
     });
   } catch (error) {

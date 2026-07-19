@@ -17,6 +17,14 @@ import {
   reserveApiUsage,
   runWithUsageReservation,
 } from "@/app/lib/usage-limit-api";
+import {
+  parseAIConsultSnapshot,
+  parseUuid,
+} from "@/app/lib/weekly-cycle-validation";
+import {
+  analysisRunBelongsToUser,
+  finalizeAIConsult,
+} from "@/db/weekly-cycle";
 
 const consultSchema = {
   name: "youtube_consult_result",
@@ -62,6 +70,13 @@ export async function POST(request: NextRequest) {
 
     const body = await readJsonObject(request);
     const aiSummary = parseAISummary(body.aiSummary);
+    const analysisRunId = parseUuid(body.analysisRunId, "analysisRunId");
+    if (!(await analysisRunBelongsToUser(userId, analysisRunId))) {
+      return NextResponse.json(
+        { error: "The analysis history item was not found." },
+        { status: 404 }
+      );
+    }
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return serverConfigurationErrorResponse();
 
@@ -152,7 +167,16 @@ ${JSON.stringify(aiSummary, null, 2)}
           throw new ExternalServiceError();
         }
 
-        return output as Record<string, unknown>;
+        return parseAIConsultSnapshot(output);
+      },
+      {
+        finalize: (aiConsult) =>
+          finalizeAIConsult({
+            reservationId: usageResult.reservation.reservationId,
+            userId,
+            analysisRunId,
+            aiConsult,
+          }),
       }
     );
 

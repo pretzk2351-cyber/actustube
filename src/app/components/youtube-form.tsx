@@ -2,6 +2,8 @@
 
 import { useMemo, useState } from "react";
 
+import { WeeklyImprovementCycle } from "@/app/components/weekly-improvement-cycle";
+
 import {
   canRequestAIConsult,
   evaluateChannelAnalysisResponse,
@@ -44,6 +46,8 @@ type AIConsultResult = {
 };
 
 type ChannelAnalysisResult = {
+  analysisRunId: string;
+  channelId: string;
   channelTitle: string;
   regularVideos: Video[];
   shortVideos: Video[];
@@ -609,6 +613,7 @@ export function YouTubeForm() {
   const [consultLoading, setConsultLoading] = useState(false);
   const [consultError, setConsultError] = useState("");
   const [consult, setConsult] = useState<AIConsultResult | null>(null);
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
 
   const hasActiveSubscription = true;
   const currentPlan = hasActiveSubscription ? "standard" : "free";
@@ -655,10 +660,13 @@ export function YouTubeForm() {
       }
 
       setAnalysisResult({
+        analysisRunId: decision.analysis.analysisRunId,
+        channelId: decision.analysis.channelId,
         channelTitle: decision.analysis.channelTitle.trim(),
         regularVideos: (decision.analysis.regularVideos ?? []) as Video[],
         shortVideos: (decision.analysis.shortVideos ?? []) as Video[],
       });
+      setHistoryRefreshKey((current) => current + 1);
     } catch {
       setError("チャンネル分析に失敗しました。時間をおいてもう一度お試しください。");
     } finally {
@@ -711,7 +719,10 @@ export function YouTubeForm() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ aiSummary: consultPayload }),
+        body: JSON.stringify({
+          aiSummary: consultPayload,
+          analysisRunId: analysisResult?.analysisRunId,
+        }),
       });
 
       const text = await res.text();
@@ -734,6 +745,7 @@ export function YouTubeForm() {
       }
 
       setConsult(data as AIConsultResult);
+      setHistoryRefreshKey((current) => current + 1);
     } catch {
       setConsultError(
         "AI提案の生成に失敗しました。時間をおいてもう一度お試しください。"
@@ -816,6 +828,14 @@ export function YouTubeForm() {
 
       {error && <div style={styles.errorBox}>{error}</div>}
       {consultError && <div style={styles.errorBox}>{consultError}</div>}
+
+      <WeeklyImprovementCycle
+        currentAnalysisRunId={analysisResult?.analysisRunId ?? null}
+        suggestedAction={
+          consult?.currentImprovements[0] ?? consult?.nextSuggestions[0] ?? ""
+        }
+        refreshKey={historyRefreshKey}
+      />
 
       {channelTitle && (
         <>

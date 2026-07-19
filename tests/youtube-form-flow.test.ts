@@ -66,6 +66,8 @@ describe("YouTube form flow", () => {
 
   it("permits AI consult after a valid channel analysis", () => {
     const decision = evaluateChannelAnalysisResponse(200, {
+      analysisRunId: "3ecce3e0-2dd5-4b57-9a4a-f26b4c7793b3",
+      channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
       channelTitle: "Test Channel",
       regularVideos: [],
       shortVideos: [],

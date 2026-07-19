@@ -154,10 +154,19 @@ function logSafeLifecycleError(context: string, error: unknown) {
 export async function runWithUsageReservation<T>(
   reservation: UsageReservationAllowed,
   userId: string,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  options?: { finalize: (result: T) => Promise<boolean> }
 ) {
   try {
     const result = await operation();
+
+    if (options) {
+      const finalized = await options.finalize(result);
+      if (!finalized) {
+        throw new Error("UsageReservationFinalizationFailed");
+      }
+      return result;
+    }
 
     try {
       const finalized = await finalizeUsageReservation({

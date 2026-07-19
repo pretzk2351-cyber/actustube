@@ -9,6 +9,8 @@ type ApiErrorPayload = {
 };
 
 export type ChannelAnalysisEnvelope = {
+  analysisRunId: string;
+  channelId: string;
   channelTitle: string;
   regularVideos?: unknown[];
   shortVideos?: unknown[];
@@ -31,7 +33,18 @@ function isObject(value: unknown): value is Record<string, unknown> {
 export function isUsableChannelAnalysis(
   value: unknown
 ): value is ChannelAnalysisEnvelope {
-  if (!isObject(value) || typeof value.channelTitle !== "string") return false;
+  if (
+    !isObject(value) ||
+    typeof value.analysisRunId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value.analysisRunId
+    ) ||
+    typeof value.channelId !== "string" ||
+    !/^UC[A-Za-z0-9_-]{22}$/.test(value.channelId) ||
+    typeof value.channelTitle !== "string"
+  ) {
+    return false;
+  }
 
   const channelTitle = value.channelTitle.trim();
   if (channelTitle.length === 0 || channelTitle.length > 200) return false;
