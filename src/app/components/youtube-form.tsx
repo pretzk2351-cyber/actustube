@@ -274,6 +274,7 @@ function DonutChart({
 
   return (
     <div
+      className="youtube-donut-grid"
       style={{
         display: "grid",
         gridTemplateColumns: "180px 1fr",
@@ -352,7 +353,7 @@ function DonutChart({
         </div>
       </div>
 
-      <div>
+      <div className="youtube-donut-legend">
         {items.map((item) => {
           const ratio = total > 0 ? Math.round((item.value / total) * 100) : 0;
           return (
@@ -413,8 +414,9 @@ const styles = {
   prefixWrap: {
     display: "flex",
     alignItems: "center",
-    flex: 1,
-    minWidth: "320px",
+    flex: "1 1 320px",
+    minWidth: 0,
+    width: "100%",
     border: "1px solid #dddddd",
     borderRadius: "18px",
     overflow: "hidden",
@@ -432,7 +434,8 @@ const styles = {
   } as const,
   input: {
     flex: 1,
-    minWidth: "180px",
+    minWidth: 0,
+    width: "100%",
     padding: "15px 16px",
     border: "none",
     backgroundColor: "#ffffff",
@@ -486,13 +489,13 @@ const styles = {
   } as const,
   grid2: {
     display: "grid",
-    gridTemplateColumns: "1fr 1fr",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
     gap: "22px",
     marginBottom: "22px",
   } as const,
   grid3: {
     display: "grid",
-    gridTemplateColumns: "repeat(3, 1fr)",
+    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
     gap: "18px",
     marginBottom: "22px",
   } as const,
@@ -782,10 +785,13 @@ export function YouTubeForm() {
 
   return (
     <div style={styles.page}>
-      <div style={styles.inputBar}>
-        <div style={styles.prefixWrap}>
-          <div style={styles.prefix}>https://www.youtube.com/</div>
+      <div className="youtube-input-bar" style={styles.inputBar}>
+        <div className="youtube-url-input" style={styles.prefixWrap}>
+          <div className="youtube-url-prefix" style={styles.prefix}>
+            https://www.youtube.com/
+          </div>
           <input
+            className="youtube-url-field"
             type="text"
             value={channelInput}
             onChange={(e) => handleChannelInputChange(e.target.value)}
@@ -803,7 +809,7 @@ export function YouTubeForm() {
           {loading ? "分析中..." : "分析する"}
         </button>
 
-        <div style={styles.consultAction}>
+        <div className="youtube-consult-action" style={styles.consultAction}>
           <button
             type="button"
             className="ai-consult-button"
@@ -819,7 +825,11 @@ export function YouTubeForm() {
             {consultLoading ? "提案を作成中..." : "提案を見る"}
           </button>
           {!consultPayload && (
-            <p id="ai-consult-availability-hint" style={styles.consultHint}>
+            <p
+              id="ai-consult-availability-hint"
+              className="youtube-consult-hint"
+              style={styles.consultHint}
+            >
               チャンネル分析後に利用できます
             </p>
           )}
@@ -839,7 +849,7 @@ export function YouTubeForm() {
 
       {channelTitle && (
         <>
-          <div style={styles.grid2}>
+          <div className="youtube-grid-two" style={styles.grid2}>
             <div style={styles.cardRed}>
               <p style={styles.smallLabel}>Overview</p>
               <h2
@@ -900,7 +910,7 @@ export function YouTubeForm() {
             </div>
           </div>
 
-          <div style={styles.grid3}>
+          <div className="youtube-grid-three" style={styles.grid3}>
             <div style={styles.statCard}>
               <p style={styles.smallLabel}>Regular Average</p>
               <h3 style={{ margin: "8px 0 0", fontSize: "30px", lineHeight: 1 }}>
@@ -944,7 +954,7 @@ export function YouTubeForm() {
                 <p style={styles.prose}>{consult.overallDiagnosis}</p>
               </div>
 
-              <div style={styles.grid2}>
+              <div className="youtube-grid-two" style={styles.grid2}>
                 <div style={styles.section}>
                   <p style={styles.smallLabel}>Strengths</p>
                   <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
@@ -970,7 +980,7 @@ export function YouTubeForm() {
                 </div>
               </div>
 
-              <div style={styles.grid2}>
+              <div className="youtube-grid-two" style={styles.grid2}>
                 <div style={styles.section}>
                   <p style={styles.smallLabel}>Current Fixes</p>
                   <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
@@ -998,7 +1008,7 @@ export function YouTubeForm() {
             </>
           )}
 
-          <div style={styles.grid2}>
+          <div className="youtube-grid-two" style={styles.grid2}>
             <div style={styles.section}>
               <p style={styles.smallLabel}>Regular View Distribution</p>
               <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
@@ -1030,7 +1040,7 @@ export function YouTubeForm() {
             </div>
           </div>
 
-          <div style={styles.grid2}>
+          <div className="youtube-grid-two" style={styles.grid2}>
             <div style={styles.section}>
               <p style={styles.smallLabel}>Regular Monthly Trend</p>
               <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
@@ -1102,7 +1112,7 @@ export function YouTubeForm() {
             </div>
           </div>
 
-          <div style={styles.grid2}>
+          <div className="youtube-grid-two" style={styles.grid2}>
             <div style={styles.section}>
               <p style={styles.smallLabel}>Regular Ranking</p>
               <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
@@ -1162,7 +1172,7 @@ export function YouTubeForm() {
             </div>
           </div>
 
-          <div style={styles.grid2}>
+          <div className="youtube-grid-two" style={styles.grid2}>
             <div style={styles.section}>
               <p style={styles.smallLabel}>Regular Weak Videos</p>
               <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
@@ -1222,7 +1232,7 @@ export function YouTubeForm() {
             </div>
           </div>
 
-          <div style={styles.grid2}>
+          <div className="youtube-grid-two" style={styles.grid2}>
             <div style={styles.section}>
               <p style={styles.smallLabel}>Regular Details</p>
               <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
