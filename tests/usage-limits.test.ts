@@ -3,10 +3,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   buildFinalizeUsageReservationQuery,
+  buildRecoverStaleUsageReservationsQuery,
   buildReleaseUsageQuery,
   buildUsageReservationQuery,
   finalizeUsageReservationWithDatabase,
   InvalidUsageReservationInputError,
+  recoverStaleUsageReservationsWithDatabase,
   releaseUsageReservationWithDatabase,
   reserveUsageWithDatabase,
   UsageReservationLifecyclePersistenceError,
@@ -263,5 +265,44 @@ describe("usage reservation", () => {
     );
     expect(String(failure)).not.toContain("database-secret");
     expect(String(failure)).not.toContain("postgresql://");
+  });
+
+  it("builds a bounded stale recovery query from server-owned values", () => {
+    const query = new PgDialect().sqlToQuery(
+      buildRecoverStaleUsageReservationsQuery({
+        staleBefore: new Date("2026-07-19T00:00:00.000Z"),
+        batchSize: 25,
+      })
+    );
+
+    expect(query.params).toEqual(["2026-07-19T00:00:00.000Z", 25]);
+    expect(query.sql).toContain(
+      '"public"."recover_stale_usage_reservations"'
+    );
+  });
+
+  it("parses stale recovery counts and rejects invalid batches", async () => {
+    await expect(
+      recoverStaleUsageReservationsWithDatabase(
+        databaseReturning({ recovered: 3 }) as never,
+        { staleBefore: new Date("2026-07-19T00:00:00.000Z"), batchSize: 10 }
+      )
+    ).resolves.toEqual({ recovered: 3 });
+
+    await expect(
+      recoverStaleUsageReservationsWithDatabase(
+        databaseReturning({ recovered: 0 }) as never,
+        { staleBefore: new Date("invalid"), batchSize: 10 }
+      )
+    ).rejects.toBeInstanceOf(InvalidUsageReservationInputError);
+
+    await expect(
+      recoverStaleUsageReservationsWithDatabase(
+        databaseReturning({ recovered: 11 }) as never,
+        { staleBefore: new Date("2026-07-19T00:00:00.000Z"), batchSize: 10 }
+      )
+    ).rejects.toBeInstanceOf(
+      UsageReservationLifecyclePersistenceError
+    );
   });
 });

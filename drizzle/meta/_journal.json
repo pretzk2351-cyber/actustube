@@ -29,6 +29,13 @@
       "when": 1784386238024,
       "tag": "0003_add_usage_reservation_release",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1784391717523,
+      "tag": "0004_add_stale_reservation_recovery",
+      "breakpoints": true
     }
   ]
 }

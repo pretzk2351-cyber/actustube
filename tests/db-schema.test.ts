@@ -22,7 +22,10 @@ function migrationSql(index: number) {
     new RegExp(`^${String(index).padStart(4, "0")}_.*\\.sql$`).test(file)
   );
   if (!migration) throw new Error(`Migration ${index} was not generated.`);
-  return readFileSync(resolve(migrationDirectory, migration), "utf8");
+  return readFileSync(resolve(migrationDirectory, migration), "utf8").replace(
+    /\r\n/g,
+    "\n"
+  );
 }
 
 function initialMigrationSql() {
@@ -39,6 +42,10 @@ function usageReservationMigrationSql() {
 
 function usageReleaseMigrationSql() {
   return migrationSql(3);
+}
+
+function staleRecoveryMigrationSql() {
+  return migrationSql(4);
 }
 
 describe("database schema", () => {
@@ -409,6 +416,42 @@ describe("database schema", () => {
     );
     expect(sql).toContain(
       'REVOKE ALL ON FUNCTION "public"."finalize_usage_reservation"(uuid, uuid) FROM PUBLIC'
+    );
+    expect(sql).not.toMatch(/https?:\/\//);
+    expect(sql).not.toMatch(/\b(?:email|provider_account_id|access_token)\b/i);
+    expect(sql).not.toMatch(/plpgsql\.variable_conflict/i);
+  });
+
+  it("recovers stale leases in bounded, concurrency-safe batches", () => {
+    const sql = staleRecoveryMigrationSql();
+    const table = getTableConfig(usageReservationLeases);
+
+    expect(table.indexes.map((index) => index.config.name)).toContain(
+      "usage_reservation_leases_created_at_idx"
+    );
+    expect(sql).toContain(
+      'CREATE FUNCTION "public"."recover_stale_usage_reservations"'
+    );
+    expect(sql).toContain("FOR UPDATE OF r SKIP LOCKED");
+    expect(sql).toContain("LIMIT p_batch_size");
+    expect(sql).toContain("p_batch_size > 500");
+    expect(sql).toContain("pg_advisory_xact_lock");
+    expect(sql).toContain(
+      "'usage:' || v_lease.user_id::text || ':' || v_lease.metric::text"
+    );
+    expect(sql.match(/GREATEST\(b\.used_count - 1, 0\)/g)).toHaveLength(2);
+    expect(sql).toContain(
+      "DELETE FROM public.usage_reservation_leases AS r"
+    );
+  });
+
+  it("keeps stale recovery securely scoped and free of secrets", () => {
+    const sql = staleRecoveryMigrationSql();
+
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).toContain("SET search_path = public, pg_temp");
+    expect(sql).toContain(
+      'REVOKE ALL ON FUNCTION "public"."recover_stale_usage_reservations"'
     );
     expect(sql).not.toMatch(/https?:\/\//);
     expect(sql).not.toMatch(/\b(?:email|provider_account_id|access_token)\b/i);

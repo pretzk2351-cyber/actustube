@@ -94,6 +94,16 @@ async function finalize(userId, reservationId) {
   return rows[0].finalized;
 }
 
+async function recover(staleBefore, batchSize = 100) {
+  const rows = await database`
+    SELECT public.recover_stale_usage_reservations(
+      ${staleBefore}::timestamp with time zone,
+      ${batchSize}::integer
+    ) AS recovered
+  `;
+  return rows[0].recovered;
+}
+
 async function run() {
   const releasedUser = await createUser();
   const pendingRelease = await reserve(
@@ -135,6 +145,31 @@ async function run() {
   assert.deepEqual(await bucketCounts(finalizedUser, "ai_consult"), [
     { periodKind: "day", usedCount: 1, limitSnapshot: 1 },
     { periodKind: "month", usedCount: 1, limitSnapshot: 3 },
+  ]);
+
+  const staleUser = await createUser();
+  const staleReservation = await reserve(
+    staleUser,
+    "channel_analysis",
+    "2026-07-18T12:00:00.000Z"
+  );
+  assert.equal(staleReservation.allowed, true);
+  const concurrentRecoveries = await Promise.all([
+    recover("2026-07-18T12:15:00.000Z", 10),
+    recover("2026-07-18T12:15:00.000Z", 10),
+  ]);
+  assert.equal(
+    concurrentRecoveries.reduce((total, recovered) => total + recovered, 0),
+    1
+  );
+  assert.equal(await recover("2026-07-18T12:15:00.000Z", 10), 0);
+  assert.equal(
+    (await release(staleUser, staleReservation.reservation_id)).released,
+    false
+  );
+  assert.deepEqual(await bucketCounts(staleUser, "channel_analysis"), [
+    { periodKind: "day", usedCount: 0, limitSnapshot: 2 },
+    { periodKind: "month", usedCount: 0, limitSnapshot: 5 },
   ]);
 
   const concurrentUser = await createUser();
@@ -244,6 +279,7 @@ async function run() {
     stateDenialsVerified: true,
     oneTimeReleaseVerified: true,
     successfulFinalizationVerified: true,
+    staleRecoveryVerified: true,
   });
 }
 

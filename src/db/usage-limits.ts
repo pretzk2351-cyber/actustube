@@ -68,6 +68,15 @@ export type UsageReleaseResult = {
   monthlyUsed: number | null;
 };
 
+export type StaleReservationRecoveryInput = {
+  staleBefore: Date;
+  batchSize?: number;
+};
+
+export type StaleReservationRecoveryResult = {
+  recovered: number;
+};
+
 export class InvalidUsageReservationInputError extends Error {
   constructor() {
     super("Usage reservation input is invalid.");
@@ -119,6 +128,21 @@ function normalizeReservationReference(input: UsageReservationReference) {
   }
 
   return input;
+}
+
+function normalizeRecoveryInput(input: StaleReservationRecoveryInput) {
+  const batchSize = input.batchSize ?? 100;
+  if (
+    !(input.staleBefore instanceof Date) ||
+    Number.isNaN(input.staleBefore.getTime()) ||
+    !Number.isSafeInteger(batchSize) ||
+    batchSize < 1 ||
+    batchSize > 500
+  ) {
+    throw new InvalidUsageReservationInputError();
+  }
+
+  return { staleBefore: input.staleBefore, batchSize };
 }
 
 function optionalNonnegativeInteger(value: unknown) {
@@ -366,4 +390,56 @@ export async function finalizeUsageReservation(
 ): Promise<boolean> {
   normalizeReservationReference(input);
   return finalizeUsageReservationWithDatabase(getDatabase(), input);
+}
+
+export function buildRecoverStaleUsageReservationsQuery(
+  input: StaleReservationRecoveryInput
+): SQL {
+  const normalized = normalizeRecoveryInput(input);
+
+  return sql`
+    SELECT "public"."recover_stale_usage_reservations"(
+      ${normalized.staleBefore.toISOString()}::timestamp with time zone,
+      ${normalized.batchSize}::integer
+    ) AS "recovered"
+  `;
+}
+
+export async function recoverStaleUsageReservationsWithDatabase(
+  database: DatabaseExecutor,
+  input: StaleReservationRecoveryInput
+): Promise<StaleReservationRecoveryResult> {
+  const query = buildRecoverStaleUsageReservationsQuery(input);
+
+  try {
+    const row = (await database.execute(query)).rows[0];
+    const recovered =
+      row && typeof row === "object"
+        ? (row as Record<string, unknown>).recovered
+        : null;
+    if (
+      typeof recovered !== "number" ||
+      !Number.isSafeInteger(recovered) ||
+      recovered < 0 ||
+      recovered > (input.batchSize ?? 100)
+    ) {
+      throw new UsageReservationLifecyclePersistenceError();
+    }
+    return { recovered };
+  } catch (error) {
+    if (
+      error instanceof InvalidUsageReservationInputError ||
+      error instanceof UsageReservationLifecyclePersistenceError
+    ) {
+      throw error;
+    }
+    throw new UsageReservationLifecyclePersistenceError();
+  }
+}
+
+export async function recoverStaleUsageReservations(
+  input: StaleReservationRecoveryInput
+): Promise<StaleReservationRecoveryResult> {
+  normalizeRecoveryInput(input);
+  return recoverStaleUsageReservationsWithDatabase(getDatabase(), input);
 }

@@ -215,6 +215,7 @@ export const usageReservationLeases = pgTable(
       table.userId,
       table.metric
     ),
+    index("usage_reservation_leases_created_at_idx").on(table.createdAt),
   ]
 );
 
