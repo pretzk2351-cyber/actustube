@@ -11,6 +11,7 @@ import { parseImprovementActionCreate } from "@/app/lib/weekly-cycle-validation"
 import {
   createImprovementAction,
   weeklyCycleIdentityIsValid,
+  WeeklyCycleActionAlreadyExistsError,
   WeeklyCycleConflictError,
   WeeklyCycleNotFoundError,
 } from "@/db/weekly-cycle";
@@ -35,6 +36,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { error: "The analysis history item was not found.", code: "ANALYSIS_NOT_FOUND" },
         { status: 404 }
+      );
+    }
+    if (error instanceof WeeklyCycleActionAlreadyExistsError) {
+      return NextResponse.json(
+        {
+          error: "この分析にはすでに改善項目があります。",
+          code: "IMPROVEMENT_ACTION_ALREADY_EXISTS",
+        },
+        { status: 409 }
       );
     }
     if (error instanceof WeeklyCycleConflictError) {

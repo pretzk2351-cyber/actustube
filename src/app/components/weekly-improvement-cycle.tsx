@@ -7,6 +7,11 @@ import type {
   ImprovementActionView,
   WeeklyCycleHistoryResponse,
 } from "@/app/lib/weekly-cycle-types";
+import {
+  currentAnalysisHasAction,
+  refreshHistoryForDuplicateAction,
+  shouldShowImprovementActionCreateForm,
+} from "@/app/lib/weekly-cycle-flow";
 
 type Props = {
   currentAnalysisRunId: string | null;
@@ -102,6 +107,16 @@ export function WeeklyImprovementCycle({
   const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [resultNote, setResultNote] = useState("");
+  const hasActionForCurrentAnalysis = currentAnalysisHasAction(
+    items,
+    currentAnalysisRunId
+  );
+  const showCreateActionForm = shouldShowImprovementActionCreateForm({
+    currentAnalysisRunId,
+    items,
+    plannedAction,
+    loading,
+  });
 
   const loadFirstPage = useCallback(async () => {
     setLoading(true);
@@ -137,14 +152,19 @@ export function WeeklyImprovementCycle({
   }, [plannedAction]);
 
   useEffect(() => {
-    if (!currentAnalysisRunId || plannedAction) return;
+    if (!currentAnalysisRunId || plannedAction || hasActionForCurrentAnalysis) return;
     setNewTitle(suggestedAction.slice(0, 200));
     setNewDescription(
       suggestedAction
         ? "次の動画で実行し、完了後に結果を記録します。"
         : ""
     );
-  }, [currentAnalysisRunId, plannedAction, suggestedAction]);
+  }, [
+    currentAnalysisRunId,
+    hasActionForCurrentAnalysis,
+    plannedAction,
+    suggestedAction,
+  ]);
 
   async function createAction() {
     if (!currentAnalysisRunId) return;
@@ -161,6 +181,16 @@ export function WeeklyImprovementCycle({
         }),
       });
       if (!response.ok) {
+        const data: unknown = await response.json().catch(() => null);
+        if (
+          await refreshHistoryForDuplicateAction(
+            response.status,
+            data,
+            loadFirstPage
+          )
+        ) {
+          return;
+        }
         setMessage(safeMessage(response.status));
         return;
       }
@@ -264,7 +294,7 @@ export function WeeklyImprovementCycle({
             <button type="button" onClick={() => void updateAction("skipped")} disabled={saving || !editTitle.trim() || !resultNote.trim()} style={{ ...ui.button, background: "#e5e7eb", color: "#111827" }}>見送る</button>
           </div>
         </div>
-      ) : currentAnalysisRunId ? (
+      ) : showCreateActionForm ? (
         <div style={{ padding: "18px", border: "1px solid #e5e7eb", borderRadius: "18px", marginBottom: "24px" }}>
           <strong>この分析から今週の改善項目を設定</strong>
           <label style={{ ...ui.label, marginTop: "14px" }}>
@@ -279,6 +309,10 @@ export function WeeklyImprovementCycle({
             {saving ? "保存中..." : "今週の改善項目として保存"}
           </button>
         </div>
+      ) : hasActionForCurrentAnalysis ? (
+        <p style={{ padding: "15px", borderRadius: "14px", background: "#f3f4f6", color: "#4b5563", fontWeight: 700 }}>
+          この分析には改善項目が保存されています。内容と結果は履歴で確認できます。
+        </p>
       ) : (
         <p style={{ padding: "15px", borderRadius: "14px", background: "#f3f4f6", color: "#4b5563", fontWeight: 700 }}>
           チャンネル分析後に、今週の改善項目を設定できます。

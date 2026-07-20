@@ -23,6 +23,8 @@ import {
   listWeeklyCyclesWithDatabase,
   updateImprovementActionWithDatabase,
   weeklyCycleIdentityIsValidWithDatabase,
+  getPostgresErrorDetails,
+  WeeklyCycleActionAlreadyExistsError,
   WeeklyCycleConflictError,
   WeeklyCycleNotFoundError,
   WeeklyCyclePersistenceError,
@@ -280,9 +282,12 @@ describe("history ownership and improvement actions", () => {
     expect(built.sql).toContain("run.user_id");
   });
 
-  it("maps the planned-action unique constraint to a safe conflict", async () => {
-    const databaseError = Object.assign(new Error("private DB detail"), {
-      code: "23505",
+  it("maps a wrapped analysis-action unique constraint to its safe conflict", async () => {
+    const databaseError = new Error("wrapped query failure", {
+      cause: Object.assign(new Error("private DB detail"), {
+        code: "23505",
+        constraint: "improvement_actions_analysis_run_unique",
+      }),
     });
     const execute = vi.fn(async () => {
       throw databaseError;
@@ -295,7 +300,63 @@ describe("history ownership and improvement actions", () => {
         title: "Second action",
         description: "",
       })
+    ).rejects.toBeInstanceOf(WeeklyCycleActionAlreadyExistsError);
+  });
+
+  it("preserves the planned-action conflict mapping", async () => {
+    const databaseError = Object.assign(new Error("private DB detail"), {
+      code: "23505",
+      constraint: "improvement_actions_one_planned_per_user",
+    });
+    const execute = vi.fn(async () => {
+      throw databaseError;
+    });
+
+    await expect(
+      createImprovementActionWithDatabase({ execute } as never, {
+        userId: USER_ID,
+        analysisRunId: ANALYSIS_RUN_ID,
+        title: "Second planned action",
+        description: "",
+      })
     ).rejects.toBeInstanceOf(WeeklyCycleConflictError);
+  });
+
+  it("does not misclassify another unique constraint", async () => {
+    const execute = vi.fn(async () => {
+      throw Object.assign(new Error("private DB detail"), {
+        code: "23505",
+        constraint: "another_unique_constraint",
+      });
+    });
+
+    await expect(
+      createImprovementActionWithDatabase({ execute } as never, {
+        userId: USER_ID,
+        analysisRunId: ANALYSIS_RUN_ID,
+        title: "Action",
+        description: "",
+      })
+    ).rejects.toBeInstanceOf(WeeklyCyclePersistenceError);
+  });
+
+  it("bounds wrapped error traversal and avoids cause cycles", () => {
+    const inner = Object.assign(new Error("private DB detail"), {
+      code: "23505",
+      constraint: "improvement_actions_analysis_run_unique",
+    });
+    const outer = new Error("query failed", { cause: inner });
+    expect(getPostgresErrorDetails(outer)).toEqual({
+      code: "23505",
+      constraint: "improvement_actions_analysis_run_unique",
+    });
+
+    const cyclic = new Error("cycle") as Error & { cause?: unknown };
+    cyclic.cause = cyclic;
+    expect(getPostgresErrorDetails(cyclic)).toEqual({
+      code: null,
+      constraint: null,
+    });
   });
 
   it("stores completed status and the result note for an owned planned action", async () => {

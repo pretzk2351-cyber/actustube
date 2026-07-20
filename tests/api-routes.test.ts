@@ -41,6 +41,7 @@ const weeklyCycleState = vi.hoisted(() => ({
 }));
 const weeklyCycleErrors = vi.hoisted(() => ({
   NotFound: class WeeklyCycleNotFoundError extends Error {},
+  ActionAlreadyExists: class WeeklyCycleActionAlreadyExistsError extends Error {},
   Conflict: class WeeklyCycleConflictError extends Error {},
   Persistence: class WeeklyCyclePersistenceError extends Error {},
 }));
@@ -84,6 +85,7 @@ vi.mock("@/db/weekly-cycle", () => ({
   weeklyCycleIdentityIsValid: weeklyCycleState.identityValid,
   decodeHistoryCursor: vi.fn(() => null),
   WeeklyCycleNotFoundError: weeklyCycleErrors.NotFound,
+  WeeklyCycleActionAlreadyExistsError: weeklyCycleErrors.ActionAlreadyExists,
   WeeklyCycleConflictError: weeklyCycleErrors.Conflict,
   WeeklyCyclePersistenceError: weeklyCycleErrors.Persistence,
 }));
@@ -510,6 +512,27 @@ describe("weekly improvement cycle APIs", () => {
       })
     );
     expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ code: "PLANNED_ACTION_EXISTS" });
+  });
+
+  it("returns the dedicated 409 response for an existing analysis action", async () => {
+    weeklyCycleState.create.mockRejectedValueOnce(
+      new weeklyCycleErrors.ActionAlreadyExists()
+    );
+
+    const response = await weeklyActionPost(
+      jsonRequest("http://localhost/api/weekly-cycle/actions", {
+        analysisRunId: ANALYSIS_RUN_ID,
+        title: "Duplicate action",
+        description: "",
+      })
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: "この分析にはすでに改善項目があります。",
+      code: "IMPROVEMENT_ACTION_ALREADY_EXISTS",
+    });
   });
 });
 

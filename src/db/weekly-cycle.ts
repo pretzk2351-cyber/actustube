@@ -73,6 +73,13 @@ export class WeeklyCycleConflictError extends Error {
   }
 }
 
+export class WeeklyCycleActionAlreadyExistsError extends Error {
+  constructor() {
+    super("An improvement action already exists for this analysis.");
+    this.name = "WeeklyCycleActionAlreadyExistsError";
+  }
+}
+
 function assertUuid(value: string) {
   if (!UUID_PATTERN.test(value)) throw new WeeklyCyclePersistenceError();
 }
@@ -456,13 +463,48 @@ export function listWeeklyCycles(input: {
   return listWeeklyCyclesWithDatabase(getDatabase(), input);
 }
 
-function isUniqueViolation(error: unknown) {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: unknown }).code === "23505"
-  );
+type PostgresErrorDetails = {
+  code: string | null;
+  constraint: string | null;
+};
+
+function readStringProperty(value: object, property: string) {
+  try {
+    const result = Reflect.get(value, property);
+    return typeof result === "string" ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getPostgresErrorDetails(error: unknown): PostgresErrorDetails {
+  const visited = new Set<object>();
+  let current = error;
+
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null || visited.has(current)) {
+      break;
+    }
+    visited.add(current);
+
+    const code = readStringProperty(current, "code");
+    if (code) {
+      return {
+        code,
+        constraint:
+          readStringProperty(current, "constraint") ??
+          readStringProperty(current, "constraint_name"),
+      };
+    }
+
+    try {
+      current = Reflect.get(current, "cause");
+    } catch {
+      break;
+    }
+  }
+
+  return { code: null, constraint: null };
 }
 
 export async function createImprovementActionWithDatabase(
@@ -506,7 +548,19 @@ export async function createImprovementActionWithDatabase(
     ) {
       throw error;
     }
-    if (isUniqueViolation(error)) throw new WeeklyCycleConflictError();
+    const postgresError = getPostgresErrorDetails(error);
+    if (
+      postgresError.code === "23505" &&
+      postgresError.constraint === "improvement_actions_analysis_run_unique"
+    ) {
+      throw new WeeklyCycleActionAlreadyExistsError();
+    }
+    if (
+      postgresError.code === "23505" &&
+      postgresError.constraint === "improvement_actions_one_planned_per_user"
+    ) {
+      throw new WeeklyCycleConflictError();
+    }
     throw new WeeklyCyclePersistenceError();
   }
 }
