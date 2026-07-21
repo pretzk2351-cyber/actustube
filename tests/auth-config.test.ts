@@ -1,5 +1,6 @@
 import type { JWT } from "next-auth/jwt";
 import { encode } from "next-auth/jwt";
+import { validateAuthResponse } from "oauth4webapi";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { syncGoogleAccount } from "@/db/auth-accounts";
@@ -29,17 +30,86 @@ afterEach(() => {
 });
 
 describe("Auth.js configuration", () => {
-  it("keeps offline YouTube read-only authorization configured", () => {
+  it("pins Google OIDC endpoints without weakening authorization checks", () => {
     const provider = authConfig.providers[0] as {
-      options?: { authorization?: { params?: Record<string, string> } };
+      type?: string;
+      issuer?: string;
+      options?: {
+        issuer?: string;
+        authorization?: {
+          url?: string;
+          params?: Record<string, string>;
+        };
+        token?: string;
+        userinfo?: string;
+        checks?: string[];
+        idToken?: boolean;
+      };
     };
     const params = provider.options?.authorization?.params;
 
+    expect(provider.type).toBe("oidc");
+    expect(provider.issuer).toBe("https://accounts.google.com");
+    expect(provider.options?.issuer).toBe("https://accounts.google.com");
+    expect(provider.options?.authorization?.url).toBe(
+      "https://accounts.google.com/o/oauth2/v2/auth"
+    );
+    expect(provider.options?.token).toBe(
+      "https://oauth2.googleapis.com/token"
+    );
+    expect(provider.options?.userinfo).toBe(
+      "https://openidconnect.googleapis.com/v1/userinfo"
+    );
     expect(params?.access_type).toBe("offline");
     expect(params?.prompt).toBe("consent");
+    expect(params?.response_type).toBe("code");
     expect(params?.scope).toContain(
       "https://www.googleapis.com/auth/youtube.readonly"
     );
+    expect(provider.options?.checks).toEqual(["pkce", "state", "nonce"]);
+    expect(provider.options?.idToken).not.toBe(false);
+  });
+
+  it("accepts a Google callback without iss while still validating state", () => {
+    const authorizationServer = {
+      issuer: "https://accounts.google.com",
+      token_endpoint: "https://oauth2.googleapis.com/token",
+      userinfo_endpoint:
+        "https://openidconnect.googleapis.com/v1/userinfo",
+    };
+    const client = { client_id: "test-google-client-id" };
+    const callback = new URLSearchParams({
+      code: "test-authorization-code",
+      state: "expected-state",
+    });
+
+    expect(() =>
+      validateAuthResponse(
+        {
+          ...authorizationServer,
+          authorization_response_iss_parameter_supported: true,
+        },
+        client,
+        callback,
+        "expected-state"
+      )
+    ).toThrow(/issuer.*missing/i);
+
+    const validated = validateAuthResponse(
+      authorizationServer,
+      client,
+      callback,
+      "expected-state"
+    );
+    expect(validated.get("code")).toBe("test-authorization-code");
+    expect(() =>
+      validateAuthResponse(
+        authorizationServer,
+        client,
+        callback,
+        "different-state"
+      )
+    ).toThrow(/state/i);
   });
 
   it("does not expose OAuth tokens through the session callback", async () => {

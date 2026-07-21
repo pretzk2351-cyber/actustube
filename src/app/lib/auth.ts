@@ -11,6 +11,15 @@ import {
   storeInitialGoogleToken,
 } from "./google-oauth-token";
 
+const GOOGLE_ISSUER = "https://accounts.google.com";
+const GOOGLE_AUTHORIZATION_URL =
+  "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_URL =
+  "https://openidconnect.googleapis.com/v1/userinfo";
+const GOOGLE_AUTHORIZATION_SCOPE =
+  "openid email profile https://www.googleapis.com/auth/youtube.readonly";
+
 function optionalProfileValue(value: unknown) {
   return typeof value === "string" ? value : null;
 }
@@ -34,14 +43,19 @@ const authConfig: NextAuthConfig = {
     Google({
       clientId: process.env.GOOGLE_CLIENT_ID ?? "",
       clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? "",
+      issuer: GOOGLE_ISSUER,
       authorization: {
+        url: GOOGLE_AUTHORIZATION_URL,
         params: {
           access_type: "offline",
           prompt: "consent",
-          scope:
-            "openid email profile https://www.googleapis.com/auth/youtube.readonly",
+          response_type: "code",
+          scope: GOOGLE_AUTHORIZATION_SCOPE,
         },
       },
+      token: GOOGLE_TOKEN_URL,
+      userinfo: GOOGLE_USERINFO_URL,
+      checks: ["pkce", "state", "nonce"],
     }),
   ],
   session: {
