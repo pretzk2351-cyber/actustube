@@ -2,7 +2,7 @@
 
 最終更新日：2026-07-21
 
-> 2026-07-21にGit、Vercel、Neon Production DBを読み取り専用で再確認しました。Production DBへの書き込み、Migration、Vercel操作、Productionデプロイは行っていません。次工程でもRunbookの停止条件に従って実状態を再確認してください。
+> 2026-07-21の状態スナップショットです。週次改善サイクルMVPとGoogle OAuth互換性修正は `main` へ統合され、Vercel Productionへ公開済みです。現在はGoogle OAuthのDBユーザー同期失敗を、安全な診断ログで特定する工程です。次工程でもRunbookの停止条件に従って実状態を再確認してください。
 
 ## プロジェクト概要
 
@@ -81,7 +81,7 @@ API 500修正コミット：
 - `35b9615ce474194277e35921b628744f8dc640e5`
 - `fix: handle duplicate weekly improvement actions`
 
-この修正コミットは `fix/weekly-action-duplicate-conflict` に存在し、`main` へは未統合です。
+この修正コミットはrelease candidate `c6b403e` に含まれ、`main` へ統合・Production公開済みです。
 
 修正内容：
 
@@ -114,31 +114,35 @@ release candidate作成時に再実行した確認結果です。
 
 ## Git状態
 
-release candidate作成前の読み取り確認結果：
+2026-07-21の診断作業開始前に読み取り確認した状態：
 
-- 現在ブランチ：`fix/weekly-action-duplicate-conflict`
-- HEAD：`d02071f9cada7d5ebc858c541bf6e3d3bb73568e`
-- upstream：`origin/fix/weekly-action-duplicate-conflict`
-- fixブランチとupstream：0 / 0で同期済み
-- 作業ツリー：release candidate作成前はclean
-- `main`：`92f834ddc77d5a8134904dce4ccbb38eced8ac14`
-- `origin/main`：`92f834ddc77d5a8134904dce4ccbb38eced8ac14`
+- `main`：`2f79fa7199b8b376ba16838a175c8af436fe69c7`
+- `origin/main`：`2f79fa7199b8b376ba16838a175c8af436fe69c7`
 - `main` と `origin/main`：0 / 0で同期済み
+- 作業ツリー：clean
+- `c6b403e`：週次改善サイクルのrelease candidate
+- `2f79fa7`：Google OAuth callback互換性修正
 
-コード修正コミット `35b9615` と引き継ぎ文書コミット `d02071f` は `fix/weekly-action-duplicate-conflict` に含まれています。`main` へのmergeは未実施です。release candidateの最終commit SHA、upstreamとの同期状態、作業ツリーの状態はGit履歴と `git status` で確認してください。
+旧状態の `main` `92f834d` と `fix/weekly-action-duplicate-conflict` 未統合は完了済みの履歴です。次の作業ブランチは `fix/auth-db-error-diagnostics` とし、診断ログと文書同期を検証後にまとめて `main` へfast-forward統合します。
 
 ## Vercel Production状態
 
-2026-07-21の読み取り専用確認結果：
+2026-07-21の診断作業開始前スナップショット：
 
 - Production Branch：`main`
-- 現在Productionで稼働中の安定コミット：`5964c2d749d14eff04ea356be14166fa7eb5f4dc`
-- `92f834d` のProductionはDB未準備のためInstant Rollback済み
-- 現在のProduction状態：READY
-- HTTP 200確認済み
-- 直近確認で不要な404・500なし
-- GitHub `main` 自体は `92f834d` のまま
-- Vercel Productionだけ旧安定デプロイへ戻している
+- commit：`2f79fa7199b8b376ba16838a175c8af436fe69c7`
+- deployment：`dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ`
+- domain：`https://actustube.vercel.app`
+- 状態：READY / Current
+- `redirect_uri_mismatch`：解消済み
+- OAuth callbackの `missing iss`：解消済み
+- callbackは `/api/auth/callback/google` まで到達
+- 現在のブロッカー：`signIn` callback内の `public.sync_google_oauth_account(...)`
+- Auth.jsログ：`AccessDenied` / `NeonDbError`
+- セッション・JWT作成前に停止
+- PostgreSQLの正確な原因：既存ログの情報不足により未確定
+
+旧安定版 `5964c2d` へのロールバックと、週次改善サイクル公開前の状態は完了済みの履歴です。一時的なNeon HTTP／ネットワーク障害とは断定しません。
 
 ## Production DB
 
@@ -189,7 +193,15 @@ release candidate作成前の読み取り確認結果：
 - 状態：Ready
 - 削除せず保持中
 
-この既存ブランチはMigrationリハーサルに使用済みです。0005適用済みとなった現在のProduction DBを基点にした新規バックアップは、まだ作成していません。
+この既存ブランチはMigrationリハーサルに使用済みです。
+
+週次改善サイクルProduction公開前には、当時のProduction DBを基点に次のバックアップを作成し、Readyを確認済みです。
+
+- Name：`backup-pre-release-20260721-c6b403e`
+- Branch ID：`br-withered-darkness-azjg6fpl`
+- 状態：Ready
+
+今回の認証診断ログ追加ではDB・Migrationを変更しないため、新たなNeon branch作成やMigration実行は行いません。
 
 このブランチでは、引き継ぎ時点で次が合格済みと報告されています。
 
@@ -214,16 +226,18 @@ release candidate作成前の読み取り確認結果：
 
 ## 現在残っている作業
 
-1. 現在のProduction DBを基点に新規バックアップを作成し、Readyを確認
-2. Migration 0005を再適用せず、適用済みDBオブジェクトと既存データ維持を再確認
-3. `fix/weekly-action-duplicate-conflict` を `main` へ統合
-4. `main` 上で全自動検証
-5. `origin/main` へpush
-6. Vercel自動Productionデプロイ確認
-7. Productionスモークテスト
-8. Productionログ・Console・Network確認
-9. 安定確認後にバックアップブランチの扱いを判断
-10. ProductionとdevelopmentのNeonブランチ構成を後日整理
+1. `fix/auth-db-error-diagnostics` で文書同期を独立commitとして保存
+2. `syncGoogleAccount` のDB呼び出し境界へallowlist方式の安全な診断ログを追加
+3. 診断抽出・伏字処理の単体テストを追加
+4. テスト、ESLint、TypeScript、Production build、`npm audit`、Drizzle、差分・秘密情報検査
+5. fixブランチをpushし、`origin/main` が `2f79fa7` から変化していないことを確認
+6. `main` へfast-forward統合して一度だけpush
+7. 新しいVercel Production deploymentのREADY / Current確認
+8. 未認証経路と継続的5xxの有無を確認
+9. ユーザー本人がGoogleログインを1回だけ実行
+10. Runtime LogからPostgreSQLまたは通信層の元エラーを確定して停止
+
+認証済みスモークテスト、AI提案、DB修正、Migration、Neon branch操作はこの工程に含めません。
 
 ## 今回の公開対象外
 
@@ -238,6 +252,6 @@ release candidate作成前の読み取り確認結果：
 
 ## 次の作業
 
-次に実施する工程は、現在のProduction DBを基点にした新規バックアップの作成と、適用済みMigration 0005の読み取り確認です。Migration 0005は再適用しません。
+次に実施する工程は、`syncGoogleAccount` 境界への安全な診断ログ追加とProduction公開です。Migration 0000〜0005、Production関数、schema、権限、Neon branch、Vercel環境変数は変更しません。
 
-バックアップ・DB確認と `main` 統合・push・デプロイは段階を分けます。開始前に [Production Release Runbook](./PRODUCTION_RELEASE_RUNBOOK.md) を読み、記載内容とGit・Vercel・Neonの実状態が一致しない場合は停止してください。
+新deploymentの未認証確認後、Googleアカウント選択など本人操作の直前で停止します。ユーザーがログインを1回行った後にRuntime Logを読み取り、原因を確定します。開始前に [Production Release Runbook](./PRODUCTION_RELEASE_RUNBOOK.md) を読み、記載内容とGit・Vercel・Neonの実状態が一致しない場合は停止してください。
