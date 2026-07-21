@@ -264,6 +264,27 @@ describe("Auth.js configuration", () => {
     }
   );
 
+  it("preserves a Google account persistence failure during sign-in", async () => {
+    const persistenceError = new Error("Google account persistence failed");
+    vi.mocked(syncGoogleAccount).mockRejectedValueOnce(persistenceError);
+    const signInCallback = authConfig.callbacks?.signIn as unknown as (args: {
+      account: { provider: string; providerAccountId: string };
+      profile: Record<string, never>;
+      user: { id: string };
+    }) => Promise<boolean>;
+
+    await expect(
+      signInCallback({
+        account: {
+          provider: "google",
+          providerAccountId: "google-provider-account-123",
+        },
+        profile: {},
+        user: { id: "oauth-profile-id" },
+      })
+    ).rejects.toBe(persistenceError);
+  });
+
   it("keeps providerAccountId, token.sub, and the internal user ID distinct", async () => {
     const jwtCallback = authConfig.callbacks?.jwt as unknown as (args: {
       token: JWT;

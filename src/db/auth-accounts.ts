@@ -2,6 +2,7 @@ import "server-only";
 
 import { sql, type SQL } from "drizzle-orm";
 
+import { buildGoogleAccountSyncDiagnostic } from "./auth-db-error-diagnostic";
 import { getDatabase, type Database } from "./client";
 import type { UserStatus } from "./schema";
 
@@ -118,7 +119,24 @@ export async function syncGoogleAccountWithDatabase(
   input: GoogleAccountInput,
   now = new Date()
 ): Promise<GoogleAccountUser> {
-  const result = await database.execute(buildGoogleAccountUpsertQuery(input, now));
+  let result: Awaited<ReturnType<DatabaseExecutor["execute"]>>;
+
+  try {
+    result = await database.execute(
+      buildGoogleAccountUpsertQuery(input, now)
+    );
+  } catch (error) {
+    try {
+      console.error(
+        "[auth][google-account-sync-diagnostic]",
+        buildGoogleAccountSyncDiagnostic(error)
+      );
+    } catch {
+      // Diagnostic logging must never replace the original persistence error.
+    }
+    throw error;
+  }
+
   return parseUserRow(result.rows[0]);
 }
 
