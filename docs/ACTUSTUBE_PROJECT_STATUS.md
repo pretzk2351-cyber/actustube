@@ -2,7 +2,7 @@
 
 最終更新日：2026-07-21
 
-> Vercel、Neon Production DB、過去の検証結果に関する記載は、引き継ぎ時に提示された直近確認情報です。この文書の作成作業では、Production DBへの接続、Vercel操作、テスト再実行を行っていません。次工程の開始時に、Runbookの停止条件に従って実状態を読み取り確認してください。
+> 2026-07-21にGit、Vercel、Neon Production DBを読み取り専用で再確認しました。Production DBへの書き込み、Migration、Vercel操作、Productionデプロイは行っていません。次工程でもRunbookの停止条件に従って実状態を再確認してください。
 
 ## プロジェクト概要
 
@@ -96,7 +96,7 @@ API 500修正コミット：
 
 ## 検証結果
 
-引き継ぎ時に提示された最新確認済み結果です。この文書作成時には再実行していません。
+release candidate作成時に再実行した確認結果です。
 
 - 通常テスト：153件成功
 - 実DB専用4件は通常実行時skip
@@ -105,7 +105,7 @@ API 500修正コミット：
 - ESLint：0エラー、既存の `<img>` 警告1件
 - TypeScript：成功
 - Production build：成功
-- `npm audit`：脆弱性0件
+- `npm audit`：脆弱性0件。間接dev依存の `brace-expansion` を1.1.14から修正版1.1.16へlockfile内で更新
 - `drizzle-kit check`：成功
 - Schema drift：なし
 - `git diff --check`：成功
@@ -114,22 +114,22 @@ API 500修正コミット：
 
 ## Git状態
 
-文書作成前の読み取り確認結果：
+release candidate作成前の読み取り確認結果：
 
 - 現在ブランチ：`fix/weekly-action-duplicate-conflict`
-- HEAD：`35b9615ce474194277e35921b628744f8dc640e5`
+- HEAD：`d02071f9cada7d5ebc858c541bf6e3d3bb73568e`
 - upstream：`origin/fix/weekly-action-duplicate-conflict`
 - fixブランチとupstream：0 / 0で同期済み
-- 作業ツリー：文書作成前はclean
+- 作業ツリー：release candidate作成前はclean
 - `main`：`92f834ddc77d5a8134904dce4ccbb38eced8ac14`
 - `origin/main`：`92f834ddc77d5a8134904dce4ccbb38eced8ac14`
 - `main` と `origin/main`：0 / 0で同期済み
 
-この文書を含む3ファイルは、`fix/weekly-action-duplicate-conflict` 上の1つの文書コミットとして保存・pushする対象です。`main` へのmergeは未実施です。保存後のcommit SHA、upstreamとの同期状態、作業ツリーの状態はGit履歴と `git status` で確認してください。
+コード修正コミット `35b9615` と引き継ぎ文書コミット `d02071f` は `fix/weekly-action-duplicate-conflict` に含まれています。`main` へのmergeは未実施です。release candidateの最終commit SHA、upstreamとの同期状態、作業ツリーの状態はGit履歴と `git status` で確認してください。
 
 ## Vercel Production状態
 
-引き継ぎ時に提示された直近確認情報：
+2026-07-21の読み取り専用確認結果：
 
 - Production Branch：`main`
 - 現在Productionで稼働中の安定コミット：`5964c2d749d14eff04ea356be14166fa7eb5f4dc`
@@ -142,7 +142,7 @@ API 500修正コミット：
 
 ## Production DB
 
-引き継ぎ時には、Vercel Productionの接続設定から秘密情報を表示せずEndpoint IDだけを取得し、照合済みと報告されています。
+ローカルの接続設定を秘密情報を表示せず解析し、明示的なread-only transactionでEndpoint IDとDatabaseを再確認しました。
 
 実Production DB：
 
@@ -155,14 +155,19 @@ API 500修正コミット：
 
 重要：Neon上のブランチ名は `development` ですが、Vercel Productionが実際に接続しているためProduction DBとして扱います。削除、リセット、テスト用途への流用は禁止です。
 
-引き継ぎ時点のProduction DB状態：
+2026-07-21のProduction DB状態：
 
-- Migration履歴：5件
-- 0000〜0004相当が適用済み
-- Migration 0005：未適用
-- `analysis_runs`：未作成
-- `improvement_actions`：未作成
-- `improvement_action_status`：未作成
+- Migration履歴：6件
+- 0000〜0005がjournalの順序どおり適用済み
+- Migration 0005：適用済み。再適用は禁止
+- journalの6つの `when` とDB履歴の `created_at`：すべて一致
+- Drizzleと同じSHA-256計算で、0005は現在のファイルと一致
+- 0000〜0004は現在のWindows作業ツリーのCRLFではhashが異なるが、LFへ正規化した同一SQL本文と一致。SQL内容変更ではなく改行コード差であり、Drizzleは最新の `created_at` とjournalの `when` により適用済みと判断する
+- `analysis_runs`：作成済み、0件
+- `improvement_actions`：作成済み、0件
+- `improvement_action_status`：作成済み（`planned` / `completed` / `skipped`）
+- Migration 0005のIndex・制約・関数：`schema.ts`、Migration SQL、0005 snapshotと一致
+- 2つの確定関数：`SECURITY INVOKER`、固定 `search_path`、PUBLIC実行権限なし
 - `users`：1件
 - `oauth_accounts`：1件
 - `plans`：1件
@@ -171,6 +176,8 @@ API 500修正コミット：
 - `usage_reservation_leases`：0件
 
 実データの内容、ユーザー情報、認証情報、接続情報の秘密部分は記載しません。
+
+管理外テーブル `playing_with_neon` が1つ存在し、40件の行があります。コード、`schema.ts`、Migration、テストから参照されておらず、ActusTube管理オブジェクトとの名前衝突もありません。Neonのサンプルテーブルとしてアプリ管理Schemaの比較対象から除外し、削除・変更・Migrationへの追加は行いません。ActusTube管理対象のSchema driftはありません。
 
 ## バックアップ兼リハーサルブランチ
 
@@ -181,6 +188,8 @@ API 500修正コミット：
 - Database：`neondb`
 - 状態：Ready
 - 削除せず保持中
+
+この既存ブランチはMigrationリハーサルに使用済みです。0005適用済みとなった現在のProduction DBを基点にした新規バックアップは、まだ作成していません。
 
 このブランチでは、引き継ぎ時点で次が合格済みと報告されています。
 
@@ -205,8 +214,8 @@ API 500修正コミット：
 
 ## 現在残っている作業
 
-1. Production DB本体へMigration 0005を適用
-2. Migration適用後にDBオブジェクトと既存データ維持を確認
+1. 現在のProduction DBを基点に新規バックアップを作成し、Readyを確認
+2. Migration 0005を再適用せず、適用済みDBオブジェクトと既存データ維持を再確認
 3. `fix/weekly-action-duplicate-conflict` を `main` へ統合
 4. `main` 上で全自動検証
 5. `origin/main` へpush
@@ -229,6 +238,6 @@ API 500修正コミット：
 
 ## 次の作業
 
-次に実施する工程は、Production DB本体へのMigration 0005適用と、適用後の読み取り確認です。
+次に実施する工程は、現在のProduction DBを基点にした新規バックアップの作成と、適用済みMigration 0005の読み取り確認です。Migration 0005は再適用しません。
 
-`main` 統合・push・デプロイは同じ工程では行いません。開始前に [Production Release Runbook](./PRODUCTION_RELEASE_RUNBOOK.md) を読み、記載内容とGit・Vercel・Neonの実状態が一致しない場合はMigrationを実行せず停止してください。
+バックアップ・DB確認と `main` 統合・push・デプロイは段階を分けます。開始前に [Production Release Runbook](./PRODUCTION_RELEASE_RUNBOOK.md) を読み、記載内容とGit・Vercel・Neonの実状態が一致しない場合は停止してください。
