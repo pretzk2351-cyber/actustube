@@ -2,23 +2,26 @@
 
 ## 目的
 
-安全な診断ログで確定したGoogle OAuthのProduction DBパスワード認証失敗を、今回限定の例外で復旧します。各Phaseを分離し、停止条件に1つでも該当した場合は独断で続行せず、その場で停止して報告します。
+Production公開とDB接続を安全に保護するための手順と停止条件を定めます。2026-07-22のProduction DBパスワード認証失敗は、今回限定の例外手順、本人による単一Googleログイン、同時間帯のRuntime Log確認を経て復旧完了しました。通常のVercel環境変数変更禁止を再び全面適用します。
 
 ## 現在の前提
 
-以下は2026-07-22のProduction DB接続復旧作業開始前スナップショットです。実行時には必ず読み取り専用で再確認してください。
+以下は2026-07-22のProduction DB接続復旧完了後スナップショットです。deployment情報は確認日時付きの状態であり、将来の作業では必ず読み取り専用で実状態を再確認してください。
 
-- GitHub `main` は `c3e71ffdf5b66f97e1303f9e3f62481b7f725f2a`
+- GitHub `main` は `696d4b027d062e4f5dd85ed5af566194af70061f`
 - `main` と `origin/main` は0 / 0で同期し、作業ツリーはclean
-- Vercel Production deploymentは `dpl_HPGCXavawHj3yHKo9nFg99LGB6jR`
+- Vercel Production deploymentは `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`
 - Production domainは `https://actustube.vercel.app`
-- deploymentはREADY / Currentで、source branchは `main`、commitは `c3e71ff`
+- deploymentはREADY / Currentで、source branchは `main`、commitは `696d4b0`
 - 週次改善サイクルrelease candidate `c6b403e` とGoogle OAuth callback互換性修正 `2f79fa7` はmain統合・公開済み
 - `redirect_uri_mismatch` とOAuth callbackの `missing iss` は解消済み
 - 安全な認証DB診断ログ `c3e71ff` はProduction公開済み
-- 本人による単一ログインで、Runtimeの `DATABASE_URL` によるDBパスワード認証失敗と確定
-- `public.sync_google_oauth_account(...)` のSQL実行前に接続認証で停止
-- timeout、fetch失敗、接続リセットではなく、Migration、関数、schema、制約、権限の問題でもない
+- 有効なpooled接続資格情報による読み取り専用接続確認と、Vercel Productionの `DATABASE_URL` 1件の更新が完了
+- 本人による単一Googleログインに成功し、Google callbackはHTTP 302、callback直後のトップページはHTTP 200
+- 本人申告のログイン時刻周辺にGoogle callbackとHTTP 200を確認し、エラー、5xx、DB認証失敗は確認されなかった。Vercel側ログの表示時刻にはタイムゾーンまたは表示形式による差があるため、本人申告時刻との秒単位の一致は断定しない
+- Auth.jsエラー、DB同期診断ログ、DBパスワード認証失敗、Neon / PostgreSQL接続エラー、HTTP 5xxは0件
+- 以前失敗していたGoogle OAuthアカウントのDB同期境界を正常に通過し、Production DB接続復旧は正式完了
+- 復旧でrollbackは不要だった
 - Production DBは `br-blue-bonus-aza51iwc`
 - Production DBのEndpoint IDは `ep-polished-cloud-az8xdsqg`
 - Production DBのMigration履歴は0000〜0005の6件
@@ -30,11 +33,11 @@
 - Production公開前バックアップ `backup-pre-release-20260721-c6b403e`（`br-withered-darkness-azjg6fpl`）はReady確認済み
 - `npm audit` のhigh以上は0件
 
-旧状態の `main` `92f834d`、旧安定版 `5964c2d`、診断ログ未公開、原因未確定は完了済みの履歴です。
+旧状態の `main` `92f834d`、旧安定版 `5964c2d`、診断ログ未公開、原因未確定、DB資格情報の復旧待ちは完了済みの履歴です。
 
-## 今回限定のVercel環境変数例外
+## 終了済み：今回限定のVercel環境変数例外
 
-通常時のVercel環境変数変更禁止は維持します。今回のDBパスワード認証失敗に限り、ActusTube projectのProduction scopeに一意に存在する `DATABASE_URL` だけを更新できます。
+今回のDBパスワード認証失敗に限り、ActusTube projectのProduction scopeに一意に存在する `DATABASE_URL` だけを更新する例外を適用しました。この例外は、本人による単一Googleログインと同時間帯のRuntime Log確認が正常に完了したため、2026-07-22に終了しました。以下は再利用できる許可ではなく、終了済みの監査履歴です。
 
 - 対象branch：`br-blue-bonus-aza51iwc`
 - 対象database：`neondb`
@@ -49,11 +52,13 @@
 - 自動deploymentを優先し、重複deploymentを作成しない
 - CodexはGoogleログインを実行しない
 - 新deploymentと現在の文書上deploymentが異なることだけを理由に、本人ログイン後のログ確認を停止しない
-- この例外は、本人による単一ログイン結果の確認が完了した時点で自動的に終了する
+- この例外は、本人による単一ログイン結果の確認完了時点で終了済み
 
-復旧deployment IDは本人ログイン後の完了報告に記録する。即時の追跡docs commitによって追加deploymentを発生させない。
+通常時のVercel環境変数変更禁止は全面的に再適用されています。`DATABASE_URL` を含むProduction環境変数は、新しい明示的許可なしに変更しません。Neon資格情報、role、password、endpoint、Production DB、Migration、schema、データも変更しません。この終了済み例外を将来の別障害へ流用しません。
 
-## 正しい実行順序
+## 復旧完了済み手順（監査履歴）
+
+以下のPhase 1〜4は完了済みです。将来の障害対応を自動的に許可する手順ではありません。
 
 ### Phase 1：文書同期と復旧ブランチ
 
@@ -86,7 +91,7 @@
 8. トップページ、静的リソース、auth providers、session、未認証保護GET API、継続的5xxの有無を確認する。
 9. 重大なアプリ全体の回帰がある場合だけ、事前に特定した直前の正常deploymentへrollbackする。本人ログイン待ちだけを理由にrollbackしない。
 
-### Phase 4：本人ログイン待ちと別タスクでの確認
+### Phase 4：本人ログインと別タスクでの確認（完了）
 
 Productionへダミーや検証専用のデータを作成してはいけません。データ保存を伴う確認は、ユーザーが明示的に承認した実利用データで行う場合に限ります。それ以外はバックアップまたは一時DBでの合格結果を利用し、Productionでは非破壊の確認だけを行います。
 
@@ -95,6 +100,8 @@ Productionへダミーや検証専用のデータを作成してはいけませ�
 3. 本人が完了時刻を報告した後、別タスクでcallback、ユーザー同期、DBパスワード認証失敗の再発、5xxを読み取り専用確認する。
 4. 成功時は今回限定例外を終了し、追加環境変数変更・追加deployment・即時docs-only pushを行わない。
 5. 失敗時はエラー分類だけを報告し、`DATABASE_URL` 以外へ例外を拡張せず停止する。
+
+実績：本人による単一Googleログイン、callback HTTP 302、直後のトップページHTTP 200を確認しました。Auth.jsエラー、DB認証失敗、Neon / PostgreSQL接続エラー、HTTP 5xxは確認されず、例外を終了しました。
 
 認証済みスモークテスト、AI提案、利用枠消費、週次改善項目の作成・更新はまだ行いません。
 
@@ -126,7 +133,7 @@ Productionでは検証専用データの作成や、その後片付けを前提�
 
 Migration 0005を含む適用済みMigrationは再実行しないでください。エラー後に独自判断でSQLを編集・実行せず、Migrationファイルも編集しないでください。
 
-## Phase 2・3停止条件
+## Phase 2・3停止条件（復旧時の監査履歴）
 
 - `main` またはfixブランチが想定コミットと異なる
 - upstream設定済みのブランチがupstreamと未同期
@@ -148,14 +155,7 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 
 ## ロールバック
 
-新コード公開後に異常が発生した場合：
-
-1. 新しい `main` commitを即座にrevertしない。
-2. 重大なアプリ全体の回帰がある場合だけ、事前に一意に特定した直前のProduction deployment `dpl_HPGCXavawHj3yHKo9nFg99LGB6jR` へInstant Rollbackする。本人ログイン待ちだけを理由にrollbackしない。
-3. Production HTTPとログを確認する。
-4. 適用済みMigration 0005は追加型のため、独断でDBを巻き戻さない。
-5. バックアップブランチを維持する。
-6. 原因を調査し、ユーザーと対応を決定する。
+今回のProduction DB接続復旧では、本人ログインとサーバーログが正常であり、rollbackは不要でした。以前のrollback候補は監査上の履歴であり、将来の障害へ自動適用しません。将来rollbackが必要な場合は、その時点のCurrent deployment、直前の正常deployment、影響範囲を再確認し、新しい明示的許可に従います。適用済みMigrationやProduction DBを独断で巻き戻しません。
 
 ## 絶対禁止
 
@@ -168,7 +168,7 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - Migrationの場当たり的な編集
 - DB関数、schema、権限の変更
 - Neon branchの作成・削除
-- Vercel環境変数の変更。ただし上記「今回限定のVercel環境変数例外」に完全一致するProduction `DATABASE_URL` の1回の更新だけを除く
+- Vercel環境変数の変更。終了済みの今回限定例外は再利用しない
 - Google Cloud設定の変更
 - 認証検証の緩和
 - 自動または複数回のGoogleログイン試行
@@ -179,7 +179,7 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 
 ## 完了条件
 
-以下がすべて合格した時に、Production DB接続復旧の未認証確認工程を完了し、本人操作待ちで停止します。
+2026-07-22のProduction DB接続復旧は、以下をすべて満たして正式完了しました。
 
 - Production Migration履歴6件
 - 必要DBオブジェクトとセキュリティ属性が存在
@@ -190,6 +190,12 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - Vercel Productionの `DATABASE_URL` だけを更新済み
 - 新deploymentがREADY / Current
 - 未認証Production確認に合格し、継続的5xxがない
-- Googleログインはまだ自動実行していない
+- CodexによるGoogleログインは実行せず、本人による単一ログインに成功
 - Git `main` と `origin/main` が同期
 - 作業ツリーclean
+- callback HTTP 302、直後のトップページHTTP 200
+- Auth.jsエラー、DB認証失敗、Neon / PostgreSQL接続エラー、HTTP 5xxなし
+- 今回限定の環境変数変更例外を終了し、通常の変更禁止規則を全面再適用
+- rollback不要
+
+次の開発工程は第1回UI改修であり、Production復旧作業とは分離します。
