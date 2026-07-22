@@ -3,6 +3,11 @@
 import { useMemo, useState } from "react";
 
 import { WeeklyImprovementCycle } from "@/app/components/weekly-improvement-cycle";
+import {
+  AnalysisFlowGuide,
+  SectionIntro,
+  StatusPanel,
+} from "@/app/components/ui-foundation";
 
 import {
   canRequestAIConsult,
@@ -401,7 +406,7 @@ function DonutChart({
 const styles = {
   page: {
     width: "100%",
-    maxWidth: "1320px",
+    maxWidth: "1180px",
     margin: "0 auto",
   } as const,
   inputBar: {
@@ -417,16 +422,15 @@ const styles = {
     flex: "1 1 320px",
     minWidth: 0,
     width: "100%",
-    border: "1px solid #dddddd",
-    borderRadius: "18px",
+    border: "1px solid var(--color-border-strong)",
+    borderRadius: "16px",
     overflow: "hidden",
-    backgroundColor: "#ffffff",
-    boxShadow: "0 10px 24px rgba(0,0,0,0.04)",
+    backgroundColor: "var(--color-surface)",
   } as const,
   prefix: {
     padding: "15px 14px 15px 16px",
-    backgroundColor: "#fafafa",
-    color: "#6b7280",
+    backgroundColor: "var(--color-surface-muted)",
+    color: "var(--color-text-muted)",
     fontSize: "14px",
     fontWeight: 700,
     borderRight: "1px solid #ededed",
@@ -438,20 +442,19 @@ const styles = {
     width: "100%",
     padding: "15px 16px",
     border: "none",
-    backgroundColor: "#ffffff",
-    color: "#111111",
+    backgroundColor: "var(--color-surface)",
+    color: "var(--color-text)",
     fontSize: "15px",
     outline: "none",
   } as const,
   button: {
     padding: "15px 20px",
     borderRadius: "16px",
-    border: "1px solid #d90429",
-    backgroundColor: "#d90429",
+    border: "1px solid var(--color-accent)",
+    backgroundColor: "var(--color-accent)",
     color: "#ffffff",
     fontWeight: 800,
     cursor: "pointer",
-    boxShadow: "0 12px 26px rgba(217,4,41,0.18)",
   } as const,
   consultButton: {
     padding: "15px 20px",
@@ -474,11 +477,11 @@ const styles = {
   } as const,
   section: {
     backgroundColor: "#ffffff",
-    border: "1px solid #ebebeb",
-    borderRadius: "24px",
+    border: "1px solid var(--color-border)",
+    borderRadius: "20px",
     padding: "24px",
     marginBottom: "22px",
-    boxShadow: "0 14px 30px rgba(0,0,0,0.05)",
+    boxShadow: "var(--shadow-card)",
   } as const,
   sectionTitle: {
     marginTop: 0,
@@ -500,55 +503,43 @@ const styles = {
     marginBottom: "22px",
   } as const,
   statCard: {
-    border: "1px solid #ededed",
+    border: "1px solid var(--color-border)",
     borderRadius: "20px",
     padding: "20px",
-    background:
-      "linear-gradient(180deg, rgba(255,255,255,1) 0%, rgba(249,250,251,1) 100%)",
-    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.6)",
+    background: "var(--color-surface-muted)",
   } as const,
   cardRed: {
-    background:
-      "linear-gradient(135deg, rgba(217,4,41,0.08) 0%, rgba(255,255,255,1) 65%)",
-    border: "1px solid #ffd4dc",
-    borderRadius: "24px",
+    background: "var(--color-surface)",
+    border: "1px solid var(--color-border)",
+    borderTop: "4px solid var(--color-accent)",
+    borderRadius: "20px",
     padding: "24px",
-    boxShadow: "0 16px 34px rgba(217,4,41,0.08)",
+    boxShadow: "var(--shadow-card)",
   } as const,
   cardBlack: {
-    background:
-      "linear-gradient(135deg, #111111 0%, #171717 55%, #202020 100%)",
+    background: "var(--color-dark)",
     color: "#ffffff",
-    borderRadius: "24px",
+    borderRadius: "20px",
     padding: "24px",
-    boxShadow: "0 18px 38px rgba(0,0,0,0.16)",
+    boxShadow: "var(--shadow-card)",
   } as const,
   list: {
     margin: 0,
     paddingLeft: "20px",
     lineHeight: 1.95,
   } as const,
-  errorBox: {
-    marginBottom: "20px",
-    padding: "13px 15px",
-    borderRadius: "14px",
-    backgroundColor: "#fff1f2",
-    color: "#b91c1c",
-    border: "1px solid #fecdd3",
-    fontWeight: 700,
-  } as const,
   smallLabel: {
     margin: 0,
     fontSize: "12px",
     fontWeight: 800,
     letterSpacing: "0.05em",
-    color: "#d90429",
+    color: "var(--color-accent)",
     textTransform: "uppercase" as const,
   } as const,
   prose: {
     margin: 0,
     lineHeight: 1.95,
-    color: "#232323",
+    color: "var(--color-text)",
     fontSize: "15px",
   } as const,
   darkProse: {
@@ -560,14 +551,14 @@ const styles = {
   tableWrap: {
     width: "100%",
     overflowX: "auto" as const,
-    border: "1px solid #ededed",
+    border: "1px solid var(--color-border)",
     borderRadius: "18px",
   } as const,
   table: {
     width: "100%",
     borderCollapse: "collapse" as const,
     minWidth: "760px",
-    backgroundColor: "#ffffff",
+    backgroundColor: "var(--color-surface)",
   } as const,
   th: {
     textAlign: "left" as const,
@@ -595,14 +586,12 @@ const styles = {
   } as const,
   barFillBlack: {
     height: "100%",
-    background:
-      "linear-gradient(90deg, #111111 0%, #2a2a2a 100%)",
+    background: "var(--color-dark)",
     borderRadius: "999px",
   } as const,
   barFillRed: {
     height: "100%",
-    background:
-      "linear-gradient(90deg, #d90429 0%, #ff3358 100%)",
+    background: "var(--color-accent)",
     borderRadius: "999px",
   } as const,
 };
@@ -790,7 +779,11 @@ export function YouTubeForm() {
           <div className="youtube-url-prefix" style={styles.prefix}>
             https://www.youtube.com/
           </div>
+          <label className="sr-only" htmlFor="youtube-channel-input">
+            YouTubeチャンネル名またはハンドル
+          </label>
           <input
+            id="youtube-channel-input"
             className="youtube-url-field"
             type="text"
             value={channelInput}
@@ -802,9 +795,12 @@ export function YouTubeForm() {
         </div>
 
         <button
+          type="button"
+          className="button button--primary"
           onClick={handleFetch}
           style={styles.button}
           disabled={loading || consultLoading}
+          aria-busy={loading}
         >
           {loading ? "分析中..." : "分析する"}
         </button>
@@ -836,20 +832,33 @@ export function YouTubeForm() {
         </div>
       </div>
 
-      {error && <div style={styles.errorBox}>{error}</div>}
-      {consultError && <div style={styles.errorBox}>{consultError}</div>}
+      {error && <StatusPanel tone="error" title={error} />}
+      {consultError && <StatusPanel tone="error" title={consultError} />}
+      {loading && (
+        <StatusPanel tone="loading" title="チャンネルを分析しています">
+          通常動画とショートの取得、集計、履歴保存を行っています。このままお待ちください。
+        </StatusPanel>
+      )}
+      {consultLoading && (
+        <StatusPanel tone="loading" title="AI提案を作成しています">
+          現在の分析データをもとに改善候補を整理しています。
+        </StatusPanel>
+      )}
+      {!channelTitle && !loading && !error && (
+        <StatusPanel tone="info" title="分析するチャンネルを入力してください">
+          YouTubeのチャンネル名またはハンドルを入力して「分析する」を選ぶと、現状と根拠データを確認できます。
+        </StatusPanel>
+      )}
 
-      <WeeklyImprovementCycle
-        currentAnalysisRunId={analysisResult?.analysisRunId ?? null}
-        suggestedAction={
-          consult?.currentImprovements[0] ?? consult?.nextSuggestions[0] ?? ""
-        }
-        refreshKey={historyRefreshKey}
-      />
+      {channelTitle && <AnalysisFlowGuide hasRecommendation={consult !== null} />}
 
       {channelTitle && (
         <>
-          <div className="youtube-grid-two" style={styles.grid2}>
+          <div
+            id="analysis-overview"
+            className="youtube-grid-two analysis-section-anchor"
+            style={styles.grid2}
+          >
             <div style={styles.cardRed}>
               <p style={styles.smallLabel}>Overview</p>
               <h2
@@ -910,7 +919,11 @@ export function YouTubeForm() {
             </div>
           </div>
 
-          <div className="youtube-grid-three" style={styles.grid3}>
+          <div
+            id="analysis-evidence"
+            className="youtube-grid-three analysis-section-anchor"
+            style={styles.grid3}
+          >
             <div style={styles.statCard}>
               <p style={styles.smallLabel}>Regular Average</p>
               <h3 style={{ margin: "8px 0 0", fontSize: "30px", lineHeight: 1 }}>
@@ -945,11 +958,20 @@ export function YouTubeForm() {
           </div>
 
           {consult && (
-            <>
+            <section
+              id="analysis-priority"
+              className="analysis-recommendation analysis-section-anchor"
+              aria-label="AIによる改善提案"
+            >
+              <SectionIntro
+                eyebrow="AI recommendation"
+                title="分析から見えた改善候補"
+                description="結論、強み・弱み、今すぐ見直すこと、次に試すことを、既存のAI提案データのまま整理しています。"
+              />
               <div style={styles.section}>
                 <p style={styles.smallLabel}>Diagnosis</p>
                 <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
-                  全体の見立て
+                  提案の結論
                 </h2>
                 <p style={styles.prose}>{consult.overallDiagnosis}</p>
               </div>
@@ -984,7 +1006,7 @@ export function YouTubeForm() {
                 <div style={styles.section}>
                   <p style={styles.smallLabel}>Current Fixes</p>
                   <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
-                    今の改善点
+                    今すぐ見直すこと
                   </h2>
                   <ul style={styles.list}>
                     {consult.currentImprovements.map((item, index) => (
@@ -996,7 +1018,7 @@ export function YouTubeForm() {
                 <div style={styles.section}>
                   <p style={styles.smallLabel}>Next Direction</p>
                   <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
-                    次回以降の提案
+                    次に試すこと
                   </h2>
                   <ul style={styles.list}>
                     {consult.nextSuggestions.map((item, index) => (
@@ -1005,10 +1027,26 @@ export function YouTubeForm() {
                   </ul>
                 </div>
               </div>
-            </>
+            </section>
           )}
+        </>
+      )}
 
-          <div className="youtube-grid-two" style={styles.grid2}>
+      <WeeklyImprovementCycle
+        currentAnalysisRunId={analysisResult?.analysisRunId ?? null}
+        suggestedAction={
+          consult?.currentImprovements[0] ?? consult?.nextSuggestions[0] ?? ""
+        }
+        refreshKey={historyRefreshKey}
+      />
+
+      {channelTitle && (
+        <>
+          <div
+            id="analysis-metrics"
+            className="youtube-grid-two analysis-section-anchor"
+            style={styles.grid2}
+          >
             <div style={styles.section}>
               <p style={styles.smallLabel}>Regular View Distribution</p>
               <h2 style={{ ...styles.sectionTitle, marginTop: "8px" }}>
@@ -1072,7 +1110,9 @@ export function YouTubeForm() {
                   </div>
                 ))
               ) : (
-                <p style={styles.prose}>データがありません。</p>
+                <StatusPanel tone="empty" title="通常動画の月別データがありません">
+                  取得できた通常動画が少ない場合は、月別推移を表示できません。
+                </StatusPanel>
               )}
             </div>
 
@@ -1107,7 +1147,9 @@ export function YouTubeForm() {
                   </div>
                 ))
               ) : (
-                <p style={styles.prose}>データがありません。</p>
+                <StatusPanel tone="empty" title="ショートの月別データがありません">
+                  取得できたショートが少ない場合は、月別推移を表示できません。
+                </StatusPanel>
               )}
             </div>
           </div>

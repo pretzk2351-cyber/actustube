@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { SectionIntro, StatusPanel } from "@/app/components/ui-foundation";
 import type {
   AnalysisHistoryItem,
   ImprovementActionView,
@@ -57,29 +58,17 @@ function isHistoryResponse(value: unknown): value is WeeklyCycleHistoryResponse 
 }
 
 const ui = {
-  section: {
-    backgroundColor: "#ffffff",
-    border: "1px solid #e5e7eb",
-    borderRadius: "24px",
-    padding: "24px",
-    marginBottom: "22px",
-    boxShadow: "0 14px 30px rgba(0,0,0,0.05)",
-  } as const,
   input: {
     width: "100%",
     boxSizing: "border-box" as const,
-    border: "1px solid #d1d5db",
+    border: "1px solid var(--color-border-strong)",
     borderRadius: "12px",
     padding: "11px 12px",
     fontSize: "14px",
     marginTop: "6px",
   } as const,
   button: {
-    border: 0,
     borderRadius: "12px",
-    padding: "11px 15px",
-    fontWeight: 800,
-    cursor: "pointer",
   } as const,
   label: {
     display: "block",
@@ -256,85 +245,86 @@ export function WeeklyImprovementCycle({
   }
 
   return (
-    <section style={ui.section} aria-labelledby="weekly-cycle-title">
-      <p style={{ margin: 0, color: "#d90429", fontSize: "12px", fontWeight: 900 }}>
-        WEEKLY IMPROVEMENT CYCLE
-      </p>
-      <h2 id="weekly-cycle-title" style={{ margin: "8px 0 6px", fontSize: "26px" }}>
-        今週の改善サイクル
-      </h2>
-      <p style={{ margin: "0 0 20px", color: "#6b7280", lineHeight: 1.7 }}>
-        分析結果から実行項目を1件決め、実行後に結果を記録します。
-      </p>
+    <section className="surface-card weekly-cycle" aria-labelledby="weekly-cycle-title">
+      <SectionIntro
+        id="weekly-cycle-title"
+        eyebrow="Weekly improvement cycle"
+        title="今週の改善サイクル"
+        description="分析結果から実行項目を1件決め、実行後に結果を記録します。"
+      />
 
       {message && (
-        <div style={{ padding: "11px 13px", marginBottom: "16px", borderRadius: "12px", background: "#fff1f2", color: "#9f1239", fontWeight: 700 }}>
-          {message}
-        </div>
+        <StatusPanel tone="info" title={message} />
       )}
 
-      {plannedAction ? (
-        <div style={{ padding: "18px", border: "1px solid #fecdd3", borderRadius: "18px", background: "#fff7f8", marginBottom: "24px" }}>
+      {loading && items.length === 0 ? (
+        <StatusPanel tone="loading" title="改善履歴を読み込んでいます">
+          分析履歴と進行中の改善項目を確認しています。
+        </StatusPanel>
+      ) : plannedAction ? (
+        <div className="weekly-cycle__active">
           <strong>進行中の改善項目</strong>
           <label style={{ ...ui.label, marginTop: "14px" }}>
             タイトル
-            <input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} maxLength={200} style={ui.input} disabled={saving} />
+            <input className="form-control" value={editTitle} onChange={(event) => setEditTitle(event.target.value)} maxLength={200} style={ui.input} disabled={saving} />
           </label>
           <label style={ui.label}>
             説明
-            <textarea value={editDescription} onChange={(event) => setEditDescription(event.target.value)} maxLength={2000} rows={3} style={ui.input} disabled={saving} />
+            <textarea className="form-control" value={editDescription} onChange={(event) => setEditDescription(event.target.value)} maxLength={2000} rows={3} style={ui.input} disabled={saving} />
           </label>
           <label style={ui.label}>
             実行後の結果メモ
-            <textarea value={resultNote} onChange={(event) => setResultNote(event.target.value)} maxLength={2000} rows={3} style={ui.input} disabled={saving} placeholder="実行して分かったことや次回直す点" />
+            <textarea className="form-control" value={resultNote} onChange={(event) => setResultNote(event.target.value)} maxLength={2000} rows={3} style={ui.input} disabled={saving} placeholder="実行して分かったことや次回直す点" />
           </label>
-          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-            <button type="button" onClick={() => void updateAction()} disabled={saving || !editTitle.trim()} style={{ ...ui.button, background: "#111827", color: "#fff" }}>内容を保存</button>
-            <button type="button" onClick={() => void updateAction("completed")} disabled={saving || !editTitle.trim() || !resultNote.trim()} style={{ ...ui.button, background: "#d90429", color: "#fff" }}>完了にする</button>
-            <button type="button" onClick={() => void updateAction("skipped")} disabled={saving || !editTitle.trim() || !resultNote.trim()} style={{ ...ui.button, background: "#e5e7eb", color: "#111827" }}>見送る</button>
+          <div className="form-actions">
+            <button className="button button--dark" type="button" onClick={() => void updateAction()} disabled={saving || !editTitle.trim()} style={ui.button}>内容を保存</button>
+            <button className="button button--primary" type="button" onClick={() => void updateAction("completed")} disabled={saving || !editTitle.trim() || !resultNote.trim()} style={ui.button}>完了にする</button>
+            <button className="button button--secondary" type="button" onClick={() => void updateAction("skipped")} disabled={saving || !editTitle.trim() || !resultNote.trim()} style={ui.button}>見送る</button>
           </div>
         </div>
       ) : showCreateActionForm ? (
-        <div style={{ padding: "18px", border: "1px solid #e5e7eb", borderRadius: "18px", marginBottom: "24px" }}>
+        <div className="weekly-cycle__create">
           <strong>この分析から今週の改善項目を設定</strong>
           <label style={{ ...ui.label, marginTop: "14px" }}>
             タイトル
-            <input value={newTitle} onChange={(event) => setNewTitle(event.target.value)} maxLength={200} style={ui.input} disabled={saving} />
+            <input className="form-control" value={newTitle} onChange={(event) => setNewTitle(event.target.value)} maxLength={200} style={ui.input} disabled={saving} />
           </label>
           <label style={ui.label}>
             説明
-            <textarea value={newDescription} onChange={(event) => setNewDescription(event.target.value)} maxLength={2000} rows={3} style={ui.input} disabled={saving} />
+            <textarea className="form-control" value={newDescription} onChange={(event) => setNewDescription(event.target.value)} maxLength={2000} rows={3} style={ui.input} disabled={saving} />
           </label>
-          <button type="button" onClick={() => void createAction()} disabled={saving || !newTitle.trim()} style={{ ...ui.button, background: "#d90429", color: "#fff" }}>
+          <button className="button button--primary" type="button" onClick={() => void createAction()} disabled={saving || !newTitle.trim()} style={ui.button}>
             {saving ? "保存中..." : "今週の改善項目として保存"}
           </button>
         </div>
       ) : hasActionForCurrentAnalysis ? (
-        <p style={{ padding: "15px", borderRadius: "14px", background: "#f3f4f6", color: "#4b5563", fontWeight: 700 }}>
-          この分析には改善項目が保存されています。内容と結果は履歴で確認できます。
-        </p>
+        <StatusPanel tone="success" title="この分析には改善項目が保存されています">
+          内容と実行結果は、下の履歴で確認できます。
+        </StatusPanel>
       ) : (
-        <p style={{ padding: "15px", borderRadius: "14px", background: "#f3f4f6", color: "#4b5563", fontWeight: 700 }}>
-          チャンネル分析後に、今週の改善項目を設定できます。
-        </p>
+        <StatusPanel tone="empty" title="今週の改善項目はまだありません">
+          チャンネル分析後に、実行する改善項目を1件設定できます。
+        </StatusPanel>
       )}
 
       <h3 style={{ margin: "24px 0 12px", fontSize: "20px" }}>過去の分析と改善項目</h3>
       {!loading && items.length === 0 ? (
-        <p style={{ color: "#6b7280" }}>保存された分析履歴はまだありません。</p>
+        <StatusPanel tone="empty" title="保存された分析履歴はまだありません">
+          最初のチャンネル分析が完了すると、ここに履歴が表示されます。
+        </StatusPanel>
       ) : (
-        <div style={{ display: "grid", gap: "12px" }}>
+        <div className="weekly-cycle__history">
           {items.map((item) => (
-            <article key={item.id} style={{ border: "1px solid #e5e7eb", borderRadius: "16px", padding: "15px" }}>
+            <article className="weekly-cycle__history-card" key={item.id}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
                 <strong>{item.channelTitle}</strong>
                 <span style={{ color: "#6b7280", fontSize: "13px" }}>{formatDate(item.analyzedAt)}</span>
               </div>
-              <p style={{ margin: "10px 0", color: "#4b5563", fontSize: "14px" }}>
+              <p className="weekly-cycle__history-summary" style={{ margin: "10px 0" }}>
                 通常 {item.regularVideoCount}本・平均 {item.regularAverageViews.toLocaleString()}回 ／ Shorts {item.shortVideoCount}本・平均 {item.shortAverageViews.toLocaleString()}回 ／ AI提案 {item.hasAIConsult ? "あり" : "なし"}
               </p>
               {item.action ? (
-                <div style={{ padding: "10px 12px", borderRadius: "12px", background: "#f9fafb" }}>
+                <div className="weekly-cycle__action-summary">
                   <strong>{statusLabels[item.action.status]}：{item.action.title}</strong>
                   {item.action.description && <p style={{ margin: "6px 0 0", color: "#4b5563" }}>{item.action.description}</p>}
                   {item.action.resultNote && <p style={{ margin: "6px 0 0", color: "#4b5563" }}>結果：{item.action.resultNote}</p>}
@@ -347,7 +337,7 @@ export function WeeklyImprovementCycle({
         </div>
       )}
       {nextCursor && (
-        <button type="button" onClick={() => void loadMore()} disabled={loading} style={{ ...ui.button, marginTop: "14px", background: "#e5e7eb", color: "#111827" }}>
+        <button className="button button--secondary" type="button" onClick={() => void loadMore()} disabled={loading} style={{ ...ui.button, marginTop: "14px" }}>
           {loading ? "読み込み中..." : "さらに表示"}
         </button>
       )}
