@@ -61,3 +61,27 @@
 
 - `main` 統合、Migration適用、Productionデプロイ、ロールバックなどで状態が変わった場合は、関連文書の更新も提案してください。
 - 実際の状態と文書が異なる場合は、文書を信じて作業を続けず、その場で停止して差異を報告してください。
+
+### docs-only状態差の限定例外
+
+`docs/ACTUSTUBE_PROJECT_STATUS.md` と `docs/PRODUCTION_RELEASE_RUNBOOK.md` は確認日時点の状態スナップショットです。その文書を `main` へ統合した直後に、docs-only commitとdocs-only deploymentによって `main` SHAやdeployment IDだけが1世代進む場合があります。以下の条件を**すべて**満たす場合に限り、その差を一般的な状態不一致とは区別し、読み取り専用確認、文書更新、またはユーザーが明示的に許可したProductionスモークを続行できます。
+
+1. 現在の `main` と `origin/main` が同期している。
+2. 作業ツリーがcleanで、未追跡ファイルがない。
+3. 文書に記載されたアプリコード基準から現在の `main` までの変更が、承認済み文書ファイル（`AGENTS.md`、`docs/ACTUSTUBE_PRODUCT_SPEC.md`、`docs/ACTUSTUBE_PROJECT_STATUS.md`、`docs/PRODUCTION_RELEASE_RUNBOOK.md`）だけである。
+4. `src/`、API route、test、`package.json`、`package-lock.json`、Migration、Drizzle schema、`vercel.json`、Next.js設定、環境変数、DB、Neon、Google Cloudに変更が一切ない。
+5. Current Productionのsource commitが現在の `main` と一致する。
+6. Current ProductionがREADY / Currentである。
+7. Productionトップページと主要静的リソースが正常である。
+8. 実行する作業が、読み取り専用確認、文書更新、またはユーザーが明示的に許可したProductionスモークのいずれかである。
+9. deploy、Migration、環境変数変更、DB変更を伴わない。
+
+次の場合はこの例外を適用せず、従来どおり停止してください。
+
+- アプリコード、test、package、Migration、DB schema、Vercel設定、環境変数に差分がある。
+- Production sourceと現在の `main` が一致しない、READY / Currentではない、または対象deploymentを一意に特定できない。
+- 差分が承認済み文書ファイルだけであることを証明できない、または変更内容を一意に特定できない。
+- Production変更、DB操作、Migration、rollbackを伴う。
+- 作業に必要なユーザーの明示的許可がない。
+
+この例外を使用した場合は、文書上のスナップショット、現在のGit / Production、docs-onlyである証拠、例外を適用したこと、コード・DB・Migration・設定に差分がないことを完了報告へ明記してください。この例外を一般的な状態不一致の無視には使用しません。

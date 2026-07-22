@@ -6,20 +6,19 @@ Production公開とDB接続を安全に保護するための手順と停止条�
 
 ## 現在の前提
 
-以下は2026-07-23 01:12:20 JSTのProductionスナップショットです。deployment情報とruntime件数は確認日時・確認時間帯に限定した状態であり、将来の作業では必ず読み取り専用で実状態を再確認してください。
+以下は2026-07-23 02:10:39 JSTのProductionスナップショットです。deployment情報は確認日時に限定した状態であり、将来の作業では必ず読み取り専用で実状態を再確認してください。
 
-- GitHub `main` は `f6014a183194490eaca09bec94723ee04c1a827c`
+- GitHub `main` は `e036d34db3939a79073fcb05db9c27acda06d0e9`
 - `main` と `origin/main` は0 / 0で同期し、作業ツリーはclean
 - 正式仕様書v1.0 `docs/ACTUSTUBE_PRODUCT_SPEC.md` はmainへfast-forward統合済みで、merge commitはない
-- `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` から `f6014a1` の変更は `AGENTS.md` と正式仕様書Markdownだけで、アプリコードは `7ef73ed` の内容から変わっていない
+- `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` から `e036d34` の変更は `AGENTS.md`、正式仕様書Markdown、Project Status、本Runbookだけで、アプリコードは `7ef73ed` の内容から変わっていない
 - Vercel projectはActusTube
-- Vercel Production deploymentは `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`
+- Vercel Production deploymentは `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`
 - Production domainは `https://actustube.vercel.app`
-- deploymentはREADY / Currentで、source branchは `main`、commitは `f6014a183194490eaca09bec94723ee04c1a827c`
+- deploymentはREADY / Currentで、source branchは `main`、commitは `e036d34db3939a79073fcb05db9c27acda06d0e9`
 - トップページ、主要CSS、主要JavaScriptはHTTP 200
-- 2026-07-22 23:12:20〜2026-07-23 01:12:20 JSTのRuntime Logでerror 0件、fatal 0件、HTTP 5xx 0件
-- Runtime Logの0件は上記時間帯の観測結果であり、将来も常に0件であることを保証しない
-- 正式仕様書のdocs-only統合と自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
+- deployment開始は2026-07-23 01:38:17 JST
+- docs-only統合と自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
 - 週次改善サイクルrelease candidate `c6b403e` とGoogle OAuth callback互換性修正 `2f79fa7` はmain統合・公開済み
 - `redirect_uri_mismatch` とOAuth callbackの `missing iss` は解消済み
 - 安全な認証DB診断ログ `c3e71ff` はProduction公開済み
@@ -41,9 +40,27 @@ Production公開とDB接続を安全に保護するための手順と停止条�
 - アプリコード基準 `7ef73ed` の `npm audit` は全severity 0件
 - 所有者による単一Googleログインは成功済みだが、チャンネル・動画・分析・AI提案・利用枠・週次改善を含む認証済みProduction全機能スモークテストは未実施
 
-直前のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は、docs-only deploymentとの比較用履歴です。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧状態の `main` `92f834d`、旧安定版 `5964c2d`、診断ログ未公開、原因未確定、DB資格情報の復旧待ちは完了済みの監査履歴です。これらは現在のCurrentまたは自動的なrollback先ではありません。
+直前のdocs-only deployment `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`（`main@f6014a1`）と、直近のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は比較用履歴です。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧状態の `main` `92f834d`、旧安定版 `5964c2d`、診断ログ未公開、原因未確定、DB資格情報の復旧待ちは完了済みの監査履歴です。これらは現在のCurrentまたは自動的なrollback先ではありません。
 
-今回の `docs/sync-project-status-runbook-20260723` はProject Statusと本Runbookだけを同期する文書branchです。作業branchのcommit・pushは、`main` 統合、Production操作、DB操作、設定変更を許可しません。
+今回の `docs/allow-safe-docs-only-state-drift` はdocs-only状態差の限定規則を追加し、Project Statusと本Runbookを同期する文書branchです。作業branchのcommit・pushは、`main` 統合、Production操作、DB操作、設定変更を許可しません。認証済みProduction主要機能スモークは未実施です。
+
+## docs-onlyスナップショット差の限定判定
+
+Project Statusや本RunbookのGit / deployment識別子が現在の実状態と異なる場合も、一般的な不一致として停止する前に、次の手順を**すべて読み取り専用**で確認します。
+
+1. 文書上のアプリコード基準を特定する。
+2. その基準から現在の `main` までの変更ファイル一覧を確認する。
+3. 変更が承認済み文書ファイル（`AGENTS.md`、`docs/ACTUSTUBE_PRODUCT_SPEC.md`、`docs/ACTUSTUBE_PROJECT_STATUS.md`、`docs/PRODUCTION_RELEASE_RUNBOOK.md`）だけであることを確認する。
+4. `src/`、API route、test、`package.json`、`package-lock.json`、Migration、Drizzle schema、`vercel.json`、Next.js設定に差分がなく、環境変数、DB、Neon、Google Cloudも変更されていないことを確認する。
+5. 現在の `main` と `origin/main` が同期し、作業ツリーがcleanで未追跡ファイルがないことを確認する。
+6. Current Productionのsource commitが現在の `main` と一致することを確認する。
+7. Current ProductionがREADY / Currentで、トップページと主要静的リソースが正常であることを確認する。
+8. 実行する作業が読み取り専用確認、文書更新、またはユーザーが明示的に許可したProductionスモークであることを確認する。
+9. deploy、Migration、環境変数変更、DB変更、rollbackを伴わないことを確認する。
+
+全条件に合格した場合だけ、差をdocs-onlyスナップショット差として記録し、対象作業を続行できます。例外を使用した報告には、文書上のスナップショット、現在のGit / Production、docs-onlyである証拠、例外適用の事実、コード・DB・Migration・設定に差分がないことを記載します。
+
+アプリコード、test、package、Migration、DB schema、Vercel設定、環境変数に差分がある場合、Production sourceと現在の `main` が一致しない場合、READY / Currentでない場合、deploymentまたは差分を一意に特定できない場合、手動deploy等が必要な場合、安全性を証明できない場合、または必要なユーザー許可がない場合は、この限定判定を適用せず従来どおり停止します。Production変更、DB操作、Migration、rollbackへこの例外を拡張しません。
 
 ## 終了済み：今回限定のVercel環境変数例外
 
@@ -121,8 +138,8 @@ Productionでは検証専用データの作成や、その後片付けを前提�
 
 以下の場合は変更操作へ進まず、進行中なら直ちに停止します。Migration 0005は適用済みのため再実行しません。従来のProduction DB保護条件も引き続き有効です。
 
-- `main`、`origin/main`、Production deploymentまたはsource commitが前提と不一致
-- 必読文書とGit・Vercel・Neonの実状態が不一致
+- `main`、`origin/main`、Production deploymentまたはsource commitが前提と不一致（全条件を満たすdocs-onlyスナップショット差を除く）
+- 必読文書とGit・Vercel・Neonの実状態が不一致（全条件を満たすdocs-onlyスナップショット差を除く）
 - 作業開始前に意図しないGit差分が存在
 
 - Endpoint ID不一致
@@ -165,7 +182,7 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 
 ## ロールバック
 
-今回のProduction DB接続復旧では、本人ログインとサーバーログが正常であり、rollbackは不要でした。2026-07-23時点のCurrentは `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa` で、直前の `dpl_37GSvgbM3Y23QAs9571UtAwzD42d` は同じアプリコード基準 `7ef73ed` を配信した比較用履歴です。以前のrollback候補を含む過去deploymentは監査上の履歴であり、将来の障害へ自動適用しません。将来rollbackが必要な場合は、その時点のCurrent deployment、直前の正常deployment、影響範囲を再確認し、新しい明示的許可に従います。適用済みMigrationやProduction DBを独断で巻き戻しません。
+今回のProduction DB接続復旧では、本人ログインとサーバーログが正常であり、rollbackは不要でした。2026-07-23 02:10:39 JST時点のCurrentは `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn` で、直前の `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa` と `dpl_37GSvgbM3Y23QAs9571UtAwzD42d` は同じアプリコード基準 `7ef73ed` を配信した比較用履歴です。以前のrollback候補を含む過去deploymentは監査上の履歴であり、将来の障害へ自動適用しません。将来rollbackが必要な場合は、その時点のCurrent deployment、直前の正常deployment、影響範囲を再確認し、新しい明示的許可に従います。適用済みMigrationやProduction DBを独断で巻き戻しません。
 
 ## 絶対禁止
 
@@ -208,4 +225,4 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - 今回限定の環境変数変更例外を終了し、通常の変更禁止規則を全面再適用
 - rollback不要
 
-第1回UI改修は `7ef73ed` としてmain統合・Production公開済みです。次工程は、Project Status／Production Runbook同期差分の独立レビューとmainへのfast-forward統合判定です。この判定までは文書branchをmainへ統合せず、Production、DB、Migration、Vercel設定・環境変数を変更しません。
+第1回UI改修は `7ef73ed` としてmain統合・Production公開済みです。次工程は、限定規則差分の独立レビューとmain統合後、認証済みProduction主要機能スモークを再実行することです。この判定までは文書branchをmainへ統合せず、Production、DB、Migration、Vercel設定・環境変数を変更しません。

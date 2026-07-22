@@ -2,7 +2,7 @@
 
 最終更新日：2026-07-23
 
-> 2026-07-23の状態スナップショットです。正式仕様書v1.0を `docs/ACTUSTUBE_PRODUCT_SPEC.md` として `main` へfast-forward統合済みで、`main` / `origin/main` は `f6014a183194490eaca09bec94723ee04c1a827c` です。この統合はdocs-onlyであり、アプリコードの直近基準は `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` から変わっていません。Productionは `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`（`main@f6014a1`）をREADY / Currentで配信しています。2026-07-23 01:12:20 JSTにトップ・主要CSS・主要JavaScriptのHTTP 200を確認し、2026-07-22 23:12:20〜2026-07-23 01:12:20 JSTのRuntime Logではerror / fatal / HTTP 5xxを各0件と観測しました。この0件は当該時間帯の観測結果であり、恒久保証ではありません。Production DB接続復旧は完了済みで、通常の環境変数変更禁止規則が引き続き適用されています。
+> 2026-07-23 02:10:39 JSTの読み取り専用確認に基づく状態スナップショットです。`main` / `origin/main` は `e036d34db3939a79073fcb05db9c27acda06d0e9` で同期し、Productionは `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`（`main@e036d34db3939a79073fcb05db9c27acda06d0e9`）をREADY / Currentで配信しています。トップ・主要CSS・主要JavaScriptはHTTP 200です。アプリコードの直近基準は `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` であり、そこから現在の `main` までの変更は承認済み文書ファイルだけです。認証済みProduction主要機能スモークは未実施です。この文書自体の後続docs-only commitやdeploymentによりGit / Production識別子が進む可能性があり、その場合もAGENTS / Runbookの全条件を満たすdocs-only限定例外だけが適用候補です。Production DB接続復旧は完了済みで、通常の環境変数変更禁止規則が引き続き適用されています。
 
 ## プロジェクト概要
 
@@ -117,7 +117,7 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 
 ## 検証結果
 
-アプリコード基準 `7ef73ed` のmain統合前後に再実行した確認結果です。今回の `f6014a1` はdocs-onlyのため、アプリコードと依存関係はこの検証済み内容から変わっていません。
+アプリコード基準 `7ef73ed` のmain統合前後に再実行した確認結果です。`7ef73ed` 以後の `f6014a1` と `e036d34` はdocs-onlyのため、アプリコードと依存関係はこの検証済み内容から変わっていません。
 
 - 自動テスト：185件成功、4件skip
 - React act警告：0件
@@ -139,10 +139,10 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 
 ## Git状態
 
-2026-07-23の正式仕様書統合・Production確認後に読み取り確認した状態：
+2026-07-23 02:10:39 JSTに読み取り確認した状態：
 
-- `main`：`f6014a183194490eaca09bec94723ee04c1a827c`
-- `origin/main`：`f6014a183194490eaca09bec94723ee04c1a827c`
+- `main`：`e036d34db3939a79073fcb05db9c27acda06d0e9`
+- `origin/main`：`e036d34db3939a79073fcb05db9c27acda06d0e9`
 - `main` と `origin/main`：0 / 0で同期済み
 - 作業ツリー：clean
 - `c6b403e`：週次改善サイクルのrelease candidate
@@ -152,24 +152,25 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 - `696d4b0`：Production DB接続復旧手順の文書化と復旧deploymentのsource
 - `7ef73ed`：第1回UI改修と週次改善サイクル通知修正を含む直近のアプリコード基準
 - `f6014a1`：正式仕様書v1.0を正本Markdownとして追加したdocs-only commit
+- `e036d34`：Project Status / Production Runbookを同期したdocs-only commit
 
-`7ef73ed` から `f6014a1` の変更は `AGENTS.md` と `docs/ACTUSTUBE_PRODUCT_SPEC.md` の2件だけで、fast-forward統合され、merge commitはありません。正式仕様書v1.0はmain統合済みですが、将来設計を現在の実装済み機能として扱いません。旧状態の `main` `92f834d`、`fix/weekly-action-duplicate-conflict` 未統合、診断ログ未公開、DB資格情報の復旧待ち、`feat/ui-foundation-primary-flow` 未統合は完了済みの履歴です。
+`7ef73ed` から `e036d34` の変更は、`AGENTS.md`、`docs/ACTUSTUBE_PRODUCT_SPEC.md`、`docs/ACTUSTUBE_PROJECT_STATUS.md`、`docs/PRODUCTION_RELEASE_RUNBOOK.md` の4件だけです。アプリコード、test、package、Migration、Drizzle schema、Vercel設定は変更されていません。正式仕様書v1.0はmain統合済みですが、将来設計を現在の実装済み機能として扱いません。旧状態の `main` `92f834d`、`fix/weekly-action-duplicate-conflict` 未統合、診断ログ未公開、DB資格情報の復旧待ち、`feat/ui-foundation-primary-flow` 未統合は完了済みの履歴です。
 
 ## Vercel Production状態
 
-2026-07-23 01:12:20 JSTのProductionスナップショット：
+2026-07-23 02:10:39 JSTのProductionスナップショット：
 
 - Production Branch：`main`
 - Vercel Project：ActusTube
-- commit：`f6014a183194490eaca09bec94723ee04c1a827c`
-- deployment：`dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`
+- commit：`e036d34db3939a79073fcb05db9c27acda06d0e9`
+- deployment：`dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`
 - domain：`https://actustube.vercel.app`
 - 状態：READY / Current
 - トップページ、主要CSS、主要JavaScript：HTTP 200
-- 2026-07-22 23:12:20〜2026-07-23 01:12:20 JSTのRuntime Log：error 0件、fatal 0件、HTTP 5xx 0件
-- Runtime Logの0件は上記時間帯の観測結果であり、将来も常に0件であることを保証しない
-- source commit `f6014a1` は正式仕様書追加のdocs-only commitで、アプリコードは `7ef73ed` の内容から変わっていない
-- 正式仕様書統合・自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
+- source commit `e036d34` はProject Status / Production Runbook同期のdocs-only commitで、アプリコードは `7ef73ed` の内容から変わっていない
+- `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn` の開始時刻は2026-07-23 01:38:17 JST
+- docs-only統合・自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
+- このdeployment情報は確認時点のスナップショットであり、後続docs-only commitによって識別子が進んでも永続的にCurrentであることを意味しない
 
 Production DB接続復旧に関する完了済み履歴：
 
@@ -186,7 +187,7 @@ Production DB接続復旧に関する完了済み履歴：
 - Production DB接続復旧：正式完了
 - rollback：不要
 
-直前のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は、docs-only deploymentとの比較用履歴として残します。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧deployment `dpl_HPGCXavawHj3yHKo9nFg99LGB6jR`、`dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ` は監査履歴であり、現在のCurrentまたは自動的なrollback先ではありません。復旧ではVercel Productionの `DATABASE_URL` 以外を変更せず、Production DB本体やMigration 0000〜0005を変更・再適用していません。今回限定の環境変数変更例外は終了済みです。
+直前のdocs-only deployment `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`（`main@f6014a1`）と、直近のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は比較用履歴として残します。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧deployment `dpl_HPGCXavawHj3yHKo9nFg99LGB6jR`、`dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ` は監査履歴であり、現在のCurrentまたは自動的なrollback先ではありません。復旧ではVercel Productionの `DATABASE_URL` 以外を変更せず、Production DB本体やMigration 0000〜0005を変更・再適用していません。今回限定の環境変数変更例外は終了済みです。
 
 ## Production DB
 
@@ -270,8 +271,8 @@ Production DB接続復旧に関する完了済み履歴：
 
 ## 現在残っている作業
 
-1. `docs/sync-project-status-runbook-20260723` のdocs-only差分を独立レビューし、mainへのfast-forward統合可否を判定する
-2. 所有者による認証済みProductionスモークテストの未実施項目を、費用と利用枠を考慮して最小回数で確認する
+1. docs-only状態差の限定規則差分を独立レビューし、mainへのfast-forward統合可否を判定する
+2. 統合後、所有者による認証済みProduction主要機能スモークを、費用と利用枠を考慮して最小回数で実施する
 3. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
 4. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
 
@@ -290,6 +291,6 @@ Production DB接続復旧と第1回UI改修は完了しています。通常のV
 
 ## 次の作業
 
-次工程は、Project Status／Production Runbook同期差分の独立レビューとmainへのfast-forward統合判定です。
+次工程は、限定規則差分の独立レビューとmain統合後、認証済みProduction主要機能スモークを再実行することです。スモークは現時点では未実施です。
 
-この文書同期branchの作成・commit・pushはProduction操作と分離します。レビュー完了までは `main` へ統合・pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。
+この文書同期branchの作成・commit・pushはProduction操作と分離します。レビュー完了までは `main` へ統合・pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
