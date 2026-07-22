@@ -1,8 +1,8 @@
 # ActusTube Project Status
 
-最終更新日：2026-07-21
+最終更新日：2026-07-22
 
-> 2026-07-21の状態スナップショットです。週次改善サイクルMVPとGoogle OAuth互換性修正は `main` へ統合され、Vercel Productionへ公開済みです。現在はGoogle OAuthのDBユーザー同期失敗を、安全な診断ログで特定する工程です。次工程でもRunbookの停止条件に従って実状態を再確認してください。
+> 2026-07-22の状態スナップショットです。安全な認証DB診断ログをProductionへ公開し、ユーザー本人による単一ログインで障害原因をDBパスワード認証失敗と確定しました。次工程は、今回限定の例外としてVercel Productionの `DATABASE_URL` だけを復旧する作業です。次工程でもRunbookの停止条件に従って実状態を再確認してください。
 
 ## プロジェクト概要
 
@@ -114,35 +114,39 @@ release candidate作成時に再実行した確認結果です。
 
 ## Git状態
 
-2026-07-21の診断作業開始前に読み取り確認した状態：
+2026-07-22のProduction DB接続復旧作業開始前に読み取り確認した状態：
 
-- `main`：`2f79fa7199b8b376ba16838a175c8af436fe69c7`
-- `origin/main`：`2f79fa7199b8b376ba16838a175c8af436fe69c7`
+- `main`：`c3e71ffdf5b66f97e1303f9e3f62481b7f725f2a`
+- `origin/main`：`c3e71ffdf5b66f97e1303f9e3f62481b7f725f2a`
 - `main` と `origin/main`：0 / 0で同期済み
 - 作業ツリー：clean
 - `c6b403e`：週次改善サイクルのrelease candidate
 - `2f79fa7`：Google OAuth callback互換性修正
+- `509bf21`：Production認証障害に合わせた文書同期
+- `c3e71ff`：安全な認証DB診断ログ
 
-旧状態の `main` `92f834d` と `fix/weekly-action-duplicate-conflict` 未統合は完了済みの履歴です。次の作業ブランチは `fix/auth-db-error-diagnostics` とし、診断ログと文書同期を検証後にまとめて `main` へfast-forward統合します。
+旧状態の `main` `92f834d`、`fix/weekly-action-duplicate-conflict` 未統合、診断ログ未公開は完了済みの履歴です。次の作業ブランチは `fix/production-database-url-recovery` とし、文書同期後に今回限定のProduction接続復旧を実施します。アプリコードは変更しません。
 
 ## Vercel Production状態
 
-2026-07-21の診断作業開始前スナップショット：
+2026-07-22のProduction DB接続復旧作業開始前スナップショット：
 
 - Production Branch：`main`
-- commit：`2f79fa7199b8b376ba16838a175c8af436fe69c7`
-- deployment：`dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ`
+- commit：`c3e71ffdf5b66f97e1303f9e3f62481b7f725f2a`
+- deployment：`dpl_HPGCXavawHj3yHKo9nFg99LGB6jR`
 - domain：`https://actustube.vercel.app`
 - 状態：READY / Current
 - `redirect_uri_mismatch`：解消済み
 - OAuth callbackの `missing iss`：解消済み
 - callbackは `/api/auth/callback/google` まで到達
-- 現在のブロッカー：`signIn` callback内の `public.sync_google_oauth_account(...)`
-- Auth.jsログ：`AccessDenied` / `NeonDbError`
-- セッション・JWT作成前に停止
-- PostgreSQLの正確な原因：既存ログの情報不足により未確定
+- 安全な診断ログ：実装・検証・Production公開済み
+- 本人による単一ログイン：実施済み。追加ログインは未実施
+- 現在のブロッカー：Runtimeが使用する `DATABASE_URL` のDBパスワード認証失敗
+- Neon / PostgreSQLが `sync_google_oauth_account` のSQL実行前に接続認証を拒否
+- timeout、fetch失敗、接続リセットではない
+- Migration、DB関数、schema、制約、権限の問題ではない
 
-旧安定版 `5964c2d` へのロールバックと、週次改善サイクル公開前の状態は完了済みの履歴です。一時的なNeon HTTP／ネットワーク障害とは断定しません。
+旧deployment `dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ` と診断前の原因未確定状態は完了済みの履歴です。Production DB本体やMigrationは変更せず、Migration 0000〜0005を再適用しません。
 
 ## Production DB
 
@@ -226,18 +230,17 @@ release candidate作成時に再実行した確認結果です。
 
 ## 現在残っている作業
 
-1. `fix/auth-db-error-diagnostics` で文書同期を独立commitとして保存
-2. `syncGoogleAccount` のDB呼び出し境界へallowlist方式の安全な診断ログを追加
-3. 診断抽出・伏字処理の単体テストを追加
-4. テスト、ESLint、TypeScript、Production build、`npm audit`、Drizzle、差分・秘密情報検査
-5. fixブランチをpushし、`origin/main` が `2f79fa7` から変化していないことを確認
-6. `main` へfast-forward統合して一度だけpush
-7. 新しいVercel Production deploymentのREADY / Current確認
-8. 未認証経路と継続的5xxの有無を確認
-9. ユーザー本人がGoogleログインを1回だけ実行
-10. Runtime LogからPostgreSQLまたは通信層の元エラーを確定して停止
+1. `fix/production-database-url-recovery` で今回限定の復旧手順を文書commitとして保存
+2. 対象branch・database・endpoint・既存Production Runtime用role・pooled構成を非秘密情報で照合
+3. 有効なpooled接続URIを表示・保存せず取得
+4. `BEGIN READ ONLY; SELECT 1; ROLLBACK;` だけで接続確認
+5. Vercel Production scopeの `DATABASE_URL` だけを更新
+6. 文書commitを `main` へfast-forward統合して通常push
+7. 新しいProduction deploymentを1件だけ作成し、READY / Currentを確認
+8. 未認証スモークテストを実施
+9. ユーザー本人によるGoogleログイン1回の直前で停止
 
-認証済みスモークテスト、AI提案、DB修正、Migration、Neon branch操作はこの工程に含めません。
+認証済みスモークテスト、AI提案、DB・データ・Migration・schema・関数・権限、Neon構成、Google Cloud、`DATABASE_URL` 以外の環境変数変更はこの工程に含めません。
 
 ## 今回の公開対象外
 
@@ -252,6 +255,6 @@ release candidate作成時に再実行した確認結果です。
 
 ## 次の作業
 
-次に実施する工程は、`syncGoogleAccount` 境界への安全な診断ログ追加とProduction公開です。Migration 0000〜0005、Production関数、schema、権限、Neon branch、Vercel環境変数は変更しません。
+次に実施する工程は、今回限定の例外としてVercel Productionの `DATABASE_URL` だけを有効なpooled接続資格情報へ更新し、同じアプリコードを新しいProduction deploymentへ公開することです。Production DB本体、Migration 0000〜0005、関数、schema、権限、Neon branch、Google Cloud、他の環境変数は変更しません。
 
-新deploymentの未認証確認後、Googleアカウント選択など本人操作の直前で停止します。ユーザーがログインを1回行った後にRuntime Logを読み取り、原因を確定します。開始前に [Production Release Runbook](./PRODUCTION_RELEASE_RUNBOOK.md) を読み、記載内容とGit・Vercel・Neonの実状態が一致しない場合は停止してください。
+新deploymentの未認証確認後、Googleアカウント選択など本人操作の直前で停止します。ユーザーがログインを1回行った後にRuntime Logを読み取り、復旧結果を判定します。開始前に [Production Release Runbook](./PRODUCTION_RELEASE_RUNBOOK.md) を読み、記載内容とGit・Vercel・Neonの実状態が一致しない場合は停止してください。
