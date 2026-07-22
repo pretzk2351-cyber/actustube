@@ -6,13 +6,20 @@ Production公開とDB接続を安全に保護するための手順と停止条�
 
 ## 現在の前提
 
-以下は2026-07-22のProduction DB接続復旧完了後スナップショットです。deployment情報は確認日時付きの状態であり、将来の作業では必ず読み取り専用で実状態を再確認してください。
+以下は2026-07-23 01:12:20 JSTのProductionスナップショットです。deployment情報とruntime件数は確認日時・確認時間帯に限定した状態であり、将来の作業では必ず読み取り専用で実状態を再確認してください。
 
-- GitHub `main` は `696d4b027d062e4f5dd85ed5af566194af70061f`
+- GitHub `main` は `f6014a183194490eaca09bec94723ee04c1a827c`
 - `main` と `origin/main` は0 / 0で同期し、作業ツリーはclean
-- Vercel Production deploymentは `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`
+- 正式仕様書v1.0 `docs/ACTUSTUBE_PRODUCT_SPEC.md` はmainへfast-forward統合済みで、merge commitはない
+- `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` から `f6014a1` の変更は `AGENTS.md` と正式仕様書Markdownだけで、アプリコードは `7ef73ed` の内容から変わっていない
+- Vercel projectはActusTube
+- Vercel Production deploymentは `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`
 - Production domainは `https://actustube.vercel.app`
-- deploymentはREADY / Currentで、source branchは `main`、commitは `696d4b0`
+- deploymentはREADY / Currentで、source branchは `main`、commitは `f6014a183194490eaca09bec94723ee04c1a827c`
+- トップページ、主要CSS、主要JavaScriptはHTTP 200
+- 2026-07-22 23:12:20〜2026-07-23 01:12:20 JSTのRuntime Logでerror 0件、fatal 0件、HTTP 5xx 0件
+- Runtime Logの0件は上記時間帯の観測結果であり、将来も常に0件であることを保証しない
+- 正式仕様書のdocs-only統合と自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
 - 週次改善サイクルrelease candidate `c6b403e` とGoogle OAuth callback互換性修正 `2f79fa7` はmain統合・公開済み
 - `redirect_uri_mismatch` とOAuth callbackの `missing iss` は解消済み
 - 安全な認証DB診断ログ `c3e71ff` はProduction公開済み
@@ -31,9 +38,12 @@ Production公開とDB接続を安全に保護するための手順と停止条�
 - バックアップブランチでMigrationリハーサル合格済み
 - バックアップブランチ `br-crimson-shadow-azkeq0kc` は削除せず保持中
 - Production公開前バックアップ `backup-pre-release-20260721-c6b403e`（`br-withered-darkness-azjg6fpl`）はReady確認済み
-- `npm audit` のhigh以上は0件
+- アプリコード基準 `7ef73ed` の `npm audit` は全severity 0件
+- 所有者による単一Googleログインは成功済みだが、チャンネル・動画・分析・AI提案・利用枠・週次改善を含む認証済みProduction全機能スモークテストは未実施
 
-旧状態の `main` `92f834d`、旧安定版 `5964c2d`、診断ログ未公開、原因未確定、DB資格情報の復旧待ちは完了済みの履歴です。
+直前のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は、docs-only deploymentとの比較用履歴です。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧状態の `main` `92f834d`、旧安定版 `5964c2d`、診断ログ未公開、原因未確定、DB資格情報の復旧待ちは完了済みの監査履歴です。これらは現在のCurrentまたは自動的なrollback先ではありません。
+
+今回の `docs/sync-project-status-runbook-20260723` はProject Statusと本Runbookだけを同期する文書branchです。作業branchのcommit・pushは、`main` 統合、Production操作、DB操作、設定変更を許可しません。
 
 ## 終了済み：今回限定のVercel環境変数例外
 
@@ -155,7 +165,7 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 
 ## ロールバック
 
-今回のProduction DB接続復旧では、本人ログインとサーバーログが正常であり、rollbackは不要でした。以前のrollback候補は監査上の履歴であり、将来の障害へ自動適用しません。将来rollbackが必要な場合は、その時点のCurrent deployment、直前の正常deployment、影響範囲を再確認し、新しい明示的許可に従います。適用済みMigrationやProduction DBを独断で巻き戻しません。
+今回のProduction DB接続復旧では、本人ログインとサーバーログが正常であり、rollbackは不要でした。2026-07-23時点のCurrentは `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa` で、直前の `dpl_37GSvgbM3Y23QAs9571UtAwzD42d` は同じアプリコード基準 `7ef73ed` を配信した比較用履歴です。以前のrollback候補を含む過去deploymentは監査上の履歴であり、将来の障害へ自動適用しません。将来rollbackが必要な場合は、その時点のCurrent deployment、直前の正常deployment、影響範囲を再確認し、新しい明示的許可に従います。適用済みMigrationやProduction DBを独断で巻き戻しません。
 
 ## 絶対禁止
 
@@ -198,4 +208,4 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - 今回限定の環境変数変更例外を終了し、通常の変更禁止規則を全面再適用
 - rollback不要
 
-次の開発工程は第1回UI改修であり、Production復旧作業とは分離します。
+第1回UI改修は `7ef73ed` としてmain統合・Production公開済みです。次工程は、Project Status／Production Runbook同期差分の独立レビューとmainへのfast-forward統合判定です。この判定までは文書branchをmainへ統合せず、Production、DB、Migration、Vercel設定・環境変数を変更しません。

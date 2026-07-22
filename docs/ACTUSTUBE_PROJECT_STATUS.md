@@ -1,8 +1,8 @@
 # ActusTube Project Status
 
-最終更新日：2026-07-22
+最終更新日：2026-07-23
 
-> 2026-07-22の状態スナップショットです。ProductionのDB接続資格情報を安全に復旧し、ユーザー本人による単一Googleログインと同時間帯のRuntime Logを確認しました。以前失敗していたGoogle OAuthアカウントのDB同期境界は正常に通過し、Production DB接続復旧は正式完了しています。今回限定のVercel Production `DATABASE_URL` 変更例外は終了し、通常の変更禁止規則が全面的に再適用されています。次工程はProduction復旧作業と分離した第1回UI改修です。
+> 2026-07-23の状態スナップショットです。正式仕様書v1.0を `docs/ACTUSTUBE_PRODUCT_SPEC.md` として `main` へfast-forward統合済みで、`main` / `origin/main` は `f6014a183194490eaca09bec94723ee04c1a827c` です。この統合はdocs-onlyであり、アプリコードの直近基準は `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` から変わっていません。Productionは `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`（`main@f6014a1`）をREADY / Currentで配信しています。2026-07-23 01:12:20 JSTにトップ・主要CSS・主要JavaScriptのHTTP 200を確認し、2026-07-22 23:12:20〜2026-07-23 01:12:20 JSTのRuntime Logではerror / fatal / HTTP 5xxを各0件と観測しました。この0件は当該時間帯の観測結果であり、恒久保証ではありません。Production DB接続復旧は完了済みで、通常の環境変数変更禁止規則が引き続き適用されています。
 
 ## プロジェクト概要
 
@@ -94,30 +94,55 @@ API 500修正コミット：
 - 409発生時は履歴を再取得
 - 想定外のDBエラーは内部情報を出さない安全な500に変換
 
+## 第1回UI改修
+
+`main` へfast-forward統合・Production公開済みの関連コミット：
+
+- `65cdff375ffeae8f6c063f7a4e6201f5dbf81508` `fix: override sharp to patched libvips release`
+- `f675ee9cc1db785adc625ae7f8887914da0fe35a` `feat: establish UI foundation and primary improvement flow`
+- `0b4d83509755e69495584871968015ca8b483a0a` `fix: distinguish weekly cycle error notices`
+- `3ede11a415ad47899f9776bd5fcd0ca33018006b` `test: add weekly cycle component test harness`
+- `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` `fix: preserve weekly cycle refresh errors`
+
+実装・検証済みの内容：
+
+- 共通UI基盤と、分析結果から今週の改善行動へ進む主要導線
+- 320px、375px、390px、768px、1024px、1440pxを対象としたレスポンシブ確認
+- 週次改善項目の作成・更新成功後に履歴再読込が失敗した場合、成功通知で上書きしない部分成功表示
+- errorは `role="alert"` / `aria-live="assertive"`、successは `role="status"` / `aria-live="polite"`
+- pending中のdisabledと二重送信防止
+- WeeklyImprovementCycle本体をjsdomへrenderし、fetch mockとユーザー操作を通す実行経路テスト
+
+API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案の「期待効果」仕様は、このUI改修では変更していません。
+
 ## 検証結果
 
-release candidate作成時に再実行した確認結果です。
+アプリコード基準 `7ef73ed` のmain統合前後に再実行した確認結果です。今回の `f6014a1` はdocs-onlyのため、アプリコードと依存関係はこの検証済み内容から変わっていません。
 
-- 通常テスト：153件成功
-- 実DB専用4件は通常実行時skip
-- 重複作成関連実DB検証：4/4成功
-- 関連実DBテスト：48/48成功
+- 自動テスト：185件成功、4件skip
+- React act警告：0件
 - ESLint：0エラー、既存の `<img>` 警告1件
 - TypeScript：成功
 - Production build：成功
-- `npm audit`：脆弱性0件。間接dev依存の `brace-expansion` を1.1.14から修正版1.1.16へlockfile内で更新
+- `npm audit`：critical / high / moderate / lowすべて0件
+- npm 11.18.0のclean installと `npm ls --depth=0`：extraneous / invalid 0件
+- `sharp`：0.35.3のみ
+- `libvips`：package 1.3.2 / runtime 8.18.3
+- `sharp` によるメモリ内SVG→PNG変換：成功
 - `drizzle-kit check`：成功
-- Schema drift：なし
+- 週次改善release candidate時の重複作成関連実DB検証：4/4成功
+- 同release candidate時の関連実DBテスト：48/48成功
+- ActusTube管理対象のSchema drift：なし。`696d4b0` 以後のUI・依存・文書更新ではDB、Migration、schemaを変更していない
 - `git diff --check`：成功
-- 秘密情報混入：なし
+- 秘密情報・個人情報候補：0件
 - UI幅320、375、390、768、1024、1440で横はみ出しなし
 
 ## Git状態
 
-2026-07-22のProduction DB接続復旧完了後に読み取り確認した状態：
+2026-07-23の正式仕様書統合・Production確認後に読み取り確認した状態：
 
-- `main`：`696d4b027d062e4f5dd85ed5af566194af70061f`
-- `origin/main`：`696d4b027d062e4f5dd85ed5af566194af70061f`
+- `main`：`f6014a183194490eaca09bec94723ee04c1a827c`
+- `origin/main`：`f6014a183194490eaca09bec94723ee04c1a827c`
 - `main` と `origin/main`：0 / 0で同期済み
 - 作業ツリー：clean
 - `c6b403e`：週次改善サイクルのrelease candidate
@@ -125,18 +150,29 @@ release candidate作成時に再実行した確認結果です。
 - `509bf21`：Production認証障害に合わせた文書同期
 - `c3e71ff`：安全な認証DB診断ログ
 - `696d4b0`：Production DB接続復旧手順の文書化と復旧deploymentのsource
+- `7ef73ed`：第1回UI改修と週次改善サイクル通知修正を含む直近のアプリコード基準
+- `f6014a1`：正式仕様書v1.0を正本Markdownとして追加したdocs-only commit
 
-旧状態の `main` `92f834d`、`fix/weekly-action-duplicate-conflict` 未統合、診断ログ未公開、DB資格情報の復旧待ちは完了済みの履歴です。Production復旧用branchの作業は完了し、次の開発作業は `feat/ui-foundation-primary-flow` でProductionと分離して進めます。
+`7ef73ed` から `f6014a1` の変更は `AGENTS.md` と `docs/ACTUSTUBE_PRODUCT_SPEC.md` の2件だけで、fast-forward統合され、merge commitはありません。正式仕様書v1.0はmain統合済みですが、将来設計を現在の実装済み機能として扱いません。旧状態の `main` `92f834d`、`fix/weekly-action-duplicate-conflict` 未統合、診断ログ未公開、DB資格情報の復旧待ち、`feat/ui-foundation-primary-flow` 未統合は完了済みの履歴です。
 
 ## Vercel Production状態
 
-2026-07-22のProduction DB接続復旧完了後スナップショット：
+2026-07-23 01:12:20 JSTのProductionスナップショット：
 
 - Production Branch：`main`
-- commit：`696d4b027d062e4f5dd85ed5af566194af70061f`
-- deployment：`dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`
+- Vercel Project：ActusTube
+- commit：`f6014a183194490eaca09bec94723ee04c1a827c`
+- deployment：`dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`
 - domain：`https://actustube.vercel.app`
 - 状態：READY / Current
+- トップページ、主要CSS、主要JavaScript：HTTP 200
+- 2026-07-22 23:12:20〜2026-07-23 01:12:20 JSTのRuntime Log：error 0件、fatal 0件、HTTP 5xx 0件
+- Runtime Logの0件は上記時間帯の観測結果であり、将来も常に0件であることを保証しない
+- source commit `f6014a1` は正式仕様書追加のdocs-only commitで、アプリコードは `7ef73ed` の内容から変わっていない
+- 正式仕様書統合・自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
+
+Production DB接続復旧に関する完了済み履歴：
+
 - `redirect_uri_mismatch`：解消済み
 - OAuth callbackの `missing iss`：解消済み
 - callbackは `/api/auth/callback/google` まで到達し、HTTP 302で完了
@@ -150,7 +186,7 @@ release candidate作成時に再実行した確認結果です。
 - Production DB接続復旧：正式完了
 - rollback：不要
 
-旧deployment `dpl_HPGCXavawHj3yHKo9nFg99LGB6jR`、`dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ`、診断前の原因未確定状態は完了済みの履歴です。復旧ではVercel Productionの `DATABASE_URL` 以外を変更せず、Production DB本体やMigration 0000〜0005を変更・再適用していません。今回限定の環境変数変更例外は終了済みです。
+直前のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は、docs-only deploymentとの比較用履歴として残します。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧deployment `dpl_HPGCXavawHj3yHKo9nFg99LGB6jR`、`dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ` は監査履歴であり、現在のCurrentまたは自動的なrollback先ではありません。復旧ではVercel Productionの `DATABASE_URL` 以外を変更せず、Production DB本体やMigration 0000〜0005を変更・再適用していません。今回限定の環境変数変更例外は終了済みです。
 
 ## Production DB
 
@@ -234,19 +270,19 @@ release candidate作成時に再実行した確認結果です。
 
 ## 現在残っている作業
 
-1. 第1回UI改修で、分析結果から週次改善行動までの主要導線を明確にする
-2. 共通カラー、背景、タイポグラフィ、余白、最大幅、ボタン、カード、入力欄を整理する
-3. 既存状態判定を維持したままloading、empty、error表示を改善する
-4. 自動テストと各レスポンシブ幅で検証する
+1. `docs/sync-project-status-runbook-20260723` のdocs-only差分を独立レビューし、mainへのfast-forward統合可否を判定する
+2. 所有者による認証済みProductionスモークテストの未実施項目を、費用と利用枠を考慮して最小回数で確認する
+3. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
+4. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
 
-Production復旧作業は完了しています。通常のVercel環境変数変更禁止が再適用されており、UI改修ではProduction、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
+Production DB接続復旧と第1回UI改修は完了しています。通常のVercel環境変数変更禁止が適用されており、今回の文書同期ではProduction、アプリコード、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
 
 ## 今回の公開対象外
 
 - YouTube Analytics API
 - 自動成果比較
 - Stripe
-- 通知
+- メール・プッシュ等の外部通知機能
 - Proの全動画処理
 - トレンド分析
 - 収益予測
@@ -254,6 +290,6 @@ Production復旧作業は完了しています。通常のVercel環境変数変�
 
 ## 次の作業
 
-次に実施する工程は、`feat/ui-foundation-primary-flow` で行う第1回UI改修です。既存の機能と表示データを維持し、分析結果から根拠、優先課題、今週の改善行動、確認指標へ自然に進める視覚構造と共通UI基盤を整えます。
+次工程は、Project Status／Production Runbook同期差分の独立レビューとmainへのfast-forward統合判定です。
 
-この工程はProduction復旧作業から分離します。`main` への統合、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudの変更は行いません。
+この文書同期branchの作成・commit・pushはProduction操作と分離します。レビュー完了までは `main` へ統合・pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。
