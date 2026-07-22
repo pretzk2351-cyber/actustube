@@ -38,6 +38,7 @@
     "vitest": "^4.1.10"
   },
   "overrides": {
+    "sharp": "0.35.3",
     "postcss": "8.5.19",
     "@esbuild-kit/core-utils": {
       "esbuild": "0.25.12"
