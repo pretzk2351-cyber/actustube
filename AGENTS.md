@@ -53,6 +53,7 @@
 
 ## 作業前に読む文書
 
+- `docs/ACTUSTUBE_PRODUCT_SPEC.md`
 - `docs/ACTUSTUBE_PROJECT_STATUS.md`
 - `docs/PRODUCTION_RELEASE_RUNBOOK.md`
 
