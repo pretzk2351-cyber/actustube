@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-type StatusTone = "info" | "loading" | "empty" | "error" | "success";
+export type StatusTone = "info" | "loading" | "empty" | "error" | "success";
 
 export function StatusPanel({
   tone,

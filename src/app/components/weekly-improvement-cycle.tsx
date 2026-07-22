@@ -13,6 +13,10 @@ import {
   refreshHistoryForDuplicateAction,
   shouldShowImprovementActionCreateForm,
 } from "@/app/lib/weekly-cycle-flow";
+import {
+  createWeeklyCycleNotice,
+  type WeeklyCycleNotice,
+} from "@/app/lib/weekly-cycle-notice";
 
 type Props = {
   currentAnalysisRunId: string | null;
@@ -90,7 +94,7 @@ export function WeeklyImprovementCycle({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState("");
+  const [notice, setNotice] = useState<WeeklyCycleNotice>(null);
   const [newTitle, setNewTitle] = useState("");
   const [newDescription, setNewDescription] = useState("");
   const [editTitle, setEditTitle] = useState("");
@@ -109,21 +113,26 @@ export function WeeklyImprovementCycle({
 
   const loadFirstPage = useCallback(async () => {
     setLoading(true);
-    setMessage("");
+    setNotice(null);
     try {
       const response = await fetch("/api/weekly-cycle?limit=10", {
         cache: "no-store",
       });
       const data: unknown = await response.json().catch(() => null);
       if (!response.ok || !isHistoryResponse(data)) {
-        setMessage(safeMessage(response.status));
+        setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return;
       }
       setItems(data.items);
       setPlannedAction(data.plannedAction);
       setNextCursor(data.nextCursor);
     } catch {
-      setMessage("週次改善サイクルを読み込めませんでした。");
+      setNotice(
+        createWeeklyCycleNotice(
+          "error",
+          "週次改善サイクルを読み込めませんでした。"
+        )
+      );
     } finally {
       setLoading(false);
     }
@@ -158,7 +167,7 @@ export function WeeklyImprovementCycle({
   async function createAction() {
     if (!currentAnalysisRunId) return;
     setSaving(true);
-    setMessage("");
+    setNotice(null);
     try {
       const response = await fetch("/api/weekly-cycle/actions", {
         method: "POST",
@@ -180,13 +189,17 @@ export function WeeklyImprovementCycle({
         ) {
           return;
         }
-        setMessage(safeMessage(response.status));
+        setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return;
       }
       await loadFirstPage();
-      setMessage("今週の改善項目を保存しました。");
+      setNotice(
+        createWeeklyCycleNotice("success", "今週の改善項目を保存しました。")
+      );
     } catch {
-      setMessage("改善項目を保存できませんでした。");
+      setNotice(
+        createWeeklyCycleNotice("error", "改善項目を保存できませんでした。")
+      );
     } finally {
       setSaving(false);
     }
@@ -195,7 +208,7 @@ export function WeeklyImprovementCycle({
   async function updateAction(status?: "completed" | "skipped") {
     if (!plannedAction) return;
     setSaving(true);
-    setMessage("");
+    setNotice(null);
     try {
       const response = await fetch(
         `/api/weekly-cycle/actions/${plannedAction.id}`,
@@ -210,13 +223,20 @@ export function WeeklyImprovementCycle({
         }
       );
       if (!response.ok) {
-        setMessage(safeMessage(response.status));
+        setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return;
       }
       await loadFirstPage();
-      setMessage(status ? "改善結果を保存しました。" : "改善項目を更新しました。");
+      setNotice(
+        createWeeklyCycleNotice(
+          "success",
+          status ? "改善結果を保存しました。" : "改善項目を更新しました。"
+        )
+      );
     } catch {
-      setMessage("改善項目を更新できませんでした。");
+      setNotice(
+        createWeeklyCycleNotice("error", "改善項目を更新できませんでした。")
+      );
     } finally {
       setSaving(false);
     }
@@ -225,6 +245,7 @@ export function WeeklyImprovementCycle({
   async function loadMore() {
     if (!nextCursor) return;
     setLoading(true);
+    setNotice(null);
     try {
       const response = await fetch(
         `/api/weekly-cycle?limit=10&cursor=${encodeURIComponent(nextCursor)}`,
@@ -232,13 +253,15 @@ export function WeeklyImprovementCycle({
       );
       const data: unknown = await response.json().catch(() => null);
       if (!response.ok || !isHistoryResponse(data)) {
-        setMessage(safeMessage(response.status));
+        setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return;
       }
       setItems((current) => [...current, ...data.items]);
       setNextCursor(data.nextCursor);
     } catch {
-      setMessage("履歴の続きを読み込めませんでした。");
+      setNotice(
+        createWeeklyCycleNotice("error", "履歴の続きを読み込めませんでした。")
+      );
     } finally {
       setLoading(false);
     }
@@ -253,9 +276,7 @@ export function WeeklyImprovementCycle({
         description="分析結果から実行項目を1件決め、実行後に結果を記録します。"
       />
 
-      {message && (
-        <StatusPanel tone="info" title={message} />
-      )}
+      {notice && <StatusPanel tone={notice.tone} title={notice.message} />}
 
       {loading && items.length === 0 ? (
         <StatusPanel tone="loading" title="改善履歴を読み込んでいます">
