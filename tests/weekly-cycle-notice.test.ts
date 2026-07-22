@@ -80,7 +80,7 @@ describe("weekly improvement cycle notices", () => {
   it("routes every component failure through the error tone and clears stale notices", () => {
     expect(
       componentSource.match(/createWeeklyCycleNotice\(\s*"error"/g)
-    ).toHaveLength(8);
+    ).toHaveLength(10);
     expect(componentSource.match(/setNotice\(null\)/g)).toHaveLength(4);
   });
 

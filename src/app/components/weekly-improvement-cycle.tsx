@@ -111,7 +111,7 @@ export function WeeklyImprovementCycle({
     loading,
   });
 
-  const loadFirstPage = useCallback(async () => {
+  const loadFirstPage = useCallback(async (): Promise<boolean> => {
     setLoading(true);
     setNotice(null);
     try {
@@ -121,11 +121,12 @@ export function WeeklyImprovementCycle({
       const data: unknown = await response.json().catch(() => null);
       if (!response.ok || !isHistoryResponse(data)) {
         setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
-        return;
+        return false;
       }
       setItems(data.items);
       setPlannedAction(data.plannedAction);
       setNextCursor(data.nextCursor);
+      return true;
     } catch {
       setNotice(
         createWeeklyCycleNotice(
@@ -133,6 +134,7 @@ export function WeeklyImprovementCycle({
           "週次改善サイクルを読み込めませんでした。"
         )
       );
+      return false;
     } finally {
       setLoading(false);
     }
@@ -184,7 +186,9 @@ export function WeeklyImprovementCycle({
           await refreshHistoryForDuplicateAction(
             response.status,
             data,
-            loadFirstPage
+            async () => {
+              await loadFirstPage();
+            }
           )
         ) {
           return;
@@ -192,7 +196,16 @@ export function WeeklyImprovementCycle({
         setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return;
       }
-      await loadFirstPage();
+      const refreshed = await loadFirstPage();
+      if (!refreshed) {
+        setNotice(
+          createWeeklyCycleNotice(
+            "error",
+            "改善項目は作成されましたが、最新の履歴を読み込めませんでした。ページを再読み込みして確認してください。"
+          )
+        );
+        return;
+      }
       setNotice(
         createWeeklyCycleNotice("success", "今週の改善項目を保存しました。")
       );
@@ -226,7 +239,16 @@ export function WeeklyImprovementCycle({
         setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return;
       }
-      await loadFirstPage();
+      const refreshed = await loadFirstPage();
+      if (!refreshed) {
+        setNotice(
+          createWeeklyCycleNotice(
+            "error",
+            "変更は保存されましたが、最新の履歴を読み込めませんでした。ページを再読み込みして確認してください。"
+          )
+        );
+        return;
+      }
       setNotice(
         createWeeklyCycleNotice(
           "success",
