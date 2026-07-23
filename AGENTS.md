@@ -70,7 +70,18 @@
 2. 作業ツリーがcleanで、未追跡ファイルがない。
 3. 文書に記載されたアプリコード基準から現在の `main` までの変更が、承認済み文書ファイル（`AGENTS.md`、`docs/ACTUSTUBE_PRODUCT_SPEC.md`、`docs/ACTUSTUBE_PROJECT_STATUS.md`、`docs/PRODUCTION_RELEASE_RUNBOOK.md`）だけである。
 4. `src/`、API route、test、`package.json`、`package-lock.json`、Migration、Drizzle schema、`vercel.json`、Next.js設定、環境変数、DB、Neon、Google Cloudに変更が一切ない。
-5. Current Productionのsource commitが現在の `main` と一致する。
+5. Current Productionのsource関係について、次のAまたはBのどちらか一方を読み取り専用のGit / Vercel情報で厳密に証明できる。
+   - **A. 新deployment経路**：Current Productionのsource commitが現在の `main` の完全SHAと一致し、対象がProduction deploymentで、READY / Current、Production domain・主要CSS・主要JavaScriptが正常であり、deployment開始後のruntime error / fatal / HTTP 5xxに重大な異常がない。
+   - **B. 明示的docs-only skip経路**：次をすべて満たす。
+     1. docs-only統合直前に、Current Productionのsource commitと統合前 `main` の完全SHAが一致していた。
+     2. 統合前 `main` から現在の `main` までの全差分が、その作業でユーザーから明示的に承認された文書だけである。
+     3. 差分にアプリコード、API route、test、`package.json`、`package-lock.json`、Migration、Drizzle schema、Next.js設定、`.github` / workflow、script、`vercel.json`、DB関連ファイルが一切ない。
+     4. Vercel等の読み取り専用情報で、自動処理が現在の `main` の完全SHAを対象としてdocs-onlyを理由に明示的にskipしたことを一意に確認できる。
+     5. Current Productionが統合直前と同じdeployment / sourceのままREADY / Currentであり、そのsource commitが統合前 `main` の完全SHAと一致する。
+     6. Production domain、トップページ、主要CSS、主要JavaScriptが正常である。
+     7. skip確認後のruntime error / fatal / HTTP 5xxに重大な異常がない。
+     8. 手動deploy、redeploy、promote、rollback、alias変更、Vercel設定・環境変数変更、DB変更を行っていない。
+     9. Production sourceから現在の `main` までの非文書部分が同一であることをGit差分で証明できる。
 6. Current ProductionがREADY / Currentである。
 7. Productionトップページと主要静的リソースが正常である。
 8. 実行する作業が、読み取り専用確認、文書更新、またはユーザーが明示的に許可したProductionスモークのいずれかである。
@@ -79,9 +90,11 @@
 次の場合はこの例外を適用せず、従来どおり停止してください。
 
 - アプリコード、test、package、Migration、DB schema、Vercel設定、環境変数に差分がある。
-- Production sourceと現在の `main` が一致しない、READY / Currentではない、または対象deploymentを一意に特定できない。
+- Production source関係についてA、Bのどちらも厳密に証明できない、READY / Currentではない、または対象deploymentを一意に特定できない。
 - 差分が承認済み文書ファイルだけであることを証明できない、または変更内容を一意に特定できない。
 - Production変更、DB操作、Migration、rollbackを伴う。
 - 作業に必要なユーザーの明示的許可がない。
+
+明示的docs-only skip経路では、Production sourceと現在の `main` の完全SHA一致を要求しません。代わりに、Production sourceと統合前 `main` の完全SHA一致、Production sourceから現在の `main` までの全差分がユーザー承認済み文書だけであること、skip対象commitが現在の `main` の完全SHAであることを要求します。skip理由または対象commitを一意に確認できない場合は停止し、単に新deploymentが見つからないだけではskip扱いにしません。
 
 この例外を使用した場合は、文書上のスナップショット、現在のGit / Production、docs-onlyである証拠、例外を適用したこと、コード・DB・Migration・設定に差分がないことを完了報告へ明記してください。この例外を一般的な状態不一致の無視には使用しません。

@@ -53,14 +53,38 @@ Project Statusや本RunbookのGit / deployment識別子が現在の実状態と�
 3. 変更が承認済み文書ファイル（`AGENTS.md`、`docs/ACTUSTUBE_PRODUCT_SPEC.md`、`docs/ACTUSTUBE_PROJECT_STATUS.md`、`docs/PRODUCTION_RELEASE_RUNBOOK.md`）だけであることを確認する。
 4. `src/`、API route、test、`package.json`、`package-lock.json`、Migration、Drizzle schema、`vercel.json`、Next.js設定に差分がなく、環境変数、DB、Neon、Google Cloudも変更されていないことを確認する。
 5. 現在の `main` と `origin/main` が同期し、作業ツリーがcleanで未追跡ファイルがないことを確認する。
-6. Current Productionのsource commitが現在の `main` と一致することを確認する。
+6. Current Productionのsource関係について、次のAまたはBのどちらか一方を読み取り専用のGit / Vercel情報で厳密に証明する。
+   - **A. 新Production deployment経路**
+     1. Current Productionのsource commitが現在の `main` の完全SHAと一致する。
+     2. 対象deploymentがProductionである。
+     3. deploymentがREADY / Currentである。
+     4. Production domain、トップページ、主要CSS、主要JavaScriptが正常である。
+     5. deployment開始後のruntime error / fatal / HTTP 5xxに重大な異常がない。
+   - **B. 明示的docs-only skip経路**
+     1. docs-only統合直前に、Current Productionのsource commitと統合前 `main` の完全SHAが一致していたことを確認する。
+     2. 統合前 `main` から現在の `main` までの全差分が、その作業でユーザーから明示的に承認された文書だけであることを確認する。
+     3. 差分にアプリコード、API route、test、`package.json`、`package-lock.json`、Migration、Drizzle schema、Next.js設定、`.github` / workflow、script、`vercel.json`、DB関連ファイルが一切ないことを確認する。
+     4. Vercel等の読み取り専用情報で、自動処理が現在の `main` の完全SHAを対象としてdocs-onlyを理由に明示的にskipしたことを一意に確認する。
+     5. Current Productionが統合直前と同じdeployment / sourceのままREADY / Currentであり、そのsource commitが統合前 `main` の完全SHAと一致することを確認する。
+     6. Production domain、トップページ、主要CSS、主要JavaScriptが正常であることを確認する。
+     7. skip確認後のruntime error / fatal / HTTP 5xxに重大な異常がないことを確認する。
+     8. 手動deploy、redeploy、promote、rollback、alias変更、Vercel設定・環境変数変更、DB変更を行っていないことを確認する。
+     9. Production sourceから現在の `main` までの非文書部分が同一であることをGit差分で証明する。
 7. Current ProductionがREADY / Currentで、トップページと主要静的リソースが正常であることを確認する。
 8. 実行する作業が読み取り専用確認、文書更新、またはユーザーが明示的に許可したProductionスモークであることを確認する。
 9. deploy、Migration、環境変数変更、DB変更、rollbackを伴わないことを確認する。
 
-全条件に合格した場合だけ、差をdocs-onlyスナップショット差として記録し、対象作業を続行できます。例外を使用した報告には、文書上のスナップショット、現在のGit / Production、docs-onlyである証拠、例外適用の事実、コード・DB・Migration・設定に差分がないことを記載します。
+全条件に合格した場合だけ、差をdocs-onlyスナップショット差として記録し、対象作業を続行できます。例外を使用した報告には、文書上のスナップショット、現在のGit / Production、採用したA / B経路、docs-onlyである証拠、例外適用の事実、コード・DB・Migration・設定に差分がないことを記載します。
 
-アプリコード、test、package、Migration、DB schema、Vercel設定、環境変数に差分がある場合、Production sourceと現在の `main` が一致しない場合、READY / Currentでない場合、deploymentまたは差分を一意に特定できない場合、手動deploy等が必要な場合、安全性を証明できない場合、または必要なユーザー許可がない場合は、この限定判定を適用せず従来どおり停止します。Production変更、DB操作、Migration、rollbackへこの例外を拡張しません。
+明示的docs-only skip経路では、Production sourceと現在の `main` の完全SHA一致を要求しません。代わりに、Production sourceと統合前 `main` の完全SHA一致、Production sourceから現在の `main` までの全差分がユーザー承認済み文書だけであること、skip対象commitが現在の `main` の完全SHAであることを要求します。skip理由または対象commitを一意に確認できない場合は停止し、単に新deploymentが見つからないだけではskip扱いにしません。
+
+アプリコード、test、package、Migration、DB schema、Vercel設定、環境変数に差分がある場合、Production source関係についてA、Bのどちらも厳密に証明できない場合、READY / Currentでない場合、deploymentまたは差分を一意に特定できない場合、手動deploy等が必要な場合、安全性を証明できない場合、または必要なユーザー許可がない場合は、この限定判定を適用せず従来どおり停止します。Production変更、DB操作、Migration、rollbackへこの例外を拡張しません。
+
+### docs-only統合後の自動処理判定
+
+- 新しいProduction deploymentが作成された場合は、Aの新Production deployment経路で確認する。
+- 現在の `main` の完全SHAを対象とする明示的なdocs-only skipを確認できた場合は、Bの明示的docs-only skip経路で確認する。
+- どちらも一意に確認できない場合は停止する。
 
 ## 終了済み：今回限定のVercel環境変数例外
 
