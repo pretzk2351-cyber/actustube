@@ -26,6 +26,7 @@ describe("database server boundary", () => {
       resolve(process.cwd(), "src/db/client.ts"),
       resolve(process.cwd(), "src/db/auth-accounts.ts"),
       resolve(process.cwd(), "src/db/usage-limits.ts"),
+      resolve(process.cwd(), "src/db/usage-status.ts"),
     ]) {
       expect(readFileSync(file, "utf8")).toContain('import "server-only"');
     }

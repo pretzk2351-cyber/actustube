@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import {
+  assertUsageSchemaCompatibility,
   finalizeUsageReservation,
   releaseUsageReservation,
   reserveUsage,
@@ -8,6 +9,10 @@ import {
   type UsageReservationAllowed,
   type UsageReservationDenied,
 } from "@/db/usage-limits";
+import {
+  getUsageStatus,
+  type UsageStatusAvailable,
+} from "@/db/usage-status";
 
 import { getServerUsageIdentity } from "./api-security";
 import {
@@ -24,11 +29,29 @@ export type PublicUsage = {
   monthlyUsed: number;
   monthlyLimit: number;
   monthlyResetAt: string;
+  regularVideoLimit: number;
+  shortsVideoLimit: number;
 };
 
 export type ApiUsageReservationResult =
   | { allowed: true; reservation: UsageReservationAllowed }
   | { allowed: false; response: NextResponse };
+
+export type ServerUsageIdentity = {
+  userId: string;
+  sessionVersion: number;
+};
+
+const PREPARED_API_USAGE = Symbol("prepared-api-usage");
+const COMPATIBLE_API_USAGE = Symbol("compatible-api-usage");
+
+export type CompatibleApiUsage = {
+  readonly marker: typeof COMPATIBLE_API_USAGE;
+};
+
+export type PreparedApiUsage = {
+  readonly marker: typeof PREPARED_API_USAGE;
+};
 
 export function publicUsage(
   reservation: UsageReservationAllowed
@@ -42,6 +65,8 @@ export function publicUsage(
     monthlyUsed: reservation.monthlyUsed,
     monthlyLimit: reservation.monthlyLimit,
     monthlyResetAt: reservation.monthlyResetAt.toISOString(),
+    regularVideoLimit: reservation.regularVideoLimit,
+    shortsVideoLimit: reservation.shortsVideoLimit,
   };
 }
 
@@ -49,13 +74,55 @@ export function retryAfterSeconds(resetAt: Date, now = Date.now()) {
   return Math.max(1, Math.ceil((resetAt.getTime() - now) / 1_000));
 }
 
-function reauthenticationRequiredResponse() {
+export function reauthenticationRequiredResponse() {
   return NextResponse.json(
     {
       error: "Authentication is no longer valid. Please sign in again.",
       code: "REAUTHENTICATION_REQUIRED",
     },
     { status: 401 }
+  );
+}
+
+function usageLimitResponse(
+  denialReason: "daily_limit_reached" | "monthly_limit_reached",
+  usage: {
+    metric: UsageMetric;
+    dailyUsed: number;
+    dailyLimit: number;
+    dailyResetAt: Date;
+    monthlyUsed: number;
+    monthlyLimit: number;
+    monthlyResetAt: Date;
+    planCode: string;
+  }
+) {
+  const resetAt =
+    denialReason === "daily_limit_reached"
+      ? usage.dailyResetAt
+      : usage.monthlyResetAt;
+  const retryAfter = retryAfterSeconds(resetAt);
+
+  return NextResponse.json(
+    {
+      error: "The usage limit has been reached.",
+      code:
+        denialReason === "daily_limit_reached"
+          ? "DAILY_USAGE_LIMIT_REACHED"
+          : "MONTHLY_USAGE_LIMIT_REACHED",
+      metric: usage.metric,
+      dailyUsed: usage.dailyUsed,
+      dailyLimit: usage.dailyLimit,
+      dailyResetAt: usage.dailyResetAt.toISOString(),
+      monthlyUsed: usage.monthlyUsed,
+      monthlyLimit: usage.monthlyLimit,
+      monthlyResetAt: usage.monthlyResetAt.toISOString(),
+      planCode: usage.planCode,
+    },
+    {
+      status: 429,
+      headers: { "Retry-After": String(retryAfter) },
+    }
   );
 }
 
@@ -87,33 +154,105 @@ function denialResponse(denial: UsageReservationDenied) {
     );
   }
 
-  const resetAt =
-    denial.denialReason === "daily_limit_reached"
-      ? denial.dailyResetAt
-      : denial.monthlyResetAt;
-  const retryAfter = retryAfterSeconds(resetAt);
+  if (
+    denial.dailyUsed === null ||
+    denial.dailyLimit === null ||
+    denial.monthlyUsed === null ||
+    denial.monthlyLimit === null ||
+    denial.planCode === null
+  ) {
+    throw new Error("UsageLimitDenialInvalid");
+  }
 
-  return NextResponse.json(
-    {
-      error: "The usage limit has been reached.",
-      code:
-        denial.denialReason === "daily_limit_reached"
-          ? "DAILY_USAGE_LIMIT_REACHED"
-          : "MONTHLY_USAGE_LIMIT_REACHED",
-      metric: denial.metric,
-      dailyUsed: denial.dailyUsed,
-      dailyLimit: denial.dailyLimit,
-      dailyResetAt: denial.dailyResetAt.toISOString(),
-      monthlyUsed: denial.monthlyUsed,
-      monthlyLimit: denial.monthlyLimit,
-      monthlyResetAt: denial.monthlyResetAt.toISOString(),
-      planCode: denial.planCode,
-    },
-    {
-      status: 429,
-      headers: { "Retry-After": String(retryAfter) },
+  return usageLimitResponse(denial.denialReason, {
+    metric: denial.metric,
+    dailyUsed: denial.dailyUsed,
+    dailyLimit: denial.dailyLimit,
+    dailyResetAt: denial.dailyResetAt,
+    monthlyUsed: denial.monthlyUsed,
+    monthlyLimit: denial.monthlyLimit,
+    monthlyResetAt: denial.monthlyResetAt,
+    planCode: denial.planCode,
+  });
+}
+
+export async function assertApiUsageCompatibility(): Promise<CompatibleApiUsage> {
+  await assertUsageSchemaCompatibility();
+
+  return { marker: COMPATIBLE_API_USAGE };
+}
+
+export async function prepareApiUsage(
+  compatible?: CompatibleApiUsage
+): Promise<PreparedApiUsage> {
+  if (compatible?.marker !== COMPATIBLE_API_USAGE) {
+    await assertApiUsageCompatibility();
+  }
+
+  try {
+    await recoverExpiredUsageReservations(OPPORTUNISTIC_RECOVERY_BATCH_SIZE);
+  } catch (error) {
+    logSafeLifecycleError("usage-reservation-opportunistic-recovery", error);
+  }
+
+  return { marker: PREPARED_API_USAGE };
+}
+
+export async function preflightApiUsageForIdentity(
+  identity: ServerUsageIdentity,
+  metric: UsageMetric
+): Promise<ApiUsageReservationResult | { allowed: true }> {
+  const status = await getUsageStatus(identity);
+
+  if (!status.available) {
+    if (
+      status.denialReason === "user_not_found" ||
+      status.denialReason === "session_version_mismatch"
+    ) {
+      return { allowed: false, response: reauthenticationRequiredResponse() };
     }
-  );
+
+    return {
+      allowed: false,
+      response: NextResponse.json(
+        {
+          error: "This account is not available.",
+          code: "ACCOUNT_UNAVAILABLE",
+        },
+        { status: 403 }
+      ),
+    };
+  }
+
+  const usage = usageForMetric(status, metric);
+  if (usage.daily.remaining === 0 || usage.monthly.remaining === 0) {
+    return {
+      allowed: false,
+      response: usageLimitResponse(
+        usage.daily.remaining === 0
+          ? "daily_limit_reached"
+          : "monthly_limit_reached",
+        {
+          metric,
+          dailyUsed: usage.daily.used,
+          dailyLimit: usage.daily.limit,
+          dailyResetAt: usage.daily.resetAt,
+          monthlyUsed: usage.monthly.used,
+          monthlyLimit: usage.monthly.limit,
+          monthlyResetAt: usage.monthly.resetAt,
+          planCode: status.plan.canonicalPlanKey,
+        }
+      ),
+    };
+  }
+
+  return { allowed: true };
+}
+
+function usageForMetric(status: UsageStatusAvailable, metric: UsageMetric) {
+  return metric === "channel_analysis"
+    ? status.channelAnalysis
+    : status.aiConsult;
 }
 
 export async function reserveApiUsage(
@@ -126,10 +265,16 @@ export async function reserveApiUsage(
     return { allowed: false, response: reauthenticationRequiredResponse() };
   }
 
-  try {
-    await recoverExpiredUsageReservations(OPPORTUNISTIC_RECOVERY_BATCH_SIZE);
-  } catch (error) {
-    logSafeLifecycleError("usage-reservation-opportunistic-recovery", error);
+  return reserveApiUsageForIdentity(identity, metric);
+}
+
+export async function reserveApiUsageForIdentity(
+  identity: ServerUsageIdentity,
+  metric: UsageMetric,
+  prepared?: PreparedApiUsage
+): Promise<ApiUsageReservationResult> {
+  if (prepared?.marker !== PREPARED_API_USAGE) {
+    await prepareApiUsage();
   }
 
   const reservation = await reserveUsage({

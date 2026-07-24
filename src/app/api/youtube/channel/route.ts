@@ -1,29 +1,33 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import {
-  isValidYouTubeChannelId,
   isValidYouTubeVideoId,
-  parseYouTubeChannelUrl,
+  parseYouTubeChannelId,
 } from "@/app/lib/api-validation";
 import {
   ExternalServiceError,
   fetchJsonWithTimeout,
+  getServerOAuthAccessToken,
+  getServerUsageIdentity,
   handleApiError,
   requireApiUserId,
   serverConfigurationErrorResponse,
   unauthorizedResponse,
+  youtubeAuthorizationRequiredResponse,
 } from "@/app/lib/api-security";
 import {
   publicUsage,
-  reserveApiUsage,
+  assertApiUsageCompatibility,
+  preflightApiUsageForIdentity,
+  prepareApiUsage,
+  reauthenticationRequiredResponse,
+  reserveApiUsageForIdentity,
   runWithUsageReservation,
 } from "@/app/lib/usage-limit-api";
 import type { ChannelAnalysisSnapshot } from "@/app/lib/weekly-cycle-types";
+import { fetchOwnedYouTubeChannels } from "@/app/lib/youtube-owned-channels";
 import { finalizeChannelAnalysis } from "@/db/weekly-cycle";
 
-const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const SERVER_PLAN = "free" as const;
-const PER_TYPE_LIMIT = 10;
 const FETCH_POOL_SIZE = 50;
 
 type YouTubeChannelListResponse = {
@@ -78,27 +82,11 @@ async function safeJsonFetch<T>(url: URL) {
   return fetchJsonWithTimeout<T>(url, { cache: "no-store" });
 }
 
-async function getChannelIdFromHandle(handle: string) {
-  const url = new URL("https://www.googleapis.com/youtube/v3/channels");
-  url.searchParams.set("part", "id");
-  url.searchParams.set("forHandle", handle.replace("@", ""));
-  url.searchParams.set("key", YOUTUBE_API_KEY!);
-
-  const data = await safeJsonFetch<YouTubeChannelListResponse>(url);
-  const item = data.items?.[0];
-
-  if (!item?.id || !isValidYouTubeChannelId(item.id)) {
-    throw new ExternalServiceError();
-  }
-
-  return item.id;
-}
-
-async function getChannelInfo(channelId: string) {
+async function getChannelInfo(channelId: string, apiKey: string) {
   const url = new URL("https://www.googleapis.com/youtube/v3/channels");
   url.searchParams.set("part", "contentDetails,snippet,statistics");
   url.searchParams.set("id", channelId);
-  url.searchParams.set("key", YOUTUBE_API_KEY!);
+  url.searchParams.set("key", apiKey);
 
   const data = await safeJsonFetch<YouTubeChannelListResponse>(url);
   const item = data.items?.[0];
@@ -125,7 +113,11 @@ async function getChannelInfo(channelId: string) {
   };
 }
 
-async function getUploadVideoIds(playlistId: string, limit: number) {
+async function getUploadVideoIds(
+  playlistId: string,
+  limit: number,
+  apiKey: string
+) {
   let nextPageToken = "";
   const ids: string[] = [];
   const maxPages = Math.ceil(limit / 50) + 1;
@@ -139,7 +131,7 @@ async function getUploadVideoIds(playlistId: string, limit: number) {
     playlistUrl.searchParams.set("part", "snippet,contentDetails");
     playlistUrl.searchParams.set("playlistId", playlistId);
     playlistUrl.searchParams.set("maxResults", "50");
-    playlistUrl.searchParams.set("key", YOUTUBE_API_KEY!);
+    playlistUrl.searchParams.set("key", apiKey);
 
     if (nextPageToken) {
       playlistUrl.searchParams.set("pageToken", nextPageToken);
@@ -168,7 +160,7 @@ async function getUploadVideoIds(playlistId: string, limit: number) {
   return ids.slice(0, limit);
 }
 
-async function getVideos(videoIds: string[]) {
+async function getVideos(videoIds: string[], apiKey: string) {
   if (videoIds.length === 0) return [];
 
   const chunks: string[][] = [];
@@ -182,7 +174,7 @@ async function getVideos(videoIds: string[]) {
     const videosUrl = new URL("https://www.googleapis.com/youtube/v3/videos");
     videosUrl.searchParams.set("part", "snippet,statistics,contentDetails");
     videosUrl.searchParams.set("id", chunk.join(","));
-    videosUrl.searchParams.set("key", YOUTUBE_API_KEY!);
+    videosUrl.searchParams.set("key", apiKey);
 
     const data = await safeJsonFetch<YouTubeVideoListResponse>(videosUrl);
     allVideos.push(...(data.items ?? []));
@@ -213,17 +205,44 @@ export async function GET(request: NextRequest) {
     const userId = await requireApiUserId();
     if (!userId) return unauthorizedResponse();
 
-    const input = request.nextUrl.searchParams.get("url");
-    const parsed = parseYouTubeChannelUrl(input);
+    const identity = await getServerUsageIdentity(request, userId);
+    if (!identity) return reauthenticationRequiredResponse();
 
-    if (!YOUTUBE_API_KEY) {
+    const channelId = parseYouTubeChannelId(
+      request.nextUrl.searchParams.get("channelId")
+    );
+
+    const usageCompatibility = await assertApiUsageCompatibility();
+    const usagePreparation = await prepareApiUsage(usageCompatibility);
+    const usagePreflight = await preflightApiUsageForIdentity(
+      identity,
+      "channel_analysis"
+    );
+    if (!usagePreflight.allowed) return usagePreflight.response;
+
+    const youtubeApiKey = process.env.YOUTUBE_API_KEY;
+    if (!youtubeApiKey) {
       return serverConfigurationErrorResponse();
     }
 
-    const usageResult = await reserveApiUsage(
-      request,
-      userId,
-      "channel_analysis"
+    const accessToken = await getServerOAuthAccessToken(request, userId);
+    if (!accessToken) return youtubeAuthorizationRequiredResponse();
+
+    const ownedChannels = await fetchOwnedYouTubeChannels(accessToken);
+    if (!ownedChannels.some((channel) => channel.id === channelId)) {
+      return NextResponse.json(
+        {
+          error: "The selected YouTube channel is not available.",
+          code: "YOUTUBE_CHANNEL_NOT_OWNED",
+        },
+        { status: 403 }
+      );
+    }
+
+    const usageResult = await reserveApiUsageForIdentity(
+      identity,
+      "channel_analysis",
+      usagePreparation
     );
     if (!usageResult.allowed) return usageResult.response;
 
@@ -232,11 +251,6 @@ export async function GET(request: NextRequest) {
       usageResult.reservation,
       userId,
       async () => {
-        const channelId =
-          parsed.type === "channelId"
-            ? parsed.value
-            : await getChannelIdFromHandle(`@${parsed.value}`);
-
         const {
           uploadsPlaylistId,
           channelTitle,
@@ -244,13 +258,14 @@ export async function GET(request: NextRequest) {
           subscriberCount,
           videoCount,
           viewCount,
-        } = await getChannelInfo(channelId);
+        } = await getChannelInfo(channelId, youtubeApiKey);
 
         const uploadVideoIds = await getUploadVideoIds(
           uploadsPlaylistId,
-          FETCH_POOL_SIZE
+          FETCH_POOL_SIZE,
+          youtubeApiKey
         );
-        const allVideos = await getVideos(uploadVideoIds);
+        const allVideos = await getVideos(uploadVideoIds, youtubeApiKey);
 
         const sortedByDate = [...allVideos].sort(
           (a, b) =>
@@ -260,14 +275,14 @@ export async function GET(request: NextRequest) {
 
         const regularVideos = sortedByDate
           .filter((video) => !video.isShort)
-          .slice(0, PER_TYPE_LIMIT);
+          .slice(0, usageResult.reservation.regularVideoLimit);
 
         const shortVideos = sortedByDate
           .filter((video) => video.isShort)
-          .slice(0, PER_TYPE_LIMIT);
+          .slice(0, usageResult.reservation.shortsVideoLimit);
 
         return {
-          plan: SERVER_PLAN,
+          plan: usageResult.reservation.canonicalPlanKey,
           channelId,
           channelTitle,
           channelDescription,
@@ -300,6 +315,10 @@ export async function GET(request: NextRequest) {
       usage: publicUsage(usageResult.reservation),
     });
   } catch (error) {
+    if (error instanceof ExternalServiceError && error.isAuthorizationError) {
+      return youtubeAuthorizationRequiredResponse();
+    }
+
     return handleApiError("youtube-channel", error);
   }
 }

@@ -2,10 +2,12 @@ import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  assertUsageSchemaCompatibilityWithDatabase,
   buildFinalizeUsageReservationQuery,
   buildRecoverStaleUsageReservationsQuery,
   buildReleaseUsageQuery,
   buildUsageReservationQuery,
+  buildUsageSchemaCompatibilityQuery,
   finalizeUsageReservationWithDatabase,
   InvalidUsageReservationInputError,
   recoverStaleUsageReservationsWithDatabase,
@@ -35,6 +37,12 @@ function reservationRow(
     monthlyLimit: 5,
     monthlyResetAt: "2026-08-01T00:00:00.000Z",
     planCode: "free",
+    effectivePlanId: "free",
+    canonicalPlanKey: "free",
+    planKind: "free",
+    regularVideoLimit: 10,
+    shortsVideoLimit: 10,
+    planFromAssignment: false,
     ...overrides,
   };
 }
@@ -46,6 +54,34 @@ function databaseReturning(row: Record<string, unknown>) {
 }
 
 describe("usage reservation", () => {
+  it("checks both versioned usage functions without calling either one", async () => {
+    const database = databaseReturning({ available: true });
+    const query = new PgDialect().sqlToQuery(
+      buildUsageSchemaCompatibilityQuery()
+    );
+
+    await expect(
+      assertUsageSchemaCompatibilityWithDatabase(database as never)
+    ).resolves.toBeUndefined();
+    expect(query.params).toEqual([]);
+    expect(query.sql).toContain("pg_catalog.to_regprocedure");
+    expect(query.sql).toContain("reserve_usage_limits_v2");
+    expect(query.sql).toContain("get_usage_status_v1");
+    expect(query.sql).not.toMatch(/FROM\s+"?public"?\./i);
+  });
+
+  it.each([
+    { available: false },
+    { available: null },
+    {},
+  ])("fails closed when the versioned usage schema is absent", async (row) => {
+    await expect(
+      assertUsageSchemaCompatibilityWithDatabase(
+        databaseReturning(row) as never
+      )
+    ).rejects.toBeInstanceOf(UsageReservationPersistenceError);
+  });
+
   it.each([
     {
       metric: "channel_analysis" as const,
@@ -75,6 +111,12 @@ describe("usage reservation", () => {
         monthlyUsed: 1,
         monthlyLimit,
         planCode: "free",
+        effectivePlanId: "free",
+        canonicalPlanKey: "free",
+        planKind: "free",
+        regularVideoLimit: 10,
+        shortsVideoLimit: 10,
+        planFromAssignment: false,
       });
       expect(result.dailyResetAt.toISOString()).toBe(
         "2026-07-19T00:00:00.000Z"
@@ -108,6 +150,12 @@ describe("usage reservation", () => {
         monthlyUsed: hasPlan ? 3 : null,
         monthlyLimit: hasPlan ? 5 : null,
         planCode: hasPlan ? "free" : null,
+        effectivePlanId: hasPlan ? "free" : null,
+        canonicalPlanKey: hasPlan ? "free" : null,
+        planKind: hasPlan ? "free" : null,
+        regularVideoLimit: hasPlan ? 10 : null,
+        shortsVideoLimit: hasPlan ? 10 : null,
+        planFromAssignment: hasPlan ? true : null,
       })
     );
 
@@ -138,9 +186,27 @@ describe("usage reservation", () => {
       7,
       "channel_analysis",
     ]);
-    expect(built.sql).toContain('"public"."reserve_usage_limits"');
+    expect(built.sql).toContain('"public"."reserve_usage_limits_v2"');
     expect(serialized).not.toContain("untrusted-paid-plan");
     expect(serialized).not.toContain("999999");
+  });
+
+  it.each([
+    { effectivePlanId: "free", canonicalPlanKey: "unknown" },
+    { planKind: "paid" },
+    { regularVideoLimit: -1 },
+    { shortsVideoLimit: null },
+    { planFromAssignment: null },
+  ])("fails closed for an invalid plan snapshot", async (override) => {
+    const database = databaseReturning(reservationRow(override));
+
+    await expect(
+      reserveUsageWithDatabase(database as never, {
+        userId: INTERNAL_USER_ID,
+        sessionVersion: 1,
+        metric: "channel_analysis",
+      })
+    ).rejects.toBeInstanceOf(UsageReservationPersistenceError);
   });
 
   it.each([

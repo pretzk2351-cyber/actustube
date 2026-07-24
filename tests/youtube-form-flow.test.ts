@@ -4,7 +4,10 @@ import {
   canRequestAIConsult,
   evaluateChannelAnalysisResponse,
   getSafeClientApiErrorMessage,
+  hasUsageRemaining,
   isAIConsultButtonDisabled,
+  parseOwnedChannelsResponse,
+  parseUsageStatusResponse,
 } from "@/app/lib/youtube-form-flow";
 
 function validSummary(channelTitle = "Test Channel") {
@@ -25,6 +28,126 @@ function validSummary(channelTitle = "Test Channel") {
 }
 
 describe("YouTube form flow", () => {
+  it("accepts only a complete server usage snapshot", () => {
+    const status = parseUsageStatusResponse({
+      plan: {
+        effectivePlanId: "free",
+        code: "free",
+        kind: "free",
+        source: "free_fallback",
+        regularVideoLimit: 10,
+        shortsVideoLimit: 10,
+      },
+      usage: {
+        channelAnalysis: {
+          daily: {
+            used: 0,
+            limit: 2,
+            remaining: 2,
+            resetAt: "2026-07-25T00:00:00.000Z",
+          },
+          monthly: {
+            used: 1,
+            limit: 5,
+            remaining: 4,
+            resetAt: "2026-08-01T00:00:00.000Z",
+          },
+        },
+        aiConsult: {
+          daily: {
+            used: 1,
+            limit: 1,
+            remaining: 0,
+            resetAt: "2026-07-25T00:00:00.000Z",
+          },
+          monthly: {
+            used: 1,
+            limit: 3,
+            remaining: 2,
+            resetAt: "2026-08-01T00:00:00.000Z",
+          },
+        },
+      },
+    });
+
+    expect(status?.plan).toMatchObject({
+      code: "free",
+      regularVideoLimit: 10,
+      shortsVideoLimit: 10,
+    });
+    expect(status && hasUsageRemaining(status.usage.channelAnalysis)).toBe(true);
+    expect(status && hasUsageRemaining(status.usage.aiConsult)).toBe(false);
+  });
+
+  it.each([
+    { plan: { effectivePlanId: "free", code: "paid" } },
+    { plan: { effectivePlanId: "free", code: "free", kind: "paid" } },
+    { remaining: 3 },
+  ])("rejects a partial or inconsistent usage snapshot", (override) => {
+    const valid = {
+      plan: {
+        effectivePlanId: "free",
+        code: "free",
+        kind: "free",
+        source: "assignment",
+        regularVideoLimit: 10,
+        shortsVideoLimit: 10,
+      },
+      usage: {
+        channelAnalysis: {
+          daily: {
+            used: 0,
+            limit: 2,
+            remaining: 2,
+            resetAt: "2026-07-25T00:00:00.000Z",
+          },
+          monthly: {
+            used: 0,
+            limit: 5,
+            remaining: 5,
+            resetAt: "2026-08-01T00:00:00.000Z",
+          },
+        },
+        aiConsult: {
+          daily: {
+            used: 0,
+            limit: 1,
+            remaining: 1,
+            resetAt: "2026-07-25T00:00:00.000Z",
+          },
+          monthly: {
+            used: 0,
+            limit: 3,
+            remaining: 3,
+            resetAt: "2026-08-01T00:00:00.000Z",
+          },
+        },
+      },
+    };
+    if ("plan" in override) valid.plan = { ...valid.plan, ...override.plan };
+    if ("remaining" in override && typeof override.remaining === "number") {
+      valid.usage.channelAnalysis.daily.remaining = override.remaining;
+    }
+
+    expect(parseUsageStatusResponse(valid)).toBeNull();
+  });
+
+  it("accepts a deduplicated owned-channel list and rejects arbitrary values", () => {
+    expect(
+      parseOwnedChannelsResponse({
+        channels: [
+          { id: "UCaaaaaaaaaaaaaaaaaaaaaa", title: "Primary" },
+          { id: "UCbbbbbbbbbbbbbbbbbbbbbb", title: "Secondary" },
+        ],
+      })
+    ).toHaveLength(2);
+    expect(
+      parseOwnedChannelsResponse({
+        channels: [{ id: "not-owned-or-valid", title: "Arbitrary" }],
+      })
+    ).toBeNull();
+  });
+
   it.each([400, 401, 403, 429, 500])(
     "stops after a channel analysis %s response without permitting AI consult",
     (status) => {

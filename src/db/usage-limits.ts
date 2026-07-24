@@ -6,6 +6,8 @@ import { getDatabase, type Database } from "./client";
 
 export const USAGE_METRICS = ["channel_analysis", "ai_consult"] as const;
 export type UsageMetric = (typeof USAGE_METRICS)[number];
+export const USAGE_PLAN_KINDS = ["free"] as const;
+export type UsagePlanKind = (typeof USAGE_PLAN_KINDS)[number];
 
 export const USAGE_DENIAL_REASONS = [
   "user_not_found",
@@ -38,6 +40,12 @@ export type UsageReservationAllowed = UsageReservationBase & {
   monthlyUsed: number;
   monthlyLimit: number;
   planCode: string;
+  effectivePlanId: string;
+  canonicalPlanKey: string;
+  planKind: UsagePlanKind;
+  regularVideoLimit: number;
+  shortsVideoLimit: number;
+  planFromAssignment: boolean;
 };
 
 export type UsageReservationDenied = UsageReservationBase & {
@@ -49,6 +57,12 @@ export type UsageReservationDenied = UsageReservationBase & {
   monthlyUsed: number | null;
   monthlyLimit: number | null;
   planCode: string | null;
+  effectivePlanId: string | null;
+  canonicalPlanKey: string | null;
+  planKind: UsagePlanKind | null;
+  regularVideoLimit: number | null;
+  shortsVideoLimit: number | null;
+  planFromAssignment: boolean | null;
 };
 
 export type UsageReservationResult =
@@ -107,6 +121,40 @@ function isUsageMetric(value: unknown): value is UsageMetric {
 
 function isDenialReason(value: unknown): value is UsageDenialReason {
   return USAGE_DENIAL_REASONS.some((reason) => reason === value);
+}
+
+export function buildUsageSchemaCompatibilityQuery(): SQL {
+  return sql`
+    SELECT
+      pg_catalog.to_regprocedure(
+        'public.reserve_usage_limits_v2(uuid,integer,public.usage_metric,timestamp with time zone)'
+      ) IS NOT NULL
+      AND pg_catalog.to_regprocedure(
+        'public.get_usage_status_v1(uuid,integer,timestamp with time zone)'
+      ) IS NOT NULL AS "available"
+  `;
+}
+
+export async function assertUsageSchemaCompatibilityWithDatabase(
+  database: DatabaseExecutor
+) {
+  try {
+    const result = await database.execute(buildUsageSchemaCompatibilityQuery());
+    if (result.rows.length !== 1 || result.rows[0]?.available !== true) {
+      throw new UsageReservationPersistenceError();
+    }
+  } catch (error) {
+    if (error instanceof UsageReservationPersistenceError) throw error;
+    throw new UsageReservationPersistenceError();
+  }
+}
+
+export async function assertUsageSchemaCompatibility() {
+  return assertUsageSchemaCompatibilityWithDatabase(getDatabase());
+}
+
+function isUsagePlanKind(value: unknown): value is UsagePlanKind {
+  return USAGE_PLAN_KINDS.some((planKind) => planKind === value);
 }
 
 function normalizeInput(input: UsageReservationInput) {
@@ -175,6 +223,10 @@ function parseResult(row: unknown): UsageReservationResult {
   const denialReason = candidate.denialReason;
   const planCode = candidate.planCode;
   const reservationId = candidate.reservationId;
+  const effectivePlanId = candidate.effectivePlanId;
+  const canonicalPlanKey = candidate.canonicalPlanKey;
+  const planKind = candidate.planKind;
+  const planFromAssignment = candidate.planFromAssignment;
 
   if (
     typeof allowed !== "boolean" ||
@@ -185,7 +237,17 @@ function parseResult(row: unknown): UsageReservationResult {
         planCode.length === 0 ||
         planCode.length > 32)) ||
     (reservationId !== null &&
-      (typeof reservationId !== "string" || !UUID_PATTERN.test(reservationId)))
+      (typeof reservationId !== "string" || !UUID_PATTERN.test(reservationId))) ||
+    (effectivePlanId !== null &&
+      (typeof effectivePlanId !== "string" ||
+        effectivePlanId.length === 0 ||
+        effectivePlanId.length > 32)) ||
+    (canonicalPlanKey !== null &&
+      (typeof canonicalPlanKey !== "string" ||
+        canonicalPlanKey.length === 0 ||
+        canonicalPlanKey.length > 32)) ||
+    (planKind !== null && !isUsagePlanKind(planKind)) ||
+    (planFromAssignment !== null && typeof planFromAssignment !== "boolean")
   ) {
     throw new UsageReservationPersistenceError();
   }
@@ -202,6 +264,14 @@ function parseResult(row: unknown): UsageReservationResult {
     monthlyResetAt: parseTimestamp(candidate.monthlyResetAt),
     planCode: planCode as string | null,
     reservationId: reservationId as string | null,
+    effectivePlanId: effectivePlanId as string | null,
+    canonicalPlanKey: canonicalPlanKey as string | null,
+    planKind: planKind as UsagePlanKind | null,
+    regularVideoLimit: optionalNonnegativeInteger(
+      candidate.regularVideoLimit
+    ),
+    shortsVideoLimit: optionalNonnegativeInteger(candidate.shortsVideoLimit),
+    planFromAssignment: planFromAssignment as boolean | null,
   };
 
   if (allowed) {
@@ -211,7 +281,14 @@ function parseResult(row: unknown): UsageReservationResult {
       result.monthlyUsed === null ||
       result.monthlyLimit === null ||
       result.planCode === null ||
-      result.reservationId === null
+      result.reservationId === null ||
+      result.effectivePlanId === null ||
+      result.canonicalPlanKey === null ||
+      result.planKind === null ||
+      result.regularVideoLimit === null ||
+      result.shortsVideoLimit === null ||
+      result.planFromAssignment === null ||
+      result.planCode !== result.canonicalPlanKey
     ) {
       throw new UsageReservationPersistenceError();
     }
@@ -242,8 +319,14 @@ export function buildUsageReservationQuery(
       "monthly_limit" AS "monthlyLimit",
       "monthly_reset_at" AS "monthlyResetAt",
       "plan_code" AS "planCode",
-      "reservation_id" AS "reservationId"
-    FROM "public"."reserve_usage_limits"(
+      "reservation_id" AS "reservationId",
+      "effective_plan_id" AS "effectivePlanId",
+      "canonical_plan_key" AS "canonicalPlanKey",
+      "plan_kind" AS "planKind",
+      "regular_video_limit" AS "regularVideoLimit",
+      "shorts_video_limit" AS "shortsVideoLimit",
+      "plan_from_assignment" AS "planFromAssignment"
+    FROM "public"."reserve_usage_limits_v2"(
       ${normalized.userId}::uuid,
       ${normalized.sessionVersion}::integer,
       ${normalized.metric}::"public"."usage_metric"

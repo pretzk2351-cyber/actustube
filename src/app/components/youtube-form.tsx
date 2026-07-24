@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { WeeklyImprovementCycle } from "@/app/components/weekly-improvement-cycle";
 import {
@@ -13,7 +13,12 @@ import {
   canRequestAIConsult,
   evaluateChannelAnalysisResponse,
   getSafeClientApiErrorMessage,
+  hasUsageRemaining,
   isAIConsultButtonDisabled,
+  parseOwnedChannelsResponse,
+  parseUsageStatusResponse,
+  type ClientUsageStatus,
+  type OwnedChannelOption,
 } from "@/app/lib/youtube-form-flow";
 
 type Video = {
@@ -597,7 +602,13 @@ const styles = {
 };
 
 export function YouTubeForm() {
-  const [channelInput, setChannelInput] = useState("@");
+  const [ownedChannels, setOwnedChannels] = useState<OwnedChannelOption[]>([]);
+  const [selectedOwnedChannelId, setSelectedOwnedChannelId] = useState("");
+  const [channelsLoading, setChannelsLoading] = useState(true);
+  const [channelsError, setChannelsError] = useState("");
+  const [usageStatus, setUsageStatus] = useState<ClientUsageStatus | null>(null);
+  const [usageLoading, setUsageLoading] = useState(true);
+  const [usageError, setUsageError] = useState("");
   const [loading, setLoading] = useState(false);
   const [analysisResult, setAnalysisResult] =
     useState<ChannelAnalysisResult | null>(null);
@@ -607,16 +618,73 @@ export function YouTubeForm() {
   const [consult, setConsult] = useState<AIConsultResult | null>(null);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
 
-  const hasActiveSubscription = true;
-  const currentPlan = hasActiveSubscription ? "standard" : "free";
-
-  const fullUrl = `https://www.youtube.com/${channelInput.replace(/^\/+/, "")}`;
   const channelTitle = analysisResult?.channelTitle ?? "";
   const regularVideos = analysisResult?.regularVideos ?? EMPTY_VIDEOS;
   const shortVideos = analysisResult?.shortVideos ?? EMPTY_VIDEOS;
 
-  const handleChannelInputChange = (value: string) => {
-    setChannelInput(value);
+  const loadUsageStatus = useCallback(async (signal?: AbortSignal) => {
+    setUsageLoading(true);
+    setUsageError("");
+
+    try {
+      const response = await fetch("/api/usage/status", {
+        cache: "no-store",
+        signal,
+      });
+      const data = (await response.json()) as unknown;
+      const parsed = response.ok ? parseUsageStatusResponse(data) : null;
+      if (!parsed) throw new Error("UsageStatusUnavailable");
+      if (signal?.aborted) return false;
+      setUsageStatus(parsed);
+      return true;
+    } catch {
+      if (signal?.aborted) return false;
+      setUsageStatus(null);
+      setUsageError(
+        "利用枠を確認できませんでした。安全のため分析とAI提案を停止しています。"
+      );
+      return false;
+    } finally {
+      if (!signal?.aborted) setUsageLoading(false);
+    }
+  }, []);
+
+  const loadOwnedChannels = useCallback(async (signal?: AbortSignal) => {
+    setChannelsLoading(true);
+    setChannelsError("");
+
+    try {
+      const response = await fetch("/api/youtube/my-channels", {
+        cache: "no-store",
+        signal,
+      });
+      const data = (await response.json()) as unknown;
+      const channels = response.ok ? parseOwnedChannelsResponse(data) : null;
+      if (!channels) throw new Error("OwnedChannelsUnavailable");
+      if (signal?.aborted) return;
+      setOwnedChannels(channels);
+      setSelectedOwnedChannelId(channels.length === 1 ? channels[0].id : "");
+    } catch {
+      if (signal?.aborted) return;
+      setOwnedChannels([]);
+      setSelectedOwnedChannelId("");
+      setChannelsError(
+        "所有チャンネルを取得できませんでした。任意入力では分析できません。"
+      );
+    } finally {
+      if (!signal?.aborted) setChannelsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadUsageStatus(controller.signal);
+    void loadOwnedChannels(controller.signal);
+    return () => controller.abort();
+  }, [loadOwnedChannels, loadUsageStatus]);
+
+  const handleOwnedChannelChange = (channelId: string) => {
+    setSelectedOwnedChannelId(channelId);
     setAnalysisResult(null);
     setConsult(null);
     setError("");
@@ -624,6 +692,13 @@ export function YouTubeForm() {
   };
 
   const handleFetch = async () => {
+    if (!selectedOwnedChannelId || !usageStatus) {
+      setError(
+        "所有チャンネルと利用枠を確認できるまで分析を開始できません。"
+      );
+      return;
+    }
+
     setLoading(true);
     setError("");
     setAnalysisResult(null);
@@ -632,7 +707,7 @@ export function YouTubeForm() {
 
     try {
       const res = await fetch(
-        `/api/youtube/channel?url=${encodeURIComponent(fullUrl)}&plan=${currentPlan}`
+        `/api/youtube/channel?channelId=${encodeURIComponent(selectedOwnedChannelId)}`
       );
 
       const text = await res.text();
@@ -659,6 +734,7 @@ export function YouTubeForm() {
         shortVideos: (decision.analysis.shortVideos ?? []) as Video[],
       });
       setHistoryRefreshKey((current) => current + 1);
+      await loadUsageStatus();
     } catch {
       setError("チャンネル分析に失敗しました。時間をおいてもう一度お試しください。");
     } finally {
@@ -694,9 +770,13 @@ export function YouTubeForm() {
   );
 
   const handleConsult = async () => {
-    if (!consultPayload) {
+    if (
+      !consultPayload ||
+      !usageStatus ||
+      !hasUsageRemaining(usageStatus.usage.aiConsult)
+    ) {
       setConsultError(
-        "有効な分析結果がありません。チャンネルを再分析してください。"
+        "有効な分析結果と利用可能なAI提案枠を確認できません。"
       );
       return;
     }
@@ -738,6 +818,7 @@ export function YouTubeForm() {
 
       setConsult(data as AIConsultResult);
       setHistoryRefreshKey((current) => current + 1);
+      await loadUsageStatus();
     } catch {
       setConsultError(
         "AI提案の生成に失敗しました。時間をおいてもう一度お試しください。"
@@ -766,41 +847,130 @@ export function YouTubeForm() {
     () => getPerformanceBands(shortVideos, shortAnalysis),
     [shortVideos, shortAnalysis]
   );
+  const selectedOwnedChannel = ownedChannels.find(
+    (channel) => channel.id === selectedOwnedChannelId
+  );
+  const analysisUsageRemaining = usageStatus
+    ? hasUsageRemaining(usageStatus.usage.channelAnalysis)
+    : false;
+  const aiUsageRemaining = usageStatus
+    ? hasUsageRemaining(usageStatus.usage.aiConsult)
+    : false;
+  const analysisDisabled =
+    loading ||
+    consultLoading ||
+    channelsLoading ||
+    usageLoading ||
+    !selectedOwnedChannel ||
+    !usageStatus ||
+    !analysisUsageRemaining;
   const consultDisabled = isAIConsultButtonDisabled({
     hasValidAnalysis: consultPayload !== null,
     analysisLoading: loading,
     consultLoading,
+    usageReady: !usageLoading && usageStatus !== null,
+    hasAIUsageRemaining: aiUsageRemaining,
   });
 
   return (
     <div style={styles.page}>
-      <div className="youtube-input-bar" style={styles.inputBar}>
-        <div className="youtube-url-input" style={styles.prefixWrap}>
-          <div className="youtube-url-prefix" style={styles.prefix}>
-            https://www.youtube.com/
-          </div>
-          <label className="sr-only" htmlFor="youtube-channel-input">
-            YouTubeチャンネル名またはハンドル
-          </label>
-          <input
-            id="youtube-channel-input"
-            className="youtube-url-field"
-            type="text"
-            value={channelInput}
-            onChange={(e) => handleChannelInputChange(e.target.value)}
-            disabled={loading || consultLoading}
-            placeholder="@チャンネル名"
-            style={styles.input}
-          />
+      <section
+        className="youtube-preflight-grid"
+        aria-label="分析前の利用枠と所有チャンネル確認"
+      >
+        <div className="youtube-preflight-card youtube-preflight-card--usage">
+          <p style={styles.smallLabel}>Usage status</p>
+          <h2 className="youtube-preflight-title">現在の利用枠</h2>
+          {usageLoading && <p role="status">利用枠を確認しています...</p>}
+          {!usageLoading && usageStatus && (
+            <>
+              <p className="youtube-plan-label">
+                Plan: <strong>{usageStatus.plan.code}</strong>
+              </p>
+              <div className="youtube-quota-grid">
+                <div>
+                  <span>分析・日次</span>
+                  <strong>
+                    {usageStatus.usage.channelAnalysis.daily.remaining} /{" "}
+                    {usageStatus.usage.channelAnalysis.daily.limit}
+                  </strong>
+                </div>
+                <div>
+                  <span>分析・月次</span>
+                  <strong>
+                    {usageStatus.usage.channelAnalysis.monthly.remaining} /{" "}
+                    {usageStatus.usage.channelAnalysis.monthly.limit}
+                  </strong>
+                </div>
+                <div>
+                  <span>AI提案・日次</span>
+                  <strong>
+                    {usageStatus.usage.aiConsult.daily.remaining} /{" "}
+                    {usageStatus.usage.aiConsult.daily.limit}
+                  </strong>
+                </div>
+                <div>
+                  <span>AI提案・月次</span>
+                  <strong>
+                    {usageStatus.usage.aiConsult.monthly.remaining} /{" "}
+                    {usageStatus.usage.aiConsult.monthly.limit}
+                  </strong>
+                </div>
+              </div>
+              <p className="youtube-video-limits">
+                1回の処理上限：通常動画{" "}
+                {usageStatus.plan.regularVideoLimit}本／Shorts{" "}
+                {usageStatus.plan.shortsVideoLimit}本
+              </p>
+            </>
+          )}
         </div>
 
+        <div className="youtube-preflight-card">
+          <p style={styles.smallLabel}>Owned channel</p>
+          <h2 className="youtube-preflight-title">分析する所有チャンネル</h2>
+          {channelsLoading && <p role="status">所有チャンネルを確認しています...</p>}
+          {!channelsLoading && !channelsError && ownedChannels.length === 0 && (
+            <p>分析できる所有チャンネルが見つかりません。</p>
+          )}
+          {!channelsLoading && ownedChannels.length === 1 && selectedOwnedChannel && (
+            <p className="youtube-selected-channel">
+              選択済み：<strong>{selectedOwnedChannel.title || "所有チャンネル"}</strong>
+            </p>
+          )}
+          {!channelsLoading && ownedChannels.length > 1 && (
+            <div className="youtube-channel-select-wrap">
+              <label htmlFor="owned-youtube-channel">所有チャンネルを選択</label>
+              <select
+                id="owned-youtube-channel"
+                value={selectedOwnedChannelId}
+                onChange={(event) =>
+                  handleOwnedChannelChange(event.target.value)
+                }
+                disabled={loading || consultLoading}
+              >
+                <option value="">選択してください</option>
+                {ownedChannels.map((channel) => (
+                  <option key={channel.id} value={channel.id}>
+                    {channel.title || "所有チャンネル"}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <div className="youtube-input-bar" style={styles.inputBar}>
         <button
           type="button"
           className="button button--primary"
           onClick={handleFetch}
           style={styles.button}
-          disabled={loading || consultLoading}
+          disabled={analysisDisabled}
+          aria-disabled={analysisDisabled}
           aria-busy={loading}
+          aria-describedby="analysis-availability-hint"
         >
           {loading ? "分析中..." : "分析する"}
         </button>
@@ -815,23 +985,39 @@ export function YouTubeForm() {
             aria-disabled={consultDisabled}
             aria-busy={consultLoading}
             aria-describedby={
-              consultPayload ? undefined : "ai-consult-availability-hint"
+              consultDisabled ? "ai-consult-availability-hint" : undefined
             }
           >
             {consultLoading ? "提案を作成中..." : "提案を見る"}
           </button>
-          {!consultPayload && (
+          {consultDisabled && (
             <p
               id="ai-consult-availability-hint"
               className="youtube-consult-hint"
               style={styles.consultHint}
             >
-              チャンネル分析後に利用できます
+              {!usageStatus || usageLoading
+                ? "利用枠の確認後に利用できます"
+                : !aiUsageRemaining
+                  ? "AI提案の利用枠がありません"
+                  : "チャンネル分析後に利用できます"}
             </p>
           )}
         </div>
       </div>
 
+      <p id="analysis-availability-hint" className="youtube-action-hint">
+        {!usageStatus || usageLoading
+          ? "利用枠の確認後に分析できます。"
+          : !analysisUsageRemaining
+            ? "分析の利用枠がありません。"
+            : !selectedOwnedChannel
+              ? "所有チャンネルを選択してください。"
+              : "選択した所有チャンネルだけを分析します。"}
+      </p>
+
+      {channelsError && <StatusPanel tone="error" title={channelsError} />}
+      {usageError && <StatusPanel tone="error" title={usageError} />}
       {error && <StatusPanel tone="error" title={error} />}
       {consultError && <StatusPanel tone="error" title={consultError} />}
       {loading && (
@@ -844,9 +1030,9 @@ export function YouTubeForm() {
           現在の分析データをもとに改善候補を整理しています。
         </StatusPanel>
       )}
-      {!channelTitle && !loading && !error && (
-        <StatusPanel tone="info" title="分析するチャンネルを入力してください">
-          YouTubeのチャンネル名またはハンドルを入力して「分析する」を選ぶと、現状と根拠データを確認できます。
+      {!channelTitle && !loading && !error && !channelsError && (
+        <StatusPanel tone="info" title="所有チャンネルを確認してください">
+          所有チャンネルを選び「分析する」を選ぶと、現状と根拠データを確認できます。
         </StatusPanel>
       )}
 

@@ -43,6 +43,13 @@
       "when": 1784450091319,
       "tag": "0005_silky_mystique",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1784822067041,
+      "tag": "0006_usage_status_plan_snapshot",
+      "breakpoints": true
     }
   ]
 }

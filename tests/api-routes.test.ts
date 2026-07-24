@@ -25,9 +25,11 @@ const jwtState = vi.hoisted(() => ({
 
 const openAIState = vi.hoisted(() => ({ create: vi.fn() }));
 const usageState = vi.hoisted(() => ({
+  compatible: vi.fn(),
   reserve: vi.fn(),
   release: vi.fn(),
   finalize: vi.fn(),
+  status: vi.fn(),
 }));
 const staleRecoveryState = vi.hoisted(() => ({ recover: vi.fn() }));
 const weeklyCycleState = vi.hoisted(() => ({
@@ -65,9 +67,14 @@ vi.mock("next-auth/jwt", () => ({
 }));
 
 vi.mock("@/db/usage-limits", () => ({
+  assertUsageSchemaCompatibility: usageState.compatible,
   reserveUsage: usageState.reserve,
   releaseUsageReservation: usageState.release,
   finalizeUsageReservation: usageState.finalize,
+}));
+
+vi.mock("@/db/usage-status", () => ({
+  getUsageStatus: usageState.status,
 }));
 
 vi.mock("@/app/lib/stale-reservation-recovery", () => ({
@@ -103,6 +110,7 @@ let analyzePost: RouteHandler;
 let youtubeChannelGet: RouteHandler;
 let myChannelsGet: RouteHandler;
 let myChannelVideosGet: RouteHandler;
+let usageStatusGet: RouteHandler;
 let weeklyCycleGet: RouteHandler;
 let weeklyActionPost: RouteHandler;
 let weeklyActionPatch: (
@@ -177,6 +185,55 @@ function allowedReservation(metric: "channel_analysis" | "ai_consult") {
     monthlyLimit: metric === "channel_analysis" ? 5 : 3,
     monthlyResetAt: new Date("2026-08-01T00:00:00.000Z"),
     planCode: "free",
+    effectivePlanId: "free",
+    canonicalPlanKey: "free",
+    planKind: "free" as const,
+    regularVideoLimit: 10,
+    shortsVideoLimit: 10,
+    planFromAssignment: true,
+  };
+}
+
+function availableUsageStatus(source: "assignment" | "free_fallback" = "assignment") {
+  return {
+    available: true as const,
+    denialReason: null,
+    plan: {
+      effectivePlanId: "free",
+      canonicalPlanKey: "free",
+      kind: "free" as const,
+      source,
+      regularVideoLimit: 10,
+      shortsVideoLimit: 10,
+    },
+    channelAnalysis: {
+      daily: {
+        used: 0,
+        limit: 2,
+        remaining: 2,
+        resetAt: new Date("2026-07-19T00:00:00.000Z"),
+      },
+      monthly: {
+        used: 0,
+        limit: 5,
+        remaining: 5,
+        resetAt: new Date("2026-08-01T00:00:00.000Z"),
+      },
+    },
+    aiConsult: {
+      daily: {
+        used: 0,
+        limit: 1,
+        remaining: 1,
+        resetAt: new Date("2026-07-19T00:00:00.000Z"),
+      },
+      monthly: {
+        used: 0,
+        limit: 3,
+        remaining: 3,
+        resetAt: new Date("2026-08-01T00:00:00.000Z"),
+      },
+    },
   };
 }
 
@@ -184,6 +241,17 @@ function installChannelFetchMock() {
   vi.mocked(fetch).mockImplementation(async (input) => {
     const url = new URL(String(input));
     const part = url.searchParams.get("part");
+
+    if (url.pathname.endsWith("/channels") && url.searchParams.get("mine") === "true") {
+      return jsonResponse({
+        items: [
+          {
+            id: "UCaaaaaaaaaaaaaaaaaaaaaa",
+            snippet: { title: "Owned Channel", description: "Owned" },
+          },
+        ],
+      });
+    }
 
     if (url.pathname.endsWith("/channels") && part?.includes("contentDetails")) {
       return jsonResponse({
@@ -210,11 +278,8 @@ function installChannelFetchMock() {
 }
 
 function channelRequest(extraQuery = "") {
-  const channelUrl = encodeURIComponent(
-    "https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa"
-  );
   return authenticatedGet(
-    `http://localhost/api/youtube/channel?url=${channelUrl}${extraQuery}`
+    `http://localhost/api/youtube/channel?channelId=UCaaaaaaaaaaaaaaaaaaaaaa${extraQuery}`
   );
 }
 
@@ -227,6 +292,7 @@ beforeAll(async () => {
     youtubeChannelRoute,
     myChannelsRoute,
     myChannelVideosRoute,
+    usageStatusRoute,
     weeklyCycleRoute,
     weeklyActionRoute,
     weeklyActionUpdateRoute,
@@ -236,6 +302,7 @@ beforeAll(async () => {
     import("@/app/api/youtube/channel/route"),
     import("@/app/api/youtube/my-channels/route"),
     import("@/app/api/youtube/my-channels/videos/route"),
+    import("@/app/api/usage/status/route"),
     import("@/app/api/weekly-cycle/route"),
     import("@/app/api/weekly-cycle/actions/route"),
     import("@/app/api/weekly-cycle/actions/[actionId]/route"),
@@ -246,6 +313,7 @@ beforeAll(async () => {
   youtubeChannelGet = youtubeChannelRoute.GET;
   myChannelsGet = myChannelsRoute.GET as unknown as RouteHandler;
   myChannelVideosGet = myChannelVideosRoute.GET as unknown as RouteHandler;
+  usageStatusGet = usageStatusRoute.GET as unknown as RouteHandler;
   weeklyCycleGet = weeklyCycleRoute.GET;
   weeklyActionPost = weeklyActionRoute.POST;
   weeklyActionPatch = weeklyActionUpdateRoute.PATCH;
@@ -282,12 +350,14 @@ beforeEach(() => {
   usageState.reserve.mockImplementation(async ({ metric }) =>
     allowedReservation(metric)
   );
+  usageState.compatible.mockResolvedValue(undefined);
   usageState.release.mockResolvedValue({
     released: true,
     dailyUsed: 0,
     monthlyUsed: 0,
   });
   usageState.finalize.mockResolvedValue(true);
+  usageState.status.mockResolvedValue(availableUsageStatus());
   staleRecoveryState.recover.mockResolvedValue({ recovered: 0 });
   weeklyCycleState.finalizeChannel.mockResolvedValue(ANALYSIS_RUN_ID);
   weeklyCycleState.finalizeAI.mockResolvedValue(true);
@@ -348,6 +418,11 @@ describe("API authentication and retired route", () => {
           )
         ),
     },
+    {
+      route: "GET /api/usage/status",
+      invoke: () =>
+        usageStatusGet(authenticatedGet("http://localhost/api/usage/status")),
+    },
   ])("returns 401 before DB or external work for $route", async ({ invoke }) => {
     authState.session = null;
 
@@ -355,6 +430,52 @@ describe("API authentication and retired route", () => {
 
     expect(response.status).toBe(401);
     expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(openAIState.create).not.toHaveBeenCalled();
+  });
+
+  it("returns read-only server-owned usage status with private no-store headers", async () => {
+    usageState.status.mockResolvedValue(availableUsageStatus("free_fallback"));
+
+    const response = await usageStatusGet(
+      authenticatedGet(
+        "http://localhost/api/usage/status?userId=attacker&plan=paid&limit=999999"
+      )
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toContain("no-store");
+    expect(usageState.status).toHaveBeenCalledWith({
+      userId: INTERNAL_USER_ID,
+      sessionVersion: 7,
+    });
+    expect(body).toMatchObject({
+      plan: {
+        code: "free",
+        source: "free_fallback",
+        regularVideoLimit: 10,
+        shortsVideoLimit: 10,
+      },
+      usage: {
+        channelAnalysis: {
+          daily: { used: 0, limit: 2, remaining: 2 },
+          monthly: { used: 0, limit: 5, remaining: 5 },
+        },
+        aiConsult: {
+          daily: { used: 0, limit: 1, remaining: 1 },
+          monthly: { used: 0, limit: 3, remaining: 3 },
+        },
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("attacker");
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(usageState.release).not.toHaveBeenCalled();
+    expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(staleRecoveryState.recover).not.toHaveBeenCalled();
+    expect(weeklyCycleState.list).not.toHaveBeenCalled();
+    expect(weeklyCycleState.create).not.toHaveBeenCalled();
+    expect(weeklyCycleState.update).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
     expect(openAIState.create).not.toHaveBeenCalled();
   });
@@ -571,6 +692,149 @@ describe("validation occurs before usage reservation", () => {
   });
 });
 
+describe("owned channel authorization before usage reservation", () => {
+  it("rejects invalid requests before OAuth ownership lookup or reservation", async () => {
+    const response = await youtubeChannelGet(
+      authenticatedGet("http://localhost/api/youtube/channel?channelId=invalid")
+    );
+
+    expect(response.status).toBe(400);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(usageState.compatible).not.toHaveBeenCalled();
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(staleRecoveryState.recover).not.toHaveBeenCalled();
+  });
+
+  it("fails safely on Migration 0005 before OAuth, reservation, or lifecycle work", async () => {
+    usageState.compatible.mockRejectedValueOnce(
+      new Error("missing versioned function with internal SQL details")
+    );
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await youtubeChannelGet(channelRequest());
+    const body = JSON.stringify(await response.json());
+
+    expect(response.status).toBe(500);
+    expect(body).toBe(
+      JSON.stringify({ error: "An internal server error occurred." })
+    );
+    expect(body).not.toContain("versioned function");
+    expect(usageState.compatible).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(staleRecoveryState.recover).not.toHaveBeenCalled();
+    expect(usageState.status).not.toHaveBeenCalled();
+    expect(usageState.release).not.toHaveBeenCalled();
+    expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeChannel).not.toHaveBeenCalled();
+    expect(openAIState.create).not.toHaveBeenCalled();
+  });
+
+  it("does not reserve when the OAuth token is unavailable", async () => {
+    if (jwtState.token) {
+      jwtState.token.accessToken = "";
+      jwtState.token.refreshToken = "";
+      jwtState.token.accessTokenExpiresAt = 0;
+    }
+
+    const response = await youtubeChannelGet(channelRequest());
+
+    expect(response.status).toBe(403);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
+    expect(usageState.status).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not call OAuth or YouTube when the server API key is unavailable", async () => {
+    vi.stubEnv("YOUTUBE_API_KEY", "");
+
+    const response = await youtubeChannelGet(channelRequest());
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      error: "The service is temporarily unavailable.",
+    });
+    expect(usageState.compatible).toHaveBeenCalledTimes(1);
+    expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
+    expect(usageState.status).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(usageState.release).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeChannel).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "zero owned channels",
+      channels: [],
+    },
+    {
+      label: "a different owned channel",
+      channels: [
+        {
+          id: "UCbbbbbbbbbbbbbbbbbbbbbb",
+          snippet: { title: "Different channel" },
+        },
+      ],
+    },
+  ])("returns 403 without side effects for $label", async ({ channels }) => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ items: channels }));
+
+    const response = await youtubeChannelGet(channelRequest());
+
+    expect(response.status).toBe(403);
+    expect((await response.json()).code).toBe("YOUTUBE_CHANNEL_NOT_OWNED");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
+    expect(usageState.status).toHaveBeenCalledWith({
+      userId: INTERNAL_USER_ID,
+      sessionVersion: 7,
+    });
+    expect(usageState.release).not.toHaveBeenCalled();
+    expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeChannel).not.toHaveBeenCalled();
+  });
+
+  it("does not retry or reserve when owned-channel lookup fails", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      jsonResponse({ error: "authorization unavailable" }, 503)
+    );
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await youtubeChannelGet(channelRequest());
+
+    expect(response.status).toBe(502);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
+    expect(usageState.status).toHaveBeenCalledTimes(1);
+    expect(weeklyCycleState.finalizeChannel).not.toHaveBeenCalled();
+  });
+
+  it("looks up ownership before reserving, then fetches videos and finalizes", async () => {
+    installChannelFetchMock();
+
+    const response = await youtubeChannelGet(channelRequest());
+
+    expect(response.status).toBe(200);
+    const compatibilityOrder = usageState.compatible.mock.invocationCallOrder[0];
+    const recoveryOrder = staleRecoveryState.recover.mock.invocationCallOrder[0];
+    const statusOrder = usageState.status.mock.invocationCallOrder[0];
+    const ownedLookupOrder = vi.mocked(fetch).mock.invocationCallOrder[0];
+    const reserveOrder = usageState.reserve.mock.invocationCallOrder[0];
+    const channelInfoOrder = vi.mocked(fetch).mock.invocationCallOrder[1];
+    const finalizeOrder = weeklyCycleState.finalizeChannel.mock.invocationCallOrder[0];
+    expect(compatibilityOrder).toBeLessThan(recoveryOrder);
+    expect(recoveryOrder).toBeLessThan(statusOrder);
+    expect(statusOrder).toBeLessThan(ownedLookupOrder);
+    expect(ownedLookupOrder).toBeLessThan(reserveOrder);
+    expect(reserveOrder).toBeLessThan(channelInfoOrder);
+    expect(channelInfoOrder).toBeLessThan(finalizeOrder);
+  });
+});
+
 describe("successful usage reservations", () => {
   it("reserves channel_analysis, finalizes it, and returns additive usage", async () => {
     installChannelFetchMock();
@@ -599,7 +863,7 @@ describe("successful usage reservations", () => {
     );
     expect(usageState.finalize).not.toHaveBeenCalled();
     expect(usageState.release).not.toHaveBeenCalled();
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(3);
     expect(body.plan).toBe("free");
     expect(body.analysisRunId).toBe(ANALYSIS_RUN_ID);
     expect(body.usage).toEqual({
@@ -611,7 +875,92 @@ describe("successful usage reservations", () => {
       monthlyUsed: 1,
       monthlyLimit: 5,
       monthlyResetAt: "2026-08-01T00:00:00.000Z",
+      regularVideoLimit: 10,
+      shortsVideoLimit: 10,
     });
+  });
+
+  it("uses only the atomic reservation snapshot for per-type video limits", async () => {
+    usageState.reserve.mockResolvedValueOnce({
+      ...allowedReservation("channel_analysis"),
+      regularVideoLimit: 1,
+      shortsVideoLimit: 1,
+    });
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (
+        url.pathname.endsWith("/channels") &&
+        url.searchParams.get("mine") === "true"
+      ) {
+        return jsonResponse({
+          items: [
+            {
+              id: "UCaaaaaaaaaaaaaaaaaaaaaa",
+              snippet: { title: "Owned Channel" },
+            },
+          ],
+        });
+      }
+      if (url.pathname.endsWith("/channels")) {
+        return jsonResponse({
+          items: [
+            {
+              contentDetails: { relatedPlaylists: { uploads: "UUtestuploads" } },
+              snippet: { title: "Test Channel" },
+              statistics: {},
+            },
+          ],
+        });
+      }
+      if (url.pathname.endsWith("/playlistItems")) {
+        return jsonResponse({
+          items: ["regular0001", "regular0002", "shortvid001", "shortvid002"].map(
+            (videoId) => ({ contentDetails: { videoId } })
+          ),
+        });
+      }
+      if (url.pathname.endsWith("/videos")) {
+        return jsonResponse({
+          items: [
+            { id: "regular0001", contentDetails: { duration: "PT2M" } },
+            { id: "regular0002", contentDetails: { duration: "PT3M" } },
+            { id: "shortvid001", contentDetails: { duration: "PT30S" } },
+            { id: "shortvid002", contentDetails: { duration: "PT45S" } },
+          ].map((video, index) => ({
+            ...video,
+            snippet: {
+              title: `Video ${index}`,
+              publishedAt: `2026-07-${String(20 - index).padStart(2, "0")}T00:00:00.000Z`,
+            },
+            statistics: { viewCount: String(index + 1) },
+          })),
+        });
+      }
+      throw new Error("Unexpected mocked fetch target.");
+    });
+
+    const response = await youtubeChannelGet(channelRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.regularVideos).toHaveLength(1);
+    expect(body.shortVideos).toHaveLength(1);
+    expect(body.usage).toMatchObject({
+      regularVideoLimit: 1,
+      shortsVideoLimit: 1,
+    });
+    expect(weeklyCycleState.finalizeChannel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        snapshot: expect.objectContaining({
+          regularVideos: expect.arrayContaining([
+            expect.objectContaining({ id: "regular0001" }),
+          ]),
+          shortVideos: expect.arrayContaining([
+            expect.objectContaining({ id: "shortvid001" }),
+          ]),
+        }),
+      })
+    );
   });
 
   it("reserves ai_consult and ignores client-owned identity and limit fields", async () => {
@@ -634,6 +983,15 @@ describe("successful usage reservations", () => {
       sessionVersion: 7,
       metric: "ai_consult",
     });
+    expect(usageState.compatible.mock.invocationCallOrder[0]).toBeLessThan(
+      staleRecoveryState.recover.mock.invocationCallOrder[0]
+    );
+    expect(staleRecoveryState.recover.mock.invocationCallOrder[0]).toBeLessThan(
+      usageState.reserve.mock.invocationCallOrder[0]
+    );
+    expect(usageState.reserve.mock.invocationCallOrder[0]).toBeLessThan(
+      openAIState.create.mock.invocationCallOrder[0]
+    );
     expect(weeklyCycleState.analysisBelongs).toHaveBeenCalledWith(
       INTERNAL_USER_ID,
       ANALYSIS_RUN_ID
@@ -677,11 +1035,42 @@ describe("successful usage reservations", () => {
 
 describe("usage denial HTTP mapping", () => {
   it.each([
+    ["daily", "DAILY_USAGE_LIMIT_REACHED"],
+    ["monthly", "MONTHLY_USAGE_LIMIT_REACHED"],
+  ] as const)(
+    "rejects exhausted %s analysis usage before the YouTube ownership request",
+    async (period, code) => {
+      const status = availableUsageStatus();
+      status.channelAnalysis[period].used =
+        status.channelAnalysis[period].limit;
+      status.channelAnalysis[period].remaining = 0;
+      usageState.status.mockResolvedValueOnce(status);
+
+      const response = await youtubeChannelGet(channelRequest());
+
+      expect(response.status).toBe(429);
+      expect(await response.json()).toMatchObject({
+        code,
+        metric: "channel_analysis",
+        planCode: "free",
+      });
+      expect(usageState.compatible).toHaveBeenCalledTimes(1);
+      expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
+      expect(usageState.status).toHaveBeenCalledTimes(1);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(usageState.reserve).not.toHaveBeenCalled();
+      expect(usageState.release).not.toHaveBeenCalled();
+      expect(weeklyCycleState.finalizeChannel).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
     ["user_not_found", 401, "REAUTHENTICATION_REQUIRED"],
     ["session_version_mismatch", 401, "REAUTHENTICATION_REQUIRED"],
     ["user_inactive", 403, "ACCOUNT_UNAVAILABLE"],
     ["no_active_plan", 403, "NO_ACTIVE_PLAN"],
   ] as const)("maps %s safely", async (denialReason, status, code) => {
+    installChannelFetchMock();
     usageState.reserve.mockResolvedValue({
       allowed: false,
       denialReason,
@@ -694,6 +1083,12 @@ describe("usage denial HTTP mapping", () => {
       monthlyLimit: null,
       monthlyResetAt: new Date("2026-08-01T00:00:00.000Z"),
       planCode: null,
+      effectivePlanId: null,
+      canonicalPlanKey: null,
+      planKind: null,
+      regularVideoLimit: null,
+      shortsVideoLimit: null,
+      planFromAssignment: null,
     });
 
     const response = await youtubeChannelGet(channelRequest());
@@ -701,7 +1096,8 @@ describe("usage denial HTTP mapping", () => {
 
     expect(response.status).toBe(status);
     expect(body.code).toBe(code);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
   });
 
   it.each([
@@ -712,6 +1108,7 @@ describe("usage denial HTTP mapping", () => {
     async (denialReason, code, retryAfter) => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-07-18T23:00:00.000Z"));
+      installChannelFetchMock();
       usageState.reserve.mockResolvedValue({
         allowed: false,
         denialReason,
@@ -724,6 +1121,12 @@ describe("usage denial HTTP mapping", () => {
         monthlyLimit: 5,
         monthlyResetAt: new Date("2026-08-01T00:00:00.000Z"),
         planCode: "free",
+        effectivePlanId: "free",
+        canonicalPlanKey: "free",
+        planKind: "free",
+        regularVideoLimit: 10,
+        shortsVideoLimit: 10,
+        planFromAssignment: true,
       });
 
       const response = await youtubeChannelGet(channelRequest());
@@ -742,7 +1145,8 @@ describe("usage denial HTTP mapping", () => {
         monthlyResetAt: "2026-08-01T00:00:00.000Z",
         planCode: "free",
       });
-      expect(fetch).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(staleRecoveryState.recover).toHaveBeenCalledWith(25);
     }
   );
 
@@ -769,7 +1173,18 @@ describe("external failures release usage", () => {
       504,
     ],
   ] as const)("releases a YouTube reservation on %s", async (_label, error, status) => {
-    vi.mocked(fetch).mockRejectedValueOnce(error);
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          items: [
+            {
+              id: "UCaaaaaaaaaaaaaaaaaaaaaa",
+              snippet: { title: "Owned channel" },
+            },
+          ],
+        })
+      )
+      .mockRejectedValueOnce(error);
     vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     const response = await youtubeChannelGet(channelRequest());
@@ -838,6 +1253,7 @@ describe("external failures release usage", () => {
   });
 
   it("does not expose a reservation database failure", async () => {
+    installChannelFetchMock();
     usageState.reserve.mockRejectedValueOnce(
       new Error("postgresql://user:database-secret@example.test/database")
     );
@@ -849,7 +1265,31 @@ describe("external failures release usage", () => {
     expect(response.status).toBe(500);
     expect(body).toBe(JSON.stringify({ error: "An internal server error occurred." }));
     expect(body).not.toContain("database-secret");
-    expect(fetch).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not run recovery or OpenAI when the versioned AI schema is unavailable", async () => {
+    usageState.compatible.mockRejectedValueOnce(
+      new Error("missing versioned function with internal SQL details")
+    );
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await aiConsultPost(
+      jsonRequest("http://localhost/api/ai-consult", {
+        aiSummary: validAISummary(),
+        analysisRunId: ANALYSIS_RUN_ID,
+      })
+    );
+    const body = JSON.stringify(await response.json());
+
+    expect(response.status).toBe(500);
+    expect(body).not.toContain("versioned function");
+    expect(usageState.reserve).not.toHaveBeenCalled();
+    expect(staleRecoveryState.recover).not.toHaveBeenCalled();
+    expect(openAIState.create).not.toHaveBeenCalled();
+    expect(usageState.release).not.toHaveBeenCalled();
+    expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeAI).not.toHaveBeenCalled();
   });
 
   it("rejects a missing or other-user analysis before AI usage or external work", async () => {
@@ -906,6 +1346,9 @@ describe("existing Google OAuth route behavior", () => {
 
     expect(response.status).toBe(200);
     expect(fetch).toHaveBeenCalledTimes(1);
+    const requestedUrl = new URL(String(vi.mocked(fetch).mock.calls[0][0]));
+    expect(requestedUrl.searchParams.get("mine")).toBe("true");
+    expect(requestedUrl.searchParams.get("maxResults")).toBe("50");
   });
 
   it("rejects OAuth when internalUserId differs from the session user", async () => {

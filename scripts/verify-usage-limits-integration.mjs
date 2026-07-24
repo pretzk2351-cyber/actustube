@@ -60,6 +60,31 @@ async function reserve(userId, metric, now, sessionVersion = 1) {
   return rows[0];
 }
 
+async function reserveV2(userId, metric, now, sessionVersion = 1) {
+  const rows = await database`
+    SELECT *
+    FROM public.reserve_usage_limits_v2(
+      ${userId}::uuid,
+      ${sessionVersion}::integer,
+      ${metric}::public.usage_metric,
+      ${now}::timestamp with time zone
+    )
+  `;
+  return rows[0];
+}
+
+async function usageStatus(userId, now, sessionVersion = 1) {
+  const rows = await database`
+    SELECT *
+    FROM public.get_usage_status_v1(
+      ${userId}::uuid,
+      ${sessionVersion}::integer,
+      ${now}::timestamp with time zone
+    )
+  `;
+  return rows[0];
+}
+
 async function bucketCounts(userId, metric) {
   return database`
     SELECT
@@ -113,6 +138,7 @@ async function run() {
   );
   assert.equal(pendingRelease.allowed, true);
   assert.ok(pendingRelease.reservation_id);
+  assert.equal("effective_plan_id" in pendingRelease, false);
   assert.deepEqual(await release(releasedUser, pendingRelease.reservation_id), {
     released: true,
     daily_used: 0,
@@ -204,6 +230,24 @@ async function run() {
   assert.equal(independent[1].daily_limit, 1);
   assert.equal(independent[1].monthly_limit, 3);
 
+  const snapshotUser = await createUser();
+  const snapshotReservation = await reserveV2(
+    snapshotUser,
+    "channel_analysis",
+    "2026-07-18T12:00:00.000Z"
+  );
+  assert.equal(snapshotReservation.allowed, true);
+  assert.equal(snapshotReservation.effective_plan_id, "free");
+  assert.equal(snapshotReservation.canonical_plan_key, "free");
+  assert.equal(snapshotReservation.plan_kind, "free");
+  assert.equal(snapshotReservation.regular_video_limit, 10);
+  assert.equal(snapshotReservation.shorts_video_limit, 10);
+  assert.equal(snapshotReservation.plan_from_assignment, true);
+  assert.equal(
+    (await release(snapshotUser, snapshotReservation.reservation_id)).released,
+    true
+  );
+
   const monthlyUser = await createUser();
   for (let day = 1; day <= 5; day += 1) {
     const result = await reserve(
@@ -261,15 +305,34 @@ async function run() {
   );
 
   const planlessUser = await createUser({ withPlan: false });
+  assert.deepEqual(await bucketCounts(planlessUser, "channel_analysis"), []);
+  const planlessStatus = await usageStatus(
+    planlessUser,
+    "2026-09-01T12:00:00.000Z"
+  );
+  assert.equal(planlessStatus.available, true);
+  assert.equal(planlessStatus.canonical_plan_key, "free");
+  assert.equal(planlessStatus.plan_from_assignment, false);
+  assert.equal(planlessStatus.analysis_daily_used, 0);
+  assert.equal(planlessStatus.analysis_daily_remaining, 2);
+  assert.equal(planlessStatus.analysis_monthly_used, 0);
+  assert.equal(planlessStatus.analysis_monthly_remaining, 5);
+  assert.equal(planlessStatus.ai_daily_used, 0);
+  assert.equal(planlessStatus.ai_daily_remaining, 1);
+  assert.equal(planlessStatus.ai_monthly_used, 0);
+  assert.equal(planlessStatus.ai_monthly_remaining, 3);
+  assert.deepEqual(await bucketCounts(planlessUser, "channel_analysis"), []);
+
+  const fallbackReservation = await reserveV2(
+    planlessUser,
+    "channel_analysis",
+    "2026-09-01T12:00:00.000Z"
+  );
+  assert.equal(fallbackReservation.allowed, true);
+  assert.equal(fallbackReservation.plan_from_assignment, false);
   assert.equal(
-    (
-      await reserve(
-        planlessUser,
-        "channel_analysis",
-        "2026-09-01T12:00:00.000Z"
-      )
-    ).denial_reason,
-    "no_active_plan"
+    (await release(planlessUser, fallbackReservation.reservation_id)).released,
+    true
   );
 
   console.log({
@@ -280,6 +343,10 @@ async function run() {
     oneTimeReleaseVerified: true,
     successfulFinalizationVerified: true,
     staleRecoveryVerified: true,
+    readOnlyStatusVerified: true,
+    activeAssignmentAndFreeFallbackVerified: true,
+    versionedPlanSnapshotVerified: true,
+    legacyReservationContractVerified: true,
   });
 }
 

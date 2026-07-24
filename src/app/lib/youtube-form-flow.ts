@@ -2,6 +2,39 @@ import { parseAISummary } from "./api-validation";
 
 export type ClientApiOperation = "channel_analysis" | "ai_consult";
 
+export type OwnedChannelOption = {
+  id: string;
+  title: string;
+};
+
+export type ClientUsagePeriod = {
+  used: number;
+  limit: number;
+  remaining: number;
+  resetAt: string;
+};
+
+export type ClientUsageStatus = {
+  plan: {
+    effectivePlanId: string;
+    code: string;
+    kind: "free";
+    source: "assignment" | "free_fallback";
+    regularVideoLimit: number;
+    shortsVideoLimit: number;
+  };
+  usage: {
+    channelAnalysis: {
+      daily: ClientUsagePeriod;
+      monthly: ClientUsagePeriod;
+    };
+    aiConsult: {
+      daily: ClientUsagePeriod;
+      monthly: ClientUsagePeriod;
+    };
+  };
+};
+
 type ApiErrorPayload = {
   code?: unknown;
   dailyResetAt?: unknown;
@@ -24,10 +57,129 @@ type AIConsultButtonState = {
   hasValidAnalysis: boolean;
   analysisLoading: boolean;
   consultLoading: boolean;
+  usageReady?: boolean;
+  hasAIUsageRemaining?: boolean;
 };
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonnegativeInteger(value: unknown) {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function parseUsagePeriod(value: unknown): ClientUsagePeriod | null {
+  if (!isObject(value)) return null;
+  if (
+    !isNonnegativeInteger(value.used) ||
+    !isNonnegativeInteger(value.limit) ||
+    !isNonnegativeInteger(value.remaining) ||
+    typeof value.resetAt !== "string" ||
+    Number.isNaN(Date.parse(value.resetAt)) ||
+    value.remaining !== Math.max((value.limit as number) - (value.used as number), 0)
+  ) {
+    return null;
+  }
+
+  return {
+    used: value.used as number,
+    limit: value.limit as number,
+    remaining: value.remaining as number,
+    resetAt: value.resetAt,
+  };
+}
+
+export function parseUsageStatusResponse(
+  value: unknown
+): ClientUsageStatus | null {
+  if (!isObject(value) || !isObject(value.plan) || !isObject(value.usage)) {
+    return null;
+  }
+
+  const plan = value.plan;
+  const channelAnalysis = isObject(value.usage.channelAnalysis)
+    ? value.usage.channelAnalysis
+    : null;
+  const aiConsult = isObject(value.usage.aiConsult)
+    ? value.usage.aiConsult
+    : null;
+  const analysisDaily = parseUsagePeriod(channelAnalysis?.daily);
+  const analysisMonthly = parseUsagePeriod(channelAnalysis?.monthly);
+  const aiDaily = parseUsagePeriod(aiConsult?.daily);
+  const aiMonthly = parseUsagePeriod(aiConsult?.monthly);
+
+  if (
+    typeof plan.effectivePlanId !== "string" ||
+    plan.effectivePlanId.length === 0 ||
+    plan.effectivePlanId.length > 32 ||
+    typeof plan.code !== "string" ||
+    plan.code !== plan.effectivePlanId ||
+    plan.kind !== "free" ||
+    !["assignment", "free_fallback"].includes(String(plan.source)) ||
+    !isNonnegativeInteger(plan.regularVideoLimit) ||
+    !isNonnegativeInteger(plan.shortsVideoLimit) ||
+    !analysisDaily ||
+    !analysisMonthly ||
+    !aiDaily ||
+    !aiMonthly
+  ) {
+    return null;
+  }
+
+  return {
+    plan: {
+      effectivePlanId: plan.effectivePlanId,
+      code: plan.code,
+      kind: "free",
+      source: plan.source as "assignment" | "free_fallback",
+      regularVideoLimit: plan.regularVideoLimit as number,
+      shortsVideoLimit: plan.shortsVideoLimit as number,
+    },
+    usage: {
+      channelAnalysis: {
+        daily: analysisDaily,
+        monthly: analysisMonthly,
+      },
+      aiConsult: {
+        daily: aiDaily,
+        monthly: aiMonthly,
+      },
+    },
+  };
+}
+
+export function parseOwnedChannelsResponse(
+  value: unknown
+): OwnedChannelOption[] | null {
+  if (!isObject(value) || !Array.isArray(value.channels)) return null;
+
+  const seen = new Set<string>();
+  const channels: OwnedChannelOption[] = [];
+
+  for (const candidate of value.channels) {
+    if (
+      !isObject(candidate) ||
+      typeof candidate.id !== "string" ||
+      !/^UC[A-Za-z0-9_-]{22}$/.test(candidate.id) ||
+      typeof candidate.title !== "string" ||
+      candidate.title.length > 200 ||
+      seen.has(candidate.id)
+    ) {
+      return null;
+    }
+    seen.add(candidate.id);
+    channels.push({ id: candidate.id, title: candidate.title });
+  }
+
+  return channels;
+}
+
+export function hasUsageRemaining(periods: {
+  daily: ClientUsagePeriod;
+  monthly: ClientUsagePeriod;
+}) {
+  return periods.daily.remaining > 0 && periods.monthly.remaining > 0;
 }
 
 export function isUsableChannelAnalysis(
@@ -68,8 +220,16 @@ export function isAIConsultButtonDisabled({
   hasValidAnalysis,
   analysisLoading,
   consultLoading,
+  usageReady = true,
+  hasAIUsageRemaining = true,
 }: AIConsultButtonState) {
-  return !hasValidAnalysis || analysisLoading || consultLoading;
+  return (
+    !hasValidAnalysis ||
+    analysisLoading ||
+    consultLoading ||
+    !usageReady ||
+    !hasAIUsageRemaining
+  );
 }
 
 function formatJapaneseResetAt(value: unknown) {

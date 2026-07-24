@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { FREE_PLAN } from "@/db/free-plan";
 import {
   oauthAccounts,
+  planAssignmentStatusEnum,
   plans,
   usageReservationLeases,
   usageMetricEnum,
@@ -46,6 +47,10 @@ function usageReleaseMigrationSql() {
 
 function staleRecoveryMigrationSql() {
   return migrationSql(4);
+}
+
+function usageStatusPlanSnapshotMigrationSql() {
+  return migrationSql(6);
 }
 
 describe("database schema", () => {
@@ -456,5 +461,182 @@ describe("database schema", () => {
     expect(sql).not.toMatch(/https?:\/\//);
     expect(sql).not.toMatch(/\b(?:email|provider_account_id|access_token)\b/i);
     expect(sql).not.toMatch(/plpgsql\.variable_conflict/i);
+  });
+
+  it("resolves effective usage plans once with explicit fail-closed states", () => {
+    const sql = usageStatusPlanSnapshotMigrationSql();
+    const resolverStart = sql.indexOf(
+      'CREATE FUNCTION "public"."resolve_effective_usage_plan_v1"'
+    );
+    const reservationStart = sql.indexOf(
+      'CREATE FUNCTION "public"."reserve_usage_limits_v2"'
+    );
+    const resolver = sql.slice(resolverStart, reservationStart);
+
+    expect(resolverStart).toBeGreaterThan(-1);
+    expect(resolver).toContain("SELECT COUNT(*)::integer");
+    expect(resolver).toContain("IF v_active_assignment_count > 1 THEN");
+    expect(resolver).toContain("IF v_active_assignment_count = 1 THEN");
+    expect(resolver).toContain("AND upa.status = 'active';");
+    expect(resolver).toContain("v_assignment_starts_at > v_now");
+    expect(resolver).toContain("v_assignment_ends_at <= v_now");
+    expect(resolver).toContain(
+      "LEFT JOIN public.plans AS p ON p.code = upa.plan_code"
+    );
+    expect(resolver).toContain("OR v_effective_plan_id IS NULL");
+    expect(resolver).toContain("OR v_plan_active IS DISTINCT FROM true");
+    expect(resolver).toContain("WHERE p.code = 'free'");
+    expect(resolver).toContain("IF v_free_plan_count <> 1 THEN");
+    expect(resolver).toContain(
+      "v_effective_plan_id IS DISTINCT FROM 'free'"
+    );
+    expect(resolver).toContain(
+      "v_analysis_daily_limit IS DISTINCT FROM 2"
+    );
+    expect(resolver).toContain(
+      "v_analysis_monthly_limit IS DISTINCT FROM 5"
+    );
+    expect(resolver).toContain("v_ai_daily_limit IS DISTINCT FROM 1");
+    expect(resolver).toContain("v_ai_monthly_limit IS DISTINCT FROM 3");
+    expect(resolver).toContain("v_regular_video_limit IS DISTINCT FROM 10");
+    expect(resolver).toContain("v_shorts_video_limit IS DISTINCT FROM 10");
+    expect(resolver).not.toContain("p.name");
+    expect(resolver).not.toMatch(/\b(?:INSERT|UPDATE|DELETE)\b/i);
+  });
+
+  it("treats only active assignments as current candidates", () => {
+    const sql = usageStatusPlanSnapshotMigrationSql();
+    const resolverStart = sql.indexOf(
+      'CREATE FUNCTION "public"."resolve_effective_usage_plan_v1"'
+    );
+    const reservationStart = sql.indexOf(
+      'CREATE FUNCTION "public"."reserve_usage_limits_v2"'
+    );
+    const resolver = sql.slice(resolverStart, reservationStart);
+    const countStart = resolver.indexOf("SELECT COUNT(*)::integer");
+    const countEnd = resolver.indexOf("IF v_active_assignment_count > 1 THEN");
+    const activeCount = resolver.slice(countStart, countEnd);
+
+    expect(planAssignmentStatusEnum.enumValues).toEqual([
+      "active",
+      "inactive",
+      "expired",
+    ]);
+    expect(activeCount).toContain("AND upa.status = 'active'");
+    expect(activeCount).not.toContain("upa.starts_at <= v_now");
+    expect(activeCount).not.toContain("upa.ends_at > v_now");
+    expect(resolver).not.toMatch(
+      /'cancelled'|'suspended'|'blocked'|'revoked'|'fraud'|'invalid'/
+    );
+  });
+
+  it("shares UTC boundaries and plan resolution between status and reservation", () => {
+    const sql = usageStatusPlanSnapshotMigrationSql();
+
+    expect(sql).toContain(
+      'CREATE FUNCTION "public"."usage_period_boundaries_v1"'
+    );
+    expect(sql).toContain(
+      "date_trunc('day', source.effective_now AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+    );
+    expect(sql).toContain(
+      "date_trunc('month', source.effective_now AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+    );
+    expect(
+      sql.match(/FROM public\.usage_period_boundaries_v1\(v_now\)/g)
+    ).toHaveLength(2);
+    expect(
+      sql.match(/FROM public\.resolve_effective_usage_plan_v1\(p_user_id, v_now\)/g)
+    ).toHaveLength(2);
+  });
+
+  it("adds a versioned reservation snapshot without breaking the old contract", () => {
+    const sql = usageStatusPlanSnapshotMigrationSql();
+    const wrapperStart = sql.indexOf(
+      'CREATE OR REPLACE FUNCTION "public"."reserve_usage_limits"'
+    );
+    const statusStart = sql.indexOf(
+      'CREATE FUNCTION "public"."get_usage_status_v1"'
+    );
+    const wrapper = sql.slice(wrapperStart, statusStart);
+
+    expect(sql).toContain(
+      'CREATE FUNCTION "public"."reserve_usage_limits_v2"'
+    );
+    for (const field of [
+      '"effective_plan_id" varchar',
+      '"canonical_plan_key" varchar',
+      '"plan_kind" text',
+      '"regular_video_limit" integer',
+      '"shorts_video_limit" integer',
+      '"plan_from_assignment" boolean',
+    ]) {
+      expect(sql).toContain(field);
+    }
+    expect(wrapperStart).toBeGreaterThan(-1);
+    expect(wrapper).toContain("FROM public.reserve_usage_limits_v2(");
+    expect(wrapper).toContain('"reservation_id" uuid');
+    expect(wrapper).not.toContain('"effective_plan_id" varchar');
+    expect(sql).not.toMatch(/DROP FUNCTION/i);
+    expect(sql).not.toMatch(/\b(?:ALTER|DROP) TABLE\b/i);
+    expect(sql).not.toMatch(/\b(?:CREATE|DROP) INDEX\b/i);
+  });
+
+  it("keeps usage status strictly read-only and clamps remaining counts", () => {
+    const sql = usageStatusPlanSnapshotMigrationSql();
+    const statusStart = sql.indexOf(
+      'CREATE FUNCTION "public"."get_usage_status_v1"'
+    );
+    const status = sql.slice(statusStart);
+
+    expect(statusStart).toBeGreaterThan(-1);
+    expect(status).toContain("COALESCE(MAX(b.used_count) FILTER");
+    expect(status).toContain("Usage counter state is unavailable.");
+    expect(status.match(/GREATEST\(/g)).toHaveLength(4);
+    expect(status).not.toMatch(/\b(?:INSERT|UPDATE|DELETE)\b/i);
+    expect(status).not.toContain("pg_advisory_xact_lock");
+    expect(status).not.toContain("usage_reservation_leases");
+  });
+
+  it("scopes all new SQL functions and revokes their public execution", () => {
+    const sql = usageStatusPlanSnapshotMigrationSql();
+    const applyStart = sql.indexOf("DO $usage_acl_apply$");
+    const definitions = sql.slice(0, applyStart);
+
+    expect(definitions.match(/SECURITY INVOKER/g)).toHaveLength(5);
+    expect(definitions.match(/SET search_path = public, pg_temp/g)).toHaveLength(5);
+    expect(definitions.match(/^REVOKE ALL ON FUNCTION/gm)).toHaveLength(4);
+    expect(sql).toContain("Usage function execution depends on PUBLIC.");
+    expect(sql).toContain(
+      "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC"
+    );
+    expect(sql).toContain("LANGUAGE sql\nSTABLE");
+    expect(sql).toContain("LANGUAGE plpgsql\nSTABLE");
+    expect(sql.match(/\nVOLATILE\n/g)).toHaveLength(2);
+    expect(sql).not.toContain("SECURITY DEFINER");
+    expect(sql).not.toMatch(/https?:\/\//);
+    expect(sql).not.toMatch(/\b(?:email|provider_account_id|access_token)\b/i);
+  });
+
+  it("inherits owner and explicit ACLs from the exact legacy signature", () => {
+    const sql = usageStatusPlanSnapshotMigrationSql();
+
+    expect(sql).toContain("DO $usage_acl_preflight$");
+    expect(sql).toContain("p.proname = 'reserve_usage_limits'");
+    expect(sql).toContain("p.proargtypes = ARRAY[");
+    expect(sql).toContain("'public.usage_metric'::pg_catalog.regtype::oid");
+    expect(sql).toContain("pg_catalog.aclexplode");
+    expect(sql).toContain(
+      "current_user::pg_catalog.regrole::oid"
+    );
+    expect(sql).toContain("ALTER FUNCTION %s OWNER TO %I");
+    expect(sql).toContain("GRANT EXECUTE ON FUNCTION %s TO %I%s");
+    expect(sql).toContain("WITH GRANT OPTION");
+    expect(sql).toContain("ALTER FUNCTION %s SECURITY %s");
+    expect(sql).toContain(
+      "ALTER FUNCTION %s SET search_path = public, pg_temp"
+    );
+    expect(sql).toContain("A versioned usage function ACL was not preserved.");
+    expect(sql).not.toMatch(/\b(?:app_role|runtime_role|migration_role)\b/i);
   });
 });
