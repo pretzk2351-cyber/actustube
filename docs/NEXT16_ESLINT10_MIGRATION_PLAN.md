@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft only. This document does not approve a security exception, start a major-version upgrade, or authorize a Production change.
+Planning document. The project owner separately approved the time-limited exception recorded in [the formal GHSA-mh99-v99m-4gvg exception](./SECURITY_EXCEPTION_GHSA-MH99-V99M-4GVG.md) on 2026-07-26. This plan does not start a major-version upgrade or authorize a Production change.
 
 ## Purpose
 
@@ -14,7 +14,7 @@ Move the development lint chain off the vulnerable `brace-expansion` path by upg
 - The affected package is currently reachable only through development lint dependencies.
 - The current candidate's Production dependency query, server trace, client bundle, middleware/proxy search, API route search, and user-input taint search found no affected runtime path.
 - `npm audit --omit=dev` currently reports zero vulnerabilities at every severity.
-- These observations must be regenerated immediately before approval; this draft is not permanent evidence.
+- These observations must be regenerated at least weekly, before each release decision, and whenever a withdrawal condition may have changed. The formal exception record, not this plan, is the approval evidence.
 
 ## Current formatter status
 
@@ -22,7 +22,7 @@ The repository has no formatter script, formatter configuration, formatter devel
 
 ## Temporary-exception boundary
 
-If a project owner later approves a temporary exception, its lifetime must be at most 30 days and must end no later than 2026-08-24. Approval is not established by this plan. Recheck the advisory and any compatible backport at least weekly.
+The project owner approved a temporary exception only for GHSA-mh99-v99m-4gvg in the development lint dependency path. It expires at 2026-08-24 23:59 JST, with the first weekly recheck due by 2026-08-02. Recheck the advisory and every compatible backport at least weekly. The exception does not renew automatically; permanent remediation must complete before expiry, or the release decision must stop for a new risk assessment and explicit owner decision.
 
 ## Ownership and schedule
 
@@ -31,8 +31,9 @@ If a project owner later approves a temporary exception, its lifetime must be at
 - Audit: Work.
 - Candidate branch: `chore/next16-eslint10-migration`.
 - Investigation start deadline: 2026-08-02.
-- Completion target: before 2026-08-24.
+- Completion target: before 2026-08-24 23:59 JST.
 - Review cadence: at least weekly until the advisory is removed or any exception expires.
+- Weekly backport check: Codex Local records official compatible fixes and regenerated technical evidence; Work independently audits the result; the project owner retains approval accountability.
 
 ## Official migration baseline
 

@@ -44,6 +44,25 @@ Production公開とDB接続を安全に保護するための手順と停止条�
 
 今回の `docs/allow-safe-docs-only-state-drift` はdocs-only状態差の限定規則を追加し、Project Statusと本Runbookを同期する文書branchです。作業branchのcommit・pushは、`main` 統合、Production操作、DB操作、設定変更を許可しません。認証済みProduction主要機能スモークは未実施です。
 
+## 依存関係セキュリティrelease gate
+
+通常のrelease gateは、full `npm audit` とRuntime `npm audit --omit=dev` のHigh / Criticalがともに0件であることです。この原則は維持し、一般的なdevDependency脆弱性を許容しません。
+
+唯一、[GHSA-mh99-v99m-4gvgの承認済み期限付き例外](./SECURITY_EXCEPTION_GHSA-MH99-V99M-4GVG.md)については、次を**すべて**満たす場合に限り、full auditの当該GHSAだけを期限付きでrelease判定から除外できます。
+
+1. 正式な例外文書が存在し、対象がGHSA-mh99-v99m-4gvg / CVE-2026-14257だけである。
+2. ActusTubeプロジェクトオーナーの明示承認が記録されている。
+3. 2026-08-24 23:59 JST以前で、例外が失効・撤回されていない。
+4. 初回2026-08-02、その後最低週1回の再確認が期限内に完了し、次の再確認期限を超過していない。
+5. Runtime `npm audit --omit=dev` が全severity 0件である。
+6. full auditの当該GHSA以外のHigh / Criticalが0件である。
+7. Production dependency、server/client trace、bundle、middleware/proxy、API route、server action、起動・lifecycle経路、ユーザー入力から当該packageへ到達しない。
+8. 対象candidateのPreviewでNode.js 24.x、Corepack、npm 11.18.0、既定install、`npm run build`を確認済みである。
+9. 必須検証と独立レビューに合格し、P0 / P1 / P2 / P3 / NOT VERIFIEDがすべて0件である。
+10. 正式例外文書の即時解除条件に該当していない。
+
+1条件でも満たさない場合は通常基準へ戻り、High / Criticalが0件でなければ停止します。この限定例外はmain統合、Production deployment、DB接続、Migration、Neon、Vercel設定・環境変数、Google Cloud / OAuth、Productionスモークを承認しません。Production工程は別計画、最新状態の確認、独立監査、明示許可を必要とします。
+
 ## docs-onlyスナップショット差の限定判定
 
 Project Statusや本RunbookのGit / deployment識別子が現在の実状態と異なる場合も、一般的な不一致として停止する前に、次の手順を**すべて読み取り専用**で確認します。

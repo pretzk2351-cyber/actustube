@@ -1,6 +1,6 @@
 # ActusTube Project Status
 
-最終更新日：2026-07-23
+最終更新日：2026-07-26
 
 > 2026-07-23 02:10:39 JSTの読み取り専用確認に基づく状態スナップショットです。`main` / `origin/main` は `e036d34db3939a79073fcb05db9c27acda06d0e9` で同期し、Productionは `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`（`main@e036d34db3939a79073fcb05db9c27acda06d0e9`）をREADY / Currentで配信しています。トップ・主要CSS・主要JavaScriptはHTTP 200です。アプリコードの直近基準は `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` であり、そこから現在の `main` までの変更は承認済み文書ファイルだけです。認証済みProduction主要機能スモークは未実施です。この文書自体の後続docs-only commitやdeploymentによりGit / Production識別子が進む可能性があり、その場合もAGENTS / Runbookの全条件を満たすdocs-only限定例外だけが適用候補です。Production DB接続復旧は完了済みで、通常の環境変数変更禁止規則が引き続き適用されています。
 
@@ -40,6 +40,27 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - Vitest 4.1.10以降
 - Vercel
 - Stripe SDK 18.0.0以降は依存関係に存在するが、Stripe機能は今回の公開対象外
+
+## 承認済み期限付きセキュリティ例外
+
+現在のリリース準備feature branchでは、[GHSA-mh99-v99m-4gvg / CVE-2026-14257の正式な期限付き例外](./SECURITY_EXCEPTION_GHSA-MH99-V99M-4GVG.md)がActusTubeプロジェクトオーナーにより明示承認済みです。
+
+- 対象：`brace-expansion` のdevDependency lint経路にあるGHSA-mh99-v99m-4gvgだけ
+- 承認日：2026-07-26
+- 失効日：2026-08-24 23:59 JST
+- 初回週次確認期限：2026-08-02
+- Runtime `npm audit --omit=dev`：全severity 0件
+- full `npm audit`：対象GHSAによるHigh 9件のみ。対象GHSA以外は0件
+- Production dependency / trace / bundle / route / action / user-input経路：対象packageへの到達なし
+- Preview：Node.js 24.x、Corepack、npm 11.18.0、既定install、`npm run build`を実証済み
+- ローカル回帰検証：247件成功、4件skip、React act警告0件
+- 独立レビュー：P0 / P1 / P2 / P3 / NOT VERIFIEDすべて0件
+- Git Fork Protection：有効
+- `DATABASE_URL`：Productionだけに保存され、Previewには含まれない
+
+通常のHigh / Critical 0件release gateは維持しています。今回の例外は単一GHSA、期限、週次再確認、即時解除条件、恒久対応を正式文書で拘束するもので、一般的なdevDependency脆弱性を許容しません。
+
+本feature branchはまだ`main`へ統合しておらず、Productionへ反映していません。Production DBへ接続せず、Migration 0006は未適用で、Neon、Vercel設定・環境変数、Google Cloud / OAuthも変更していません。例外文書を含む新しい完全HEADは、全ローカル検証、独立レビュー、exact Preview、Current Production不変確認の合格後にだけrelease candidateとして確定します。その次工程で、release candidateを基準にProduction release可否を別途判定します。
 
 ## 実装済み機能
 
@@ -291,6 +312,6 @@ Production DB接続復旧と第1回UI改修は完了しています。通常のV
 
 ## 次の作業
 
-次工程は、限定規則差分の独立レビューとmain統合後、認証済みProduction主要機能スモークを再実行することです。スモークは現時点では未実施です。
+次工程は、承認済み期限付き例外を含むrelease candidate確定後、Production release手順を独立作成・監査し、main統合とProduction releaseの可否を別途判定することです。Productionスモークは現時点では未実施です。
 
 この文書同期branchの作成・commit・pushはProduction操作と分離します。レビュー完了までは `main` へ統合・pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
