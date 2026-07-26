@@ -1,23 +1,73 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { createServer } from "node:net";
+import { spawnSync } from "node:child_process";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { createServer, Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import EmbeddedPostgres from "embedded-postgres";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
+
+import {
+  FORBIDDEN_ENVIRONMENT_NAME,
+  isSafeHarnessTemporaryPath,
+  sanitizeDiagnostic,
+} from "./usage-migration-harness-safety.mjs";
+
 const repositoryRoot = process.cwd();
-const embeddedEntry = process.env.ACTUSTUBE_EMBEDDED_POSTGRES_ENTRY;
+const workerMode = process.argv[2];
+const requestedDisposableRoot = process.argv[3];
+const ownershipNonce = process.argv[4];
+const intentionalCleanupFailure =
+  workerMode === "--actustube-cleanup-failure-worker";
+const intentionalParentTimeout =
+  workerMode === "--actustube-parent-timeout-worker";
 
 if (
-  process.env.ACTUSTUBE_DISPOSABLE_POSTGRES !== "1" ||
-  !embeddedEntry ||
-  !isAbsolute(embeddedEntry)
+  process.argv.length !== 5 ||
+  ![
+    "--actustube-disposable-worker",
+    "--actustube-cleanup-failure-worker",
+    "--actustube-parent-timeout-worker",
+  ].includes(workerMode)
 ) {
-  console.error({
-    success: false,
-    errorCode: "DISPOSABLE_POSTGRES_NOT_CONFIGURED",
-  });
+  console.error(
+    JSON.stringify({
+      success: false,
+      errorCode: "DISPOSABLE_POSTGRES_WORKER_REQUIRED",
+    })
+  );
+  process.exit(1);
+}
+
+if (process.platform !== "win32") {
+  console.error(
+    JSON.stringify({
+      success: false,
+      errorCode: "WINDOWS_BIND_VERIFICATION_REQUIRED",
+    })
+  );
+  process.exit(1);
+}
+
+const inheritedForbiddenEnvironment = Object.keys(process.env).filter((key) =>
+  FORBIDDEN_ENVIRONMENT_NAME.test(key)
+);
+if (inheritedForbiddenEnvironment.length > 0) {
+  console.error(
+    JSON.stringify({
+      success: false,
+      errorCode: "FORBIDDEN_PARENT_ENVIRONMENT",
+    })
+  );
   process.exit(1);
 }
 
@@ -34,6 +84,8 @@ const migrationFiles = Array.from(
       "0006_usage_status_plan_snapshot.sql",
     ][index]
 ).map((file) => join(repositoryRoot, "drizzle", file));
+const fullMigrationDirectory = join(repositoryRoot, "drizzle");
+const migrationJournal = join(fullMigrationDirectory, "meta", "_journal.json");
 
 const role = {
   legacyOwner: "fixture_legacy_owner",
@@ -70,12 +122,29 @@ async function findFreePort() {
   });
 }
 
-const databaseDirectory = await mkdtemp(join(tmpdir(), "actustube-pg-"));
+const operatingSystemTemporaryRoot = tmpdir();
+const disposableRoot = resolve(requestedDisposableRoot);
+assert.equal(
+  isSafeHarnessTemporaryPath(disposableRoot, operatingSystemTemporaryRoot),
+  true
+);
+assert.equal(
+  await readFile(join(disposableRoot, ".actustube-harness-owner"), "utf8"),
+  ownershipNonce
+);
+
+if (intentionalParentTimeout) {
+  await new Promise(() => {
+    setInterval(() => undefined, 1_000);
+  });
+}
+
+process.env.TEMP = disposableRoot;
+process.env.TMP = disposableRoot;
+const databaseDirectory = join(disposableRoot, "database");
+const baselineMigrationDirectory = join(disposableRoot, "migration-0005");
 const adminPassword = randomUUID();
 const port = await findFreePort();
-const { default: EmbeddedPostgres } = await import(
-  pathToFileURL(embeddedEntry).href
-);
 const postgres = new EmbeddedPostgres({
   databaseDir: databaseDirectory,
   user: "fixture_admin",
@@ -88,6 +157,122 @@ const postgres = new EmbeddedPostgres({
   onLog: () => undefined,
   onError: () => undefined,
 });
+
+const originalSocketConnect = Socket.prototype.connect;
+let externalDatabaseConnections = 0;
+let loopbackDatabaseConnections = 0;
+Socket.prototype.connect = function guardedConnect(...args) {
+  const first = args[0];
+  let host;
+  let localSocket = false;
+  if (first && typeof first === "object") {
+    localSocket = typeof first.path === "string";
+    host = first.host;
+  } else if (typeof first === "number") {
+    host = typeof args[1] === "string" ? args[1] : undefined;
+  } else if (typeof first === "string") {
+    localSocket = true;
+  }
+
+  if (!localSocket && host !== "127.0.0.1" && host !== "::1") {
+    externalDatabaseConnections += 1;
+    throw new Error("NON_LOOPBACK_DATABASE_CONNECTION_BLOCKED");
+  }
+  loopbackDatabaseConnections += 1;
+  return originalSocketConnect.apply(this, args);
+};
+
+async function createBaselineMigrationDirectory() {
+  const metadataDirectory = join(baselineMigrationDirectory, "meta");
+  await mkdir(metadataDirectory, { recursive: true });
+  await Promise.all(
+    migrationFiles
+      .slice(0, 6)
+      .map((file) => copyFile(file, join(baselineMigrationDirectory, file.split(/[\\/]/).at(-1))))
+  );
+  const journal = JSON.parse(await readFile(migrationJournal, "utf8"));
+  await writeFile(
+    join(metadataDirectory, "_journal.json"),
+    `${JSON.stringify({ ...journal, entries: journal.entries.slice(0, 6) }, null, 2)}\n`,
+    "utf8"
+  );
+}
+
+function processExists(processId) {
+  if (!Number.isSafeInteger(processId) || processId <= 0) return false;
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(processId) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (!processExists(processId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return !processExists(processId);
+}
+
+async function verifyBoundPostgresProcess() {
+  const postmasterPid = Number(
+    (await readFile(join(databaseDirectory, "postmaster.pid"), "utf8"))
+      .split(/\r?\n/)[0]
+      .trim()
+  );
+  assert.equal(processExists(postmasterPid), true);
+
+  if (process.platform === "win32") {
+    const processResult = spawnSync(
+      "tasklist.exe",
+      ["/FI", `PID eq ${postmasterPid}`, "/FO", "CSV", "/NH"],
+      {
+        encoding: "utf8",
+        shell: false,
+        timeout: 15_000,
+        windowsHide: true,
+      }
+    );
+    assert.equal(processResult.status, 0);
+    assert.match(processResult.stdout, /"postgres\.exe"/i);
+
+    const networkResult = spawnSync("netstat.exe", ["-ano", "-p", "TCP"], {
+      encoding: "utf8",
+      shell: false,
+      timeout: 15_000,
+      windowsHide: true,
+    });
+    assert.equal(networkResult.status, 0);
+    const listeningRows = networkResult.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim().split(/\s+/))
+      .filter(
+        (fields) =>
+          fields.length >= 5 &&
+          fields[0].toUpperCase() === "TCP" &&
+          fields[1].endsWith(`:${port}`) &&
+          fields[3].toUpperCase() === "LISTENING"
+      );
+    assert.ok(listeningRows.length > 0);
+    assert.equal(
+      listeningRows.every(
+        (fields) =>
+          fields[1] === `127.0.0.1:${port}` &&
+          Number(fields.at(-1)) === postmasterPid
+      ),
+      true
+    );
+  }
+
+  return {
+    processId: postmasterPid,
+    bind_address_is_loopback: true,
+    bound_process_is_expected_postgres: true,
+  };
+}
 
 async function withClient(database, operation) {
   const client = postgres.getPgClient(database, "127.0.0.1");
@@ -109,24 +294,17 @@ async function scalar(database, text, values = []) {
   return row ? Object.values(row)[0] : undefined;
 }
 
-async function applyFiles(database, files, executionRole) {
-  const sqlFiles = await Promise.all(
-    files.map((file) => readFile(file, "utf8"))
-  );
-
+async function applyMigrations(database, migrationsFolder, executionRole) {
   await withClient(database, async (client) => {
-    await client.query("BEGIN");
     try {
       if (executionRole) {
         await client.query(`SET ROLE ${quoteIdentifier(executionRole)}`);
       }
-      for (const sqlText of sqlFiles) {
-        await client.query(sqlText);
+      await migrate(drizzle(client), { migrationsFolder });
+    } finally {
+      if (executionRole) {
+        await client.query("RESET ROLE");
       }
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
     }
   });
 }
@@ -139,7 +317,14 @@ async function expectFailure(operation, expectedCode) {
     failure = error;
   }
   assert.ok(failure, "Expected PostgreSQL operation to fail.");
-  if (expectedCode) assert.equal(failure.code, expectedCode);
+  if (expectedCode) {
+    const failureCode =
+      failure?.code ??
+      (failure?.cause && typeof failure.cause === "object"
+        ? failure.cause.code
+        : undefined);
+    assert.equal(failureCode, expectedCode);
+  }
 }
 
 async function createRoles() {
@@ -169,12 +354,22 @@ async function configureRoleFixture(database, { publicOnly = false } = {}) {
 
   await execute(
     database,
+    `GRANT CREATE ON DATABASE ${quoteIdentifier(database)}
+     TO ${quoteIdentifier(role.migrationExecutor)}`
+  );
+  await execute(
+    database,
     `
       GRANT USAGE ON SCHEMA public TO ${runtimeRoles};
       GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${runtimeRoles};
       GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${runtimeRoles};
       GRANT USAGE, CREATE ON SCHEMA public TO ${quoteIdentifier(role.legacyOwner)};
       GRANT USAGE, CREATE ON SCHEMA public TO ${quoteIdentifier(role.migrationExecutor)};
+      GRANT USAGE, CREATE ON SCHEMA drizzle TO ${quoteIdentifier(role.migrationExecutor)};
+      GRANT SELECT, INSERT ON TABLE drizzle.__drizzle_migrations
+        TO ${quoteIdentifier(role.migrationExecutor)};
+      GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA drizzle
+        TO ${quoteIdentifier(role.migrationExecutor)};
       GRANT USAGE ON TYPE public.usage_metric, public.user_status
         TO ${quoteIdentifier(role.migrationExecutor)};
       ALTER FUNCTION public.reserve_usage_limits(
@@ -869,10 +1064,24 @@ async function verifyOldMigrationCompatibility(database) {
 }
 
 let results;
+let postgresStarted = false;
+let postgresProcessId;
 let verificationStep = "initialize";
 try {
+  await createBaselineMigrationDirectory();
   await postgres.initialise();
   await postgres.start();
+  postgresStarted = true;
+  verificationStep = "runtime-isolation";
+  const runtimeIsolation = await verifyBoundPostgresProcess();
+  postgresProcessId = runtimeIsolation.processId;
+
+  if (intentionalCleanupFailure) {
+    throw Object.assign(new Error("Intentional cleanup verification failure."), {
+      code: "INTENTIONAL_CLEANUP_FAILURE",
+    });
+  }
+
   verificationStep = "create-roles";
   await createRoles();
 
@@ -882,11 +1091,14 @@ try {
     "fixture_public",
     "fixture_old",
   ]) {
-    await postgres.createDatabase(database);
+    await execute(
+      "postgres",
+      `CREATE DATABASE ${quoteIdentifier(database)}`
+    );
   }
 
   verificationStep = "fresh-migration";
-  await applyFiles("fixture_fresh", migrationFiles);
+  await applyMigrations("fixture_fresh", fullMigrationDirectory);
   assert.equal(
     await catalogBoolean(
       "fixture_fresh",
@@ -898,7 +1110,7 @@ try {
   );
 
   verificationStep = "upgrade-baseline";
-  await applyFiles("fixture_upgrade", migrationFiles.slice(0, 6));
+  await applyMigrations("fixture_upgrade", baselineMigrationDirectory);
   await configureRoleFixture("fixture_upgrade");
   const legacyAclHash = await scalar(
     "fixture_upgrade",
@@ -907,9 +1119,9 @@ try {
      WHERE oid = to_regprocedure('${legacySignature}')`
   );
   verificationStep = "upgrade-migration";
-  await applyFiles(
+  await applyMigrations(
     "fixture_upgrade",
-    [migrationFiles[6]],
+    fullMigrationDirectory,
     role.migrationExecutor
   );
 
@@ -921,14 +1133,14 @@ try {
   const lifecycle = await verifyReservationLifecycle("fixture_upgrade");
 
   verificationStep = "public-baseline";
-  await applyFiles("fixture_public", migrationFiles.slice(0, 6));
+  await applyMigrations("fixture_public", baselineMigrationDirectory);
   await configureRoleFixture("fixture_public", { publicOnly: true });
   verificationStep = "public-fail-closed";
   await expectFailure(
     () =>
-      applyFiles(
+      applyMigrations(
         "fixture_public",
-        [migrationFiles[6]],
+        fullMigrationDirectory,
         role.migrationExecutor
       ),
     "P0001"
@@ -954,11 +1166,21 @@ try {
   );
 
   verificationStep = "old-migration";
-  await applyFiles("fixture_old", migrationFiles.slice(0, 6));
+  await applyMigrations("fixture_old", baselineMigrationDirectory);
   const oldMigration = await verifyOldMigrationCompatibility("fixture_old");
+
+  assert.equal(externalDatabaseConnections, 0);
+  assert.ok(loopbackDatabaseConnections > 0);
 
   results = {
     success: true,
+    bind_address_is_loopback: runtimeIsolation.bind_address_is_loopback,
+    bound_process_is_expected_postgres:
+      runtimeIsolation.bound_process_is_expected_postgres,
+    external_database_connections: externalDatabaseConnections,
+    parent_database_environment_inherited: false,
+    saved_connection_strings_used: false,
+    shell_execution_used: false,
     migration_fresh: true,
     migration_0005_to_0006: true,
     public_dependency_fails_closed: true,
@@ -968,42 +1190,98 @@ try {
     ...oldMigration,
   };
 } catch (error) {
-  results = {
-    success: false,
-    errorName: error instanceof Error ? error.name : "UnknownError",
-    verificationStep,
-    diagnosticMessage:
-      error instanceof Error
-        ? error.message
-            .replaceAll(/fixture_[a-z0-9_]+/g, "[fixture-role]")
-            .slice(0, 240)
-        : null,
-    errorCode:
-      error && typeof error === "object" && "code" in error
-        ? String(error.code).slice(0, 16)
-        : null,
-  };
-  process.exitCode = 1;
-} finally {
-  try {
-    await postgres.stop();
-  } catch {
-    process.exitCode = 1;
-  }
-  try {
-    await rm(databaseDirectory, {
-      recursive: true,
-      force: true,
-      maxRetries: 20,
-      retryDelay: 250,
-    });
-  } catch {
-    process.exitCode = 1;
+  if (
+    intentionalCleanupFailure &&
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    error.code === "INTENTIONAL_CLEANUP_FAILURE"
+  ) {
     results = {
-      ...results,
-      disposable_cleanup_complete: false,
+      success: true,
+      intentional_failure_triggered: true,
+      external_database_connections: externalDatabaseConnections,
+      parent_database_environment_inherited: false,
+      saved_connection_strings_used: false,
+      shell_execution_used: false,
     };
+  } else {
+    results = {
+      success: false,
+      errorName: error instanceof Error ? error.name : "UnknownError",
+      verificationStep,
+      diagnosticMessage:
+        error instanceof Error
+          ? sanitizeDiagnostic(error.message).replaceAll(
+              /fixture_[a-z0-9_]+/g,
+              "[fixture-role]"
+            )
+          : null,
+      errorCode:
+        error && typeof error === "object" && "code" in error
+          ? String(error.code).slice(0, 48)
+          : null,
+    };
+    process.exitCode = 1;
   }
+} finally {
+  let stopSucceeded = true;
+  try {
+    if (postgresStarted) await postgres.stop();
+  } catch {
+    stopSucceeded = false;
+    process.exitCode = 1;
+  }
+
+  let postgresExited = postgresProcessId
+    ? await waitForProcessExit(postgresProcessId)
+    : true;
+  if (!postgresExited && process.platform === "win32" && postgresProcessId) {
+    spawnSync(
+      "taskkill.exe",
+      ["/PID", String(postgresProcessId), "/T", "/F"],
+      {
+        encoding: "utf8",
+        shell: false,
+        stdio: "ignore",
+        timeout: 15_000,
+        windowsHide: true,
+      }
+    );
+    postgresExited = await waitForProcessExit(postgresProcessId);
+  }
+
+  Socket.prototype.connect = originalSocketConnect;
+  let dataRemoved = false;
+  try {
+    if (postgresExited) {
+      assert.equal(
+        isSafeHarnessTemporaryPath(
+          disposableRoot,
+          operatingSystemTemporaryRoot
+        ),
+        true
+      );
+      await rm(disposableRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 20,
+        retryDelay: 250,
+      });
+      dataRemoved = true;
+    }
+  } catch {
+    process.exitCode = 1;
+  }
+
+  const cleanupComplete = stopSucceeded && postgresExited && dataRemoved;
+  results = {
+    ...results,
+    disposable_cleanup_complete: cleanupComplete,
+    postgres_process_residual: !postgresExited,
+    disposable_data_residual: !dataRemoved,
+  };
+  if (!cleanupComplete) process.exitCode = 1;
 }
 
-console.log(results);
+console.log(JSON.stringify(results));
