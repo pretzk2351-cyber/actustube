@@ -63,6 +63,92 @@ Production公開とDB接続を安全に保護するための手順と停止条�
 
 1条件でも満たさない場合は通常基準へ戻り、High / Criticalが0件でなければ停止します。この限定例外はmain統合、Production deployment、DB接続、Migration、Neon、Vercel設定・環境変数、Google Cloud / OAuth、Productionスモークを承認しません。Production工程は別計画、最新状態の確認、独立監査、明示許可を必要とします。
 
+## 明示承認済みProduction Migration限定手順
+
+通常時の任意のNeon branch作成、Production DBのschema・関数・ACL変更、未承認Migration、手動SQL、既存Migrationの変更・再適用は引き続き禁止します。以下は一般的権限、恒常的許可、Codexの自律判断権限、または将来Migrationの包括承認ではありません。文書整合化、review、commit、PreviewだけでもProduction releaseの承認にはなりません。
+
+この限定手順は、各releaseについてproject ownerが別の実行指示または承認記録で対象release candidate branch、完全SHA、対象Migration、承認範囲、検証結果を固定し、以下の全条件をAND条件として満たす場合に限り発動できます。1項目でもFAILまたはNOT VERIFIEDなら発動せず停止し、条件を類推、拡張、または将来releaseへ持ち越してはいけません。
+
+### 発動条件
+
+1. project ownerが対象Production releaseを明示承認している。
+2. 対象release candidateのbranchと完全SHAが固定され、local・remote・upstreamが同期し、worktreeがcleanである。
+3. 適用対象Migrationのrepository pathとjournal entryが完全に特定され、既存Migrationに差分がない。
+4. 必読文書、Migration SQL、関連コード、fresh / upgrade検証、旧Productionコード互換性が確認済みであり、Production Migrationは事前に別工程で明示承認されたbackupまたはchild branchでリハーサル合格が記録されている。
+5. Migration SQLが独立レビュー済みで、必須の独立レビューにP0 / P1 / P2 / P3 / NOT VERIFIEDがない。
+6. 通常のHigh / Critical 0件release gate、または「依存関係セキュリティrelease gate」に記載した単一の承認済み期限付き例外の全条件を満たす。期限付き例外を他の脆弱性へ拡張しない。
+7. Current Productionのsource、READY / Current、主要HTTP、runtime error / fatal / 5xxを読み取り専用で確認する。
+8. 対象Production branchとdatabaseを推測せず一意に特定し、Migration前preflightが全項目合格する。
+9. Migration前に、承認対象と同じProduction sourceのsnapshotまたはbackupを最大1件だけ作成し、利用可能状態を読み取り専用で確認する。
+10. Migrationにはpooled接続ではなく、同じProduction branch / databaseへのdirect接続を使用する。
+11. pending Migrationが承認対象だけであり、対象Migrationが未適用である。
+12. repositoryに定義された正式Migration commandだけを使用し、commandの起動を最大1回に限定する。
+13. Migration後の履歴、schema、関数、owner、ACL、security mode、search path、主要aggregate件数を読み取り専用で確認する。
+14. Migration異常時に再実行、別command、手動修正、自動rollback、restoreを行わない。
+15. Migration後DB検証が全項目合格し、direct接続secretをprocess環境から削除した後だけGit統合工程へ進む。
+
+### Production backup / snapshot限定例外
+
+任意のbranch作成と開発目的のProduction複製は禁止します。明示承認されたProduction Migrationの直前に限り、次の優先順位でbackupを最大1件だけ作成できます。
+
+1. 対象Production branchで安全に利用できるNeon snapshot
+2. snapshotを利用できない場合だけ、対象Production branchの現在時点から作成するbackup branch
+
+作成前にsource Production branch、database系統、現在時点、名前衝突の不存在、今回の作成数0件を一意に確認します。Migration直前の復旧用backupはMigration検証環境またはテスト環境として使用せず、backup側へMigrationを適用せず、schema、data、computeを変更しません。AGENTS.mdが要求するリハーサルは、これとは分離された、別工程で明示承認済みのbackupまたはchild branchで完了していなければなりません。この記載は新しいrehearsal branch作成を自動承認しません。
+
+「最大1件」と「作成試行最大1回」を別々に管理します。作成操作を開始した時点で試行1回と数え、失敗、timeout、接続切断、応答不明、結果不明でも2件目を作成せず再試行しません。既存backup一覧と状態を読み取り専用で確認し、作成結果、source、利用可能状態を一意に確定できない場合は停止します。
+
+backup branchの任意作成・削除を許可したと解釈してはいけません。rollbackまたはrestoreには、対象、目的、影響、手順を固定した別のproject owner明示承認が必要であり、Migration承認から推定しません。
+
+### version管理済み正式Migration限定例外
+
+Production DBへの任意変更、手作業のSQL修正、未レビューSQL、未承認Migration、Migration外のschema・関数・ACL変更は禁止します。明示承認されたversion管理済みの正式Migrationだけを、全release gate合格時に限り適用できます。正式Migrationであることだけでは許可になりません。
+
+- `package.json`に定義された正式commandを使用し、現在の構成では`npm run db:migrate`から`drizzle-kit migrate`を実行する。
+- `drizzle.config.ts`が参照する`DIRECT_DATABASE_URL`へ、保存・表示しないdirect接続secretをprocess環境だけで渡す。pooled接続、host置換、接続先の推測は禁止する。
+- 現在固定されたDrizzle実装ではpending Migrationの各statementとMigration履歴行を同じtransaction内で実行する。この境界をrelease前に再確認し、手動transactionや補助SQLを追加しない。
+- Migration commandを起動した時点で適用試行1回と数え、最大1回とする。
+- Migration SQLに定義された変更以外を加えず、実行時編集、既存Migration変更、再適用、手動追加SQL、部分修正、補修SQLを行わない。
+- owner名とrole名は期待値一致のbooleanだけを記録し、個別ユーザーデータを取得しない。
+
+Migration 0006を対象とするreleaseでは、対象を`drizzle/0006_usage_status_plan_snapshot.sql`へ固定します。このMigrationは4つのversion付き利用枠関数を追加し、旧`reserve_usage_limits`を互換wrapperへ置換し、ACL preflight後に旧関数のowner、ACL、security modeをversion付き関数へ継承して、固定`search_path`とPUBLIC実行権限なしを検証します。変更可能範囲は同SQLに定義された関数定義、互換wrapper、owner、ACL、security mode、search pathだけです。既存Migration 0000〜0005を変更または再適用しません。
+
+Migration 0006のpreflightでは履歴が0000〜0005の6件、pendingが0006だけ、0006が未適用であることを確認します。適用後は履歴が0000〜0006の7件となり、0006が1回だけ記録され、version付き関数と互換wrapperの定義・権限がMigration SQLおよび関連検証scriptと一致することを確認します。旧Productionコードが互換wrapperを通して動作可能であることもrelease gateに残します。
+
+### 失敗・結果不明時の停止
+
+command非0終了、timeout、接続切断、terminal異常終了、履歴とschemaの部分更新、または完了状態を取得できない場合は失敗または結果不明として扱います。Migrationを再実行せず、別commandで試さず、SQLを変更せず、手動部分修正、自動rollback、backup restoreを行いません。
+
+許可された安全なread-only接続でMigration履歴とschemaを確認し、確認できた現在状態だけを記録して停止します。read-only確認でも接続先または権限を一意に確定できない場合は、それ以上操作しません。rollbackまたはrestoreには別のproject owner明示承認が必要です。
+
+### Production releaseの順序
+
+承認済みProduction Migrationを含むreleaseは、次の順序を変更せず実行します。
+
+1. 対象releaseのproject owner明示承認
+2. release candidate branch、完全SHA、対象Migration、承認範囲の固定
+3. 必読文書、期限付き例外、release gateの確認
+4. release candidate、Migration SQL、fresh / upgrade Migration、旧コード互換性の検証と独立レビュー
+5. Current Productionの読み取り専用確認
+6. Production snapshotまたはbackupを最大1件作成し、利用可能状態を確認
+7. 同じProduction branch / databaseへのdirect接続を安全に取得
+8. Production Migration preflight
+9. 承認対象Migrationを正式commandで最大1回適用
+10. Migration後の読み取り専用DB検証
+11. direct接続secretをprocess環境から削除
+12. Git統合可否とremote状態の最終確認
+13. project ownerが承認した方式でmainへ統合
+14. 許可されたmainへの通常push
+15. main pushで自動作成されるProduction deploymentだけを確認
+16. 承認範囲内のProductionスモーク
+17. 完了報告または停止報告
+
+backup前にMigrationを適用せず、preflight合格前にMigration commandを起動せず、Migration後DB検証合格前にmainへ進みません。main push前にProduction deploymentを作成せず、manual Deploy、Redeploy、Promote、alias変更、空commitを使用しません。direct接続secretを保持したままGitまたはVercel工程へ進みません。
+
+### 秘密情報・個人情報
+
+接続文字列、Environment Variablesの値、host、database名、role名、username、password、token、Cookieを画面、terminal、log、Git、文書、報告へ表示または保存しません。preflightと事後検証はboolean、schema metadata、個人情報を含まないaggregate件数に限定し、個人情報、本文、OAuth情報、個別レコードを取得しません。秘密情報を表示しなければ続行できない場合は停止します。
+
 ## docs-onlyスナップショット差の限定判定
 
 Project Statusや本RunbookのGit / deployment識別子が現在の実状態と異なる場合も、一般的な不一致として停止する前に、次の手順を**すべて読み取り専用**で確認します。
@@ -186,11 +272,11 @@ Productionでは検証専用データの作成や、その後片付けを前提�
 - 作業開始前に意図しないGit差分が存在
 
 - Endpoint ID不一致
-- Migration履歴が6件ではない
-- 0005が未適用、複数回記録、またはjournalの順序・timestampと不一致
+- Migration 0006適用前のpreflightでMigration履歴が0000〜0005の6件ではない、または適用後に0000〜0006の7件・0006の記録1件を確認できない
+- 0005が未適用、複数回記録、またはjournalの順序・timestampと不一致。Migration 0006を承認対象とする場合は0006の順序・timestampも同様に確認する
 - 既存データ件数が想定と不一致
-- バックアップブランチが存在しない、またはReadyではない
-- DB変更を伴う将来作業で、必要な新規バックアップの作成またはReady確認に失敗
+- 承認済みProduction Migrationで必要なsnapshotまたはbackupが一意に存在しない、利用可能状態でない、またはsourceを確認できない
+- DB変更を伴う将来作業で、必要な新規snapshotまたはbackupの作成試行、利用可能状態、source確認に失敗または結果不明
 - Migrationファイルに改行コード差では説明できないSQL本文の変更がある
 - 必要なテーブル、enum、Index、外部キー、関数、セキュリティ属性が不足
 - 既存データ件数が変化
@@ -236,8 +322,8 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - Productionへの未検証SQLの直接実行
 - 0000〜0005の再適用
 - Migrationの場当たり的な編集
-- DB関数、schema、権限の変更
-- Neon branchの作成・削除
+- DB関数、schema、権限の任意変更。上記の全条件を満たす明示承認済みversion管理Migrationに定義された変更だけを限定例外とする
+- Neon branchの任意作成・削除。上記の全条件を満たす明示承認済みProduction Migration直前のbackup branch最大1件・作成試行最大1回だけを限定例外とし、削除は許可しない
 - Vercel環境変数の変更。終了済みの今回限定例外は再利用しない
 - Google Cloud設定の変更
 - 認証検証の緩和
@@ -268,4 +354,4 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - 今回限定の環境変数変更例外を終了し、通常の変更禁止規則を全面再適用
 - rollback不要
 
-第1回UI改修は `7ef73ed` としてmain統合・Production公開済みです。次工程は、限定規則差分の独立レビューとmain統合後、認証済みProduction主要機能スモークを再実行することです。この判定までは文書branchをmainへ統合せず、Production、DB、Migration、Vercel設定・環境変数を変更しません。
+第1回UI改修は `7ef73ed` としてmain統合・Production公開済みです。Production Migration限定手順の文書整合化、独立レビュー、文書commit、release candidate branchへのpush、Preview確認はProduction releaseと分離します。新しいrelease candidate確定後も、対象branch、完全SHA、対象Migration、承認範囲を固定した別のproject owner明示承認があるまでmain、Production、DB、Migration、Neon、Vercel設定・環境変数を変更しません。

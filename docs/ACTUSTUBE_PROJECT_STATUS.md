@@ -62,6 +62,14 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 
 本feature branchはまだ`main`へ統合しておらず、Productionへ反映していません。Production DBへ接続せず、Migration 0006は未適用で、Neon、Vercel設定・環境変数、Google Cloud / OAuthも変更していません。例外文書を含む新しい完全HEADは、全ローカル検証、独立レビュー、exact Preview、Current Production不変確認の合格後にだけrelease candidateとして確定します。その次工程で、release candidateを基準にProduction release可否を別途判定します。
 
+## Production release停止とRunbook整合化
+
+Migration 0006を含むProduction releaseは、RunbookのNeon branch作成全面禁止およびDB関数・schema・権限変更全面禁止と、承認されたbackup・正式Migration手順が矛盾していたため、必読文書確認で安全に停止しました。停止判断後、Production release、Production DB接続、Migration command、Neon backup / snapshot、main統合、Production deploymentは開始していません。
+
+Runbookは、通常時の任意branch作成、任意DB変更、未承認Migration、既存Migration変更・再適用を引き続き禁止し、各releaseでproject ownerがrelease candidate branch、完全SHA、対象Migration、承認範囲を固定し、全release gateを満たした場合だけ発動できる狭い例外へ整合化します。backupはsnapshot優先・最大1件・作成試行最大1回、version管理済み正式Migrationはcommand起動最大1回とし、失敗または結果不明時の再実行、手動修正、自動rollback、restoreを許可しません。
+
+この文書整合化、review、commit、PreviewはProduction releaseの承認ではありません。Migration 0006はProduction未適用のままです。新しいrelease candidate確定後、対象branch、完全SHA、Migration 0006、承認範囲を固定した別のproject owner明示承認を受け、Production手順を最初から再開します。
+
 ## 実装済み機能
 
 - Googleログイン・ログアウト
@@ -292,8 +300,8 @@ Production DB接続復旧に関する完了済み履歴：
 
 ## 現在残っている作業
 
-1. docs-only状態差の限定規則差分を独立レビューし、mainへのfast-forward統合可否を判定する
-2. 統合後、所有者による認証済みProduction主要機能スモークを、費用と利用枠を考慮して最小回数で実施する
+1. Runbook整合化後の新しいrelease candidateを基準に、対象branch、完全SHA、Migration 0006、承認範囲を固定した別のproject owner明示承認を受け、Production release手順を最初から再開する
+2. Production releaseが全gateに合格した場合だけ、所有者による認証済みProduction主要機能スモークを、費用と利用枠を考慮して最小回数で実施する
 3. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
 4. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
 
