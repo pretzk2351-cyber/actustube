@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { SectionIntro, StatusPanel } from "@/app/components/ui-foundation";
 import type {
@@ -22,6 +22,9 @@ type Props = {
   currentAnalysisRunId: string | null;
   suggestedAction: string;
   refreshKey: number;
+  onHistoryCountChange?: (count: number | null) => void;
+  initialHistory?: WeeklyCycleHistoryResponse | null;
+  onHistoryChange?: (history: WeeklyCycleHistoryResponse) => void;
 };
 
 const statusLabels = {
@@ -87,6 +90,9 @@ export function WeeklyImprovementCycle({
   currentAnalysisRunId,
   suggestedAction,
   refreshKey,
+  onHistoryCountChange,
+  initialHistory,
+  onHistoryChange,
 }: Props) {
   const [items, setItems] = useState<AnalysisHistoryItem[]>([]);
   const [plannedAction, setPlannedAction] =
@@ -100,6 +106,8 @@ export function WeeklyImprovementCycle({
   const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [resultNote, setResultNote] = useState("");
+  const initialHistoryApplied = useRef(false);
+  const initialHistoryRef = useRef(initialHistory);
   const hasActionForCurrentAnalysis = currentAnalysisHasAction(
     items,
     currentAnalysisRunId
@@ -120,14 +128,18 @@ export function WeeklyImprovementCycle({
       });
       const data: unknown = await response.json().catch(() => null);
       if (!response.ok || !isHistoryResponse(data)) {
+        onHistoryCountChange?.(null);
         setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return false;
       }
       setItems(data.items);
+      onHistoryCountChange?.(data.items.length);
       setPlannedAction(data.plannedAction);
       setNextCursor(data.nextCursor);
+      onHistoryChange?.(data);
       return true;
     } catch {
+      onHistoryCountChange?.(null);
       setNotice(
         createWeeklyCycleNotice(
           "error",
@@ -138,11 +150,23 @@ export function WeeklyImprovementCycle({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onHistoryChange, onHistoryCountChange]);
 
   useEffect(() => {
+    const seededHistory = initialHistoryRef.current;
+    if (seededHistory) {
+      if (!initialHistoryApplied.current) {
+        initialHistoryApplied.current = true;
+        setItems(seededHistory.items);
+        setPlannedAction(seededHistory.plannedAction);
+        setNextCursor(seededHistory.nextCursor);
+        setLoading(false);
+        onHistoryCountChange?.(seededHistory.items.length);
+      }
+      return;
+    }
     void loadFirstPage();
-  }, [loadFirstPage, refreshKey]);
+  }, [loadFirstPage, onHistoryCountChange, refreshKey]);
 
   useEffect(() => {
     if (!plannedAction) return;
