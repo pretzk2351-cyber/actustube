@@ -1,8 +1,8 @@
 # ActusTube Project Status
 
-最終更新日：2026-07-26
+最終更新日：2026-07-27
 
-> 2026-07-23 02:10:39 JSTの読み取り専用確認に基づく状態スナップショットです。`main` / `origin/main` は `e036d34db3939a79073fcb05db9c27acda06d0e9` で同期し、Productionは `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`（`main@e036d34db3939a79073fcb05db9c27acda06d0e9`）をREADY / Currentで配信しています。トップ・主要CSS・主要JavaScriptはHTTP 200です。アプリコードの直近基準は `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` であり、そこから現在の `main` までの変更は承認済み文書ファイルだけです。認証済みProduction主要機能スモークは未実施です。この文書自体の後続docs-only commitやdeploymentによりGit / Production識別子が進む可能性があり、その場合もAGENTS / Runbookの全条件を満たすdocs-only限定例外だけが適用候補です。Production DB接続復旧は完了済みで、通常の環境変数変更禁止規則が引き続き適用されています。
+> 2026-07-27 JSTの読み取り専用確認に基づく状態スナップショットです。release candidateは`main`へfast-forward統合済みで、`main` / `origin/main` は `08ec587f7a242b40ada53a0eb69acb33ebb9253b` で同期しています。Current Productionは同じsource commitをREADY / Currentで配信し、トップはHTTP 200です。Migration 0006は正式Production branchへexact 1回適用済みです。一方、Production runtimeの`DATABASE_URL`がschemaの空の別branchを指しているため、`/api/usage/status`と`/api/weekly-cycle`はPersistence 500です。接続先修正、Redeploy、復旧確認はまだ実施していません。
 
 ## プロジェクト概要
 
@@ -43,7 +43,7 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 
 ## 承認済み期限付きセキュリティ例外
 
-現在のリリース準備feature branchでは、[GHSA-mh99-v99m-4gvg / CVE-2026-14257の正式な期限付き例外](./SECURITY_EXCEPTION_GHSA-MH99-V99M-4GVG.md)がActusTubeプロジェクトオーナーにより明示承認済みです。
+現在のProduction sourceには、[GHSA-mh99-v99m-4gvg / CVE-2026-14257の正式な期限付き例外](./SECURITY_EXCEPTION_GHSA-MH99-V99M-4GVG.md)を含む承認済みrelease candidateが統合されています。
 
 - 対象：`brace-expansion` のdevDependency lint経路にあるGHSA-mh99-v99m-4gvgだけ
 - 承認日：2026-07-26
@@ -60,15 +60,17 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 
 通常のHigh / Critical 0件release gateは維持しています。今回の例外は単一GHSA、期限、週次再確認、即時解除条件、恒久対応を正式文書で拘束するもので、一般的なdevDependency脆弱性を許容しません。
 
-本feature branchはまだ`main`へ統合しておらず、Productionへ反映していません。Production DBへ接続せず、Migration 0006は未適用で、Neon、Vercel設定・環境変数、Google Cloud / OAuthも変更していません。例外文書を含む新しい完全HEADは、全ローカル検証、独立レビュー、exact Preview、Current Production不変確認の合格後にだけrelease candidateとして確定します。その次工程で、release candidateを基準にProduction release可否を別途判定します。
+release candidateの統合、Migration 0006のProduction適用、Migration後postflightは完了しています。期限付き例外のscope、期限、週次再確認、即時解除条件は引き続き正式例外文書を正本とします。本docs-only同期は例外条件や依存関係の評価を変更しません。
 
-## Production release停止とRunbook整合化
+## Migration 0006適用後のProduction状態
 
-Migration 0006を含むProduction releaseは、RunbookのNeon branch作成全面禁止およびDB関数・schema・権限変更全面禁止と、承認されたbackup・正式Migration手順が矛盾していたため、必読文書確認で安全に停止しました。停止判断後、Production release、Production DB接続、Migration command、Neon backup / snapshot、main統合、Production deploymentは開始していません。
-
-Runbookは、通常時の任意branch作成、任意DB変更、未承認Migration、既存Migration変更・再適用を引き続き禁止し、各releaseでproject ownerがrelease candidate branch、完全SHA、対象Migration、承認範囲を固定し、全release gateを満たした場合だけ発動できる狭い例外へ整合化します。backupはsnapshot優先・最大1件・作成試行最大1回、version管理済み正式Migrationはcommand起動最大1回とし、失敗または結果不明時の再実行、手動修正、自動rollback、restoreを許可しません。
-
-この文書整合化、review、commit、PreviewはProduction releaseの承認ではありません。Migration 0006はProduction未適用のままです。新しいrelease candidate確定後、対象branch、完全SHA、Migration 0006、承認範囲を固定した別のproject owner明示承認を受け、Production手順を最初から再開します。
+- Migration履歴は0000〜0006の7件です。
+- Migration 0006は正式Production branchへexact 1回適用済みで、再実行は禁止です。
+- postflightは合格し、schema、function、owner、ACL、PUBLIC権限、security mode、固定search pathは期待状態です。
+- Migration由来の想定外データ件数変化はありません。
+- Migrationリハーサル用child branchとProduction復旧用backup child branchは、変更・削除せずREADYで保持しています。
+- rollbackとrestoreは実施していません。
+- 現在のPersistence 500はMigration対象Production branchの不整合ではなく、Vercel Production runtimeの接続先branch不一致が原因です。
 
 ## 実装済み機能
 
@@ -146,14 +148,15 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 
 ## 検証結果
 
-アプリコード基準 `7ef73ed` のmain統合前後に再実行した確認結果です。`7ef73ed` 以後の `f6014a1` と `e036d34` はdocs-onlyのため、アプリコードと依存関係はこの検証済み内容から変わっていません。
+現在のProduction sourceへ統合されたrelease candidateの検証結果です。期限付きセキュリティ例外の扱いは、本書の「承認済み期限付きセキュリティ例外」と正式例外文書を参照してください。
 
-- 自動テスト：185件成功、4件skip
+- 自動テスト：247件成功、4件skip
 - React act警告：0件
 - ESLint：0エラー、既存の `<img>` 警告1件
 - TypeScript：成功
 - Production build：成功
-- `npm audit`：critical / high / moderate / lowすべて0件
+- Runtime audit：全severity 0件
+- full audit：承認済み単一GHSAによるHigh 9件。例外対象外のHigh / Criticalは0件
 - npm 11.18.0のclean installと `npm ls --depth=0`：extraneous / invalid 0件
 - `sharp`：0.35.3のみ
 - `libvips`：package 1.3.2 / runtime 8.18.3
@@ -168,12 +171,15 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 
 ## Git状態
 
-2026-07-23 02:10:39 JSTに読み取り確認した状態：
+2026-07-27 JSTに読み取り確認した状態：
 
-- `main`：`e036d34db3939a79073fcb05db9c27acda06d0e9`
-- `origin/main`：`e036d34db3939a79073fcb05db9c27acda06d0e9`
+- `main`：`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
+- `origin/main`：`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
 - `main` と `origin/main`：0 / 0で同期済み
 - 作業ツリー：clean
+
+過去の主なProduction関連commit：
+
 - `c6b403e`：週次改善サイクルのrelease candidate
 - `2f79fa7`：Google OAuth callback互換性修正
 - `509bf21`：Production認証障害に合わせた文書同期
@@ -183,22 +189,27 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 - `f6014a1`：正式仕様書v1.0を正本Markdownとして追加したdocs-only commit
 - `e036d34`：Project Status / Production Runbookを同期したdocs-only commit
 
-`7ef73ed` から `e036d34` の変更は、`AGENTS.md`、`docs/ACTUSTUBE_PRODUCT_SPEC.md`、`docs/ACTUSTUBE_PROJECT_STATUS.md`、`docs/PRODUCTION_RELEASE_RUNBOOK.md` の4件だけです。アプリコード、test、package、Migration、Drizzle schema、Vercel設定は変更されていません。正式仕様書v1.0はmain統合済みですが、将来設計を現在の実装済み機能として扱いません。旧状態の `main` `92f834d`、`fix/weekly-action-duplicate-conflict` 未統合、診断ログ未公開、DB資格情報の復旧待ち、`feat/ui-foundation-primary-flow` 未統合は完了済みの履歴です。
+`08ec587f7a242b40ada53a0eb69acb33ebb9253b`には、承認済みrelease candidate、Migration 0006対応コード、期限付き例外文書が含まれ、`main`へfast-forward統合済みです。本docs-only branchはこのSHAを親とし、`main`自体を変更しません。
 
 ## Vercel Production状態
 
-2026-07-23 02:10:39 JSTのProductionスナップショット：
+2026-07-27 JSTのProductionスナップショット：
 
 - Production Branch：`main`
 - Vercel Project：ActusTube
-- commit：`e036d34db3939a79073fcb05db9c27acda06d0e9`
-- deployment：`dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`
+- source commit：`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
 - domain：`https://actustube.vercel.app`
 - 状態：READY / Current
-- トップページ、主要CSS、主要JavaScript：HTTP 200
-- source commit `e036d34` はProject Status / Production Runbook同期のdocs-only commitで、アプリコードは `7ef73ed` の内容から変わっていない
-- `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn` の開始時刻は2026-07-23 01:38:17 JST
-- docs-only統合・自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
+- トップページ：HTTP 200
+- Google認証：成功
+- session：成功
+- 所有チャンネル：1件取得成功
+- `/api/usage/status`：HTTP 500、`UsageStatusPersistenceError`
+- `/api/weekly-cycle`：HTTP 500、`WeeklyCyclePersistenceError`
+- 分析、AI提案、改善項目作成：未実行
+- 根本原因：Production runtimeの`DATABASE_URL`接続先branch不一致
+- `DATABASE_URL`修正、Redeploy、復旧確認：未実施
+- rollback、restore：未実施
 - このdeployment情報は確認時点のスナップショットであり、後続docs-only commitによって識別子が進んでも永続的にCurrentであることを意味しない
 
 Production DB接続復旧に関する完了済み履歴：
@@ -220,92 +231,36 @@ Production DB接続復旧に関する完了済み履歴：
 
 ## Production DB
 
-ローカルの接続設定を秘密情報を表示せず解析し、明示的なread-only transactionでEndpoint IDとDatabaseを再確認しました。
+Migration 0006適用後の正式Production branchを、秘密情報を表示しないread-only postflightで確認済みです。
 
-実Production DB：
+- Migration履歴：0000〜0006の7件
+- Migration 0006：exact 1件。再実行禁止
+- repositoryのjournal、Migration識別情報、適用順序：一致
+- 管理対象table、function、index、constraint：期待状態
+- owner、ACL、PUBLIC権限、security mode、固定`search_path`：期待状態
+- runtime roleの必要権限：正常
+- Migration由来の想定外データ件数変化：なし
+- rollback、restore：未実施
 
-- Neon Project：ActusTube
-- Project ID：`small-night-17748387`
-- Branch name：`development`
-- Branch ID：`br-blue-bonus-aza51iwc`
-- Endpoint ID：`ep-polished-cloud-az8xdsqg`
-- Database：`neondb`
-
-重要：Neon上のブランチ名は `development` ですが、Vercel Productionが実際に接続しているためProduction DBとして扱います。削除、リセット、テスト用途への流用は禁止です。
-
-2026-07-21のProduction DB状態：
-
-- Migration履歴：6件
-- 0000〜0005がjournalの順序どおり適用済み
-- Migration 0005：適用済み。再適用は禁止
-- journalの6つの `when` とDB履歴の `created_at`：すべて一致
-- Drizzleと同じSHA-256計算で、0005は現在のファイルと一致
-- 0000〜0004は現在のWindows作業ツリーのCRLFではhashが異なるが、LFへ正規化した同一SQL本文と一致。SQL内容変更ではなく改行コード差であり、Drizzleは最新の `created_at` とjournalの `when` により適用済みと判断する
-- `analysis_runs`：作成済み、0件
-- `improvement_actions`：作成済み、0件
-- `improvement_action_status`：作成済み（`planned` / `completed` / `skipped`）
-- Migration 0005のIndex・制約・関数：`schema.ts`、Migration SQL、0005 snapshotと一致
-- 2つの確定関数：`SECURITY INVOKER`、固定 `search_path`、PUBLIC実行権限なし
-- `users`：1件
-- `oauth_accounts`：1件
-- `plans`：1件
-- `user_plan_assignments`：1件
-- `user_usage_buckets`：0件
-- `usage_reservation_leases`：0件
-
-実データの内容、ユーザー情報、認証情報、接続情報の秘密部分は記載しません。
-
-管理外テーブル `playing_with_neon` が1つ存在し、40件の行があります。コード、`schema.ts`、Migration、テストから参照されておらず、ActusTube管理オブジェクトとの名前衝突もありません。Neonのサンプルテーブルとしてアプリ管理Schemaの比較対象から除外し、削除・変更・Migrationへの追加は行いません。ActusTube管理対象のSchema driftはありません。
+現在のPersistence 500はこのDBのMigration、schema、権限によるものではありません。正式Production branchでは同じアプリ経路がdirect／pooledとも正常で、Production runtimeだけがschemaの空の別branchへ接続しています。実データ、接続文字列、host、database名、role名、内部識別子は本書へ追加しません。
 
 ## バックアップ兼リハーサルブランチ
 
-- Name：`pre-weekly-mvp-production-backup-20260720`
-- Branch ID：`br-crimson-shadow-azkeq0kc`
-- Endpoint ID：`ep-still-bar-azv826h8`
-- Parent：`br-blue-bonus-aza51iwc`
-- Database：`neondb`
-- 状態：Ready
-- 削除せず保持中
-
-この既存ブランチはMigrationリハーサルに使用済みです。
-
-週次改善サイクルProduction公開前には、当時のProduction DBを基点に次のバックアップを作成し、Readyを確認済みです。
-
-- Name：`backup-pre-release-20260721-c6b403e`
-- Branch ID：`br-withered-darkness-azjg6fpl`
-- 状態：Ready
-
-今回の認証診断ログ追加ではDB・Migrationを変更しないため、新たなNeon branch作成やMigration実行は行いません。
-
-このブランチでは、引き継ぎ時点で次が合格済みと報告されています。
-
-- 親ブランチとのMigration履歴・データ件数一致
-- Migration 0005適用
-- 履歴5件から6件
-- 新テーブル・enum・Index・外部キー・関数作成
-- `SECURITY INVOKER`
-- 固定 `search_path`
-- PUBLIC実行権限なし
-- Googleログイン
-- YouTube分析
-- 分析履歴保存
-- AI提案保存
-- 改善項目作成・編集
-- `completed` / `skipped`
-- 結果メモ
-- 重複作成409
-- API 500なし
-- 既存データ維持
-- テストデータ削除
+- Migration 0006専用リハーサルchild branch：READYで保持中
+- Production復旧用backup child branch：READYで保持中
+- 両branchとも削除、変更、reset、restore、別用途への流用を行っていません
+- 今回のdocs-only同期ではNeon操作を行いません
 
 ## 現在残っている作業
 
-1. Runbook整合化後の新しいrelease candidateを基準に、対象branch、完全SHA、Migration 0006、承認範囲を固定した別のproject owner明示承認を受け、Production release手順を最初から再開する
-2. Production releaseが全gateに合格した場合だけ、所有者による認証済みProduction主要機能スモークを、費用と利用枠を考慮して最小回数で実施する
-3. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
-4. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
+1. 同期済みRunbookを根拠に、別のproject owner明示承認を受けてProductionの`DATABASE_URL`接続先だけを正式Production branchのpooled接続へ修正する
+2. 同じsource commitのProduction Redeployを最大1回だけ行い、`/api/usage/status`と`/api/weekly-cycle`を各最大1回確認する
+3. 両APIの復旧と正しいruntime接続先を確認した場合だけ、所有者による残りの認証済みProductionスモークを最小回数で再開する
+4. 復旧完了後、Current Productionと最終検証結果を正式文書へ再同期する
+5. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
+6. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
 
-Production DB接続復旧と第1回UI改修は完了しています。通常のVercel環境変数変更禁止が適用されており、今回の文書同期ではProduction、アプリコード、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
+Migration 0006のProduction適用とpostflightは完了しています。Persistence 500の接続先修正は未実施です。通常のVercel環境変数変更禁止は維持し、Runbookのincident限定手順と別の明示承認がある場合だけ`DATABASE_URL` 1件の修正へ進めます。今回の文書同期ではProduction、アプリコード、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
 
 ## 今回の公開対象外
 
@@ -320,6 +275,6 @@ Production DB接続復旧と第1回UI改修は完了しています。通常のV
 
 ## 次の作業
 
-次工程は、承認済み期限付き例外を含むrelease candidate確定後、Production release手順を独立作成・監査し、main統合とProduction releaseの可否を別途判定することです。Productionスモークは現時点では未実施です。
+次工程は、`docs/sync-production-incident-20260726`上の同期済みRunbookを根拠とした、Production `DATABASE_URL`接続先修正と同一source commitのRedeploy最大1回について、別途明示承認を受けることです。古い復旧指示は再利用しません。
 
-この文書同期branchの作成・commit・pushはProduction操作と分離します。レビュー完了までは `main` へ統合・pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
+この文書同期branchの作成・commit・pushはProduction操作と分離します。`main`へcommit、merge、pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
