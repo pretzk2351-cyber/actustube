@@ -178,7 +178,7 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善SaaSである。YouTube
 
 | 層 | 採用技術 | 役割・基準 |
 | --- | --- | --- |
-| フロント／サーバー | Next.js 15.5.20 / React 19.0.0 | App Routerベースの画面・サーバーAPI |
+| フロント／サーバー | Next.js 15.5.21 / React 19.0.0 | App Routerベースの画面・サーバーAPI |
 | 認証 | Auth.js | Google OAuth、セッション、アクセストークン更新 |
 | DB | Neon PostgreSQL / Drizzle ORM | ユーザー、利用枠、分析履歴、改善項目 |
 | AI | OpenAI API | チャンネル固有の分析・改善提案 |

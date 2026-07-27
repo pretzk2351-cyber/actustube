@@ -29,7 +29,7 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 
 `package.json`、Drizzle設定、実装を確認した構成です。
 
-- Next.js 15.5.20
+- Next.js 15.5.21
 - React / React DOM 19.0.0
 - TypeScript 5系
 - Auth.js（`next-auth` 5.0.0 beta 25以降）
@@ -40,6 +40,18 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - Vitest 4.1.10以降
 - Vercel
 - Stripe SDK 18.0.0以降は依存関係に存在するが、Stripe機能は今回の公開対象外
+- Node.js 24.x
+- npm 11.18.0
+- `package-lock.json` lockfileVersion 3
+
+## App Shell feature状態
+
+- branch：`feat/app-shell-vidiq-inspired-beta-ux`
+- HEAD：`a643e09303929537be6cc24bc34db5f756ab0447`
+- Preview build：合格済み
+- Production反映：未実施。`main`とCurrent Productionは引き続き`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
+- 認証済みApp Shell操作テスト：Next.js versionの文書不一致により未実施
+- 次工程：文書同期後、ProductionとDB・OAuth・Environment Variablesを完全分離した認証済みstaging環境を構築し、認証済み操作を検証する
 
 ## 承認済み期限付きセキュリティ例外
 
