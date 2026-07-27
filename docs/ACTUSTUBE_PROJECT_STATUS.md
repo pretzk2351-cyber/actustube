@@ -2,7 +2,7 @@
 
 最終更新日：2026-07-27
 
-> 2026-07-27 JSTの読み取り専用確認に基づく状態スナップショットです。release candidateは`main`へfast-forward統合済みで、`main` / `origin/main` は `08ec587f7a242b40ada53a0eb69acb33ebb9253b` で同期しています。Current Productionは同じsource commitをREADY / Currentで配信し、トップはHTTP 200です。Migration 0006は正式Production branchへexact 1回適用済みです。一方、Production runtimeの`DATABASE_URL`がschemaの空の別branchを指しているため、`/api/usage/status`と`/api/weekly-cycle`はPersistence 500です。接続先修正、Redeploy、復旧確認はまだ実施していません。
+> 2026-07-27 JSTの確認に基づく状態スナップショットです。release candidateは`main`へfast-forward統合済みで、`main` / `origin/main` は `08ec587f7a242b40ada53a0eb69acb33ebb9253b` で同期しています。Current Productionは同じsource commitをREADY / Currentで配信し、トップはHTTP 200です。Migration 0006は正式Production branchへexact 1回適用済みです。Production runtimeの`DATABASE_URL`接続先不一致は、Production scopeだけを正式Production branchの公式pooled接続へ修正し、同一source commitを1回Redeployして解消しました。`/api/usage/status`と`/api/weekly-cycle`はHTTP 200へ復旧し、動画あり最終スモークも合格しています。rollbackとrestoreは実施していません。
 
 ## プロジェクト概要
 
@@ -70,7 +70,7 @@ release candidateの統合、Migration 0006のProduction適用、Migration後pos
 - Migration由来の想定外データ件数変化はありません。
 - Migrationリハーサル用child branchとProduction復旧用backup child branchは、変更・削除せずREADYで保持しています。
 - rollbackとrestoreは実施していません。
-- 現在のPersistence 500はMigration対象Production branchの不整合ではなく、Vercel Production runtimeの接続先branch不一致が原因です。
+- Migration対象Production branch自体に不整合はなく、Vercel Production runtimeの接続先branch不一致を修正した後はPersistence 500が解消しています。
 
 ## 実装済み機能
 
@@ -169,6 +169,27 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 - 秘密情報・個人情報候補：0件
 - UI幅320、375、390、768、1024、1440で横はみ出しなし
 
+Production復旧・動画あり最終スモーク：
+
+- Productionの`DATABASE_URL`はProduction scopeだけに維持し、Sensitiveを維持したまま、Migration 0006適用済みの正式Production branchの公式pooled接続へ修正済み
+- PreviewとDevelopmentの`DATABASE_URL`：各0件
+- 同一source commitの復旧Redeploy：1回。追加Redeploy、Promote、Rollbackなし
+- `/api/usage/status`と`/api/weekly-cycle`：各HTTP 200。PersistenceErrorの再発なし
+- 所有チャンネル：1件取得・自動選択成功。通常動画2本、Shorts 1本を取得
+- 分析：1回、HTTP 200。履歴0件→1件。分析時のAI同時生成・消費なし
+- AI提案：1回、HTTP 200。履歴0件→1件
+- 分析の日次利用枠：使用0→1、上限2、残り2→1
+- 分析の月次利用枠：使用0→1、上限5、残り5→4
+- AI提案の日次利用枠：使用0→1、上限1、残り1→0
+- AI提案の月次利用枠：使用0→1、上限3、残り3→2
+- 処理上限：通常動画10本、Shorts 10本
+- 改善項目：`【Production Smoke】動画あり最終確認 2026-07-27`を1件作成。planned／進行中で再取得後も永続化を確認し、編集、結果メモ、skipped、削除は未実施
+- 重複requestと重複利用枠消費：なし
+- Browser Console error / warning、Production runtime error / fatal、HTTP 5xx：すべて0件
+- 認証情報、Cookie、token、接続情報の取得・表示：なし
+
+この結果により、今回のreleaseで確認対象としたProduction主要導線は合格です。未実装または未確認の将来機能、Standard / Proの完成を示すものではありません。
+
 ## Git状態
 
 2026-07-27 JSTに読み取り確認した状態：
@@ -203,31 +224,33 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 - トップページ：HTTP 200
 - Google認証：成功
 - session：成功
-- 所有チャンネル：1件取得成功
-- `/api/usage/status`：HTTP 500、`UsageStatusPersistenceError`
-- `/api/weekly-cycle`：HTTP 500、`WeeklyCyclePersistenceError`
-- 分析、AI提案、改善項目作成：未実行
-- 根本原因：Production runtimeの`DATABASE_URL`接続先branch不一致
-- `DATABASE_URL`修正、Redeploy、復旧確認：未実施
-- rollback、restore：未実施
+- 所有チャンネル：1件取得・自動選択成功
+- 通常動画：2本取得成功
+- Shorts：1本取得成功
+- `/api/usage/status`：HTTP 200
+- `/api/weekly-cycle`：HTTP 200
+- Production `DATABASE_URL`：正式Production branchの公式pooled接続へ修正済み。Production scopeのみ、Sensitive維持
+- Preview / Development `DATABASE_URL`：各0件
+- Persistence 500復旧後のRedeploy：同一source commitで1回。追加Redeployなし
+- 分析：1回成功、HTTP 200、履歴0件→1件
+- AI提案：1回成功、HTTP 200、履歴0件→1件
+- 利用枠：分析とAI提案を各1回分だけ消費。重複消費なし
+- 改善項目：スモーク専用項目1件をplanned／進行中で保存し、再取得後の永続化を確認
+- Browser Console error / warning、Production runtime error / fatal、HTTP 5xx：すべて0件
+- rollback、restore、Promote：未実施
 - このdeployment情報は確認時点のスナップショットであり、後続docs-only commitによって識別子が進んでも永続的にCurrentであることを意味しない
 
-Production DB接続復旧に関する完了済み履歴：
+Persistence 500復旧に関する完了済み履歴：
 
-- `redirect_uri_mismatch`：解消済み
-- OAuth callbackの `missing iss`：解消済み
-- callbackは `/api/auth/callback/google` まで到達し、HTTP 302で完了
-- 安全な診断ログ：実装・検証・Production公開済み
-- 本人による単一ログイン：成功。callback直後のトップページはHTTP 200
-- 本人申告のログイン時刻周辺にGoogle callbackとHTTP 200を確認し、エラー、5xx、DB認証失敗は確認されなかった。Vercel側ログの表示時刻にはタイムゾーンまたは表示形式による差があるため、本人申告時刻との秒単位の一致は断定しない
-- `[auth][error]`、`[auth][cause]`、`[auth][details]`：0件
-- DB同期診断ログ：0件。失敗時だけ出力される実装のため正常結果と整合
-- `password authentication failed`、Neon / PostgreSQL接続エラー、`error`、`fatal`、HTTP 5xx：0件
-- 以前失敗していたGoogle OAuthアカウントのDB同期境界を正常に通過
-- Production DB接続復旧：正式完了
-- rollback：不要
+- 以前の障害は、`/api/usage/status`の`UsageStatusPersistenceError`と`/api/weekly-cycle`の`WeeklyCyclePersistenceError`によるHTTP 500
+- 根本原因は、Vercel Productionの`DATABASE_URL`がschemaの空の別Neon branchを参照し、Migration 0006適用済みProduction branchと接続先が不一致だったこと
+- Previewの`DATABASE_URL`を削除し、Productionの`DATABASE_URL`だけを正しい公式pooled接続へ修正
+- 同じsource commitを1回だけRedeploy
+- 両APIのHTTP 200、PersistenceError再発なし、正式Production branchへのruntime activityを確認
+- runtime error、fatal、HTTP 5xx：0件
+- DBの直接修正、Migration再実行、rollback、restore：なし
 
-直前のdocs-only deployment `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`（`main@f6014a1`）と、直近のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は比較用履歴として残します。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧deployment `dpl_HPGCXavawHj3yHKo9nFg99LGB6jR`、`dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ` は監査履歴であり、現在のCurrentまたは自動的なrollback先ではありません。復旧ではVercel Productionの `DATABASE_URL` 以外を変更せず、Production DB本体やMigration 0000〜0005を変更・再適用していません。今回限定の環境変数変更例外は終了済みです。
+復旧ではPreviewだけの`DATABASE_URL`を1件削除し、Productionの`DATABASE_URL`を1件更新しました。Developmentとその他の環境変数は変更していません。値、接続文字列、host、database名、role名、内部識別子は本書へ記録しません。これらは完了済みincidentに限定した操作であり、変更許可は終了しています。通常のVercel環境変数変更禁止を再適用しています。
 
 ## Production DB
 
@@ -242,7 +265,7 @@ Migration 0006適用後の正式Production branchを、秘密情報を表示し�
 - Migration由来の想定外データ件数変化：なし
 - rollback、restore：未実施
 
-現在のPersistence 500はこのDBのMigration、schema、権限によるものではありません。正式Production branchでは同じアプリ経路がdirect／pooledとも正常で、Production runtimeだけがschemaの空の別branchへ接続しています。実データ、接続文字列、host、database名、role名、内部識別子は本書へ追加しません。
+Persistence 500はこのDBのMigration、schema、権限によるものではありませんでした。Production runtimeの接続先を正式Production branchの公式pooled接続へ修正した後は、主要読み取りAPIと動画あり最終スモークが正常です。実データ、接続文字列、host、database名、role名、内部識別子は本書へ追加しません。
 
 ## バックアップ兼リハーサルブランチ
 
@@ -253,14 +276,13 @@ Migration 0006適用後の正式Production branchを、秘密情報を表示し�
 
 ## 現在残っている作業
 
-1. 同期済みRunbookを根拠に、別のproject owner明示承認を受けてProductionの`DATABASE_URL`接続先だけを正式Production branchのpooled接続へ修正する
-2. 同じsource commitのProduction Redeployを最大1回だけ行い、`/api/usage/status`と`/api/weekly-cycle`を各最大1回確認する
-3. 両APIの復旧と正しいruntime接続先を確認した場合だけ、所有者による残りの認証済みProductionスモークを最小回数で再開する
-4. 復旧完了後、Current Productionと最終検証結果を正式文書へ再同期する
-5. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
-6. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
+1. 復旧済みProductionを24〜48時間監視し、PersistenceError、runtime error、fatal、HTTP 5xx、利用枠の重複消費が再発しないことを確認する
+2. 期限付きセキュリティ例外を初回2026-08-02、その後最低週1回の期限で再確認する
+3. planned／進行中で残存するスモーク専用改善項目について、実在データを独断で変更・削除せず、project ownerがcleanup要否を判断する
+4. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
+5. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
 
-Migration 0006のProduction適用とpostflightは完了しています。Persistence 500の接続先修正は未実施です。通常のVercel環境変数変更禁止は維持し、Runbookのincident限定手順と別の明示承認がある場合だけ`DATABASE_URL` 1件の修正へ進めます。今回の文書同期ではProduction、アプリコード、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
+Migration 0006のProduction適用、postflight、Persistence 500復旧、動画あり最終スモークは完了しています。incident限定の環境変数変更許可は終了しました。今回の文書同期ではProduction、アプリコード、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
 
 ## 今回の公開対象外
 
@@ -275,6 +297,6 @@ Migration 0006のProduction適用とpostflightは完了しています。Persist
 
 ## 次の作業
 
-次工程は、`docs/sync-production-incident-20260726`上の同期済みRunbookを根拠とした、Production `DATABASE_URL`接続先修正と同一source commitのRedeploy最大1回について、別途明示承認を受けることです。古い復旧指示は再利用しません。
+次工程は、復旧済みProductionの24〜48時間監視、期限付きセキュリティ例外の週次確認、plannedで残存するスモーク専用改善項目のcleanup判断です。監視は読み取り専用とし、データ変更、環境変数変更、Redeploy、rollbackを必要とする場合は別の明示承認を受けます。
 
 この文書同期branchの作成・commit・pushはProduction操作と分離します。`main`へcommit、merge、pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
