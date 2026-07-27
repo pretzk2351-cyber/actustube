@@ -22,6 +22,7 @@ type Props = {
   currentAnalysisRunId: string | null;
   suggestedAction: string;
   refreshKey: number;
+  onHistoryCountChange?: (count: number | null) => void;
 };
 
 const statusLabels = {
@@ -87,6 +88,7 @@ export function WeeklyImprovementCycle({
   currentAnalysisRunId,
   suggestedAction,
   refreshKey,
+  onHistoryCountChange,
 }: Props) {
   const [items, setItems] = useState<AnalysisHistoryItem[]>([]);
   const [plannedAction, setPlannedAction] =
@@ -120,14 +122,17 @@ export function WeeklyImprovementCycle({
       });
       const data: unknown = await response.json().catch(() => null);
       if (!response.ok || !isHistoryResponse(data)) {
+        onHistoryCountChange?.(null);
         setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return false;
       }
       setItems(data.items);
+      onHistoryCountChange?.(data.items.length);
       setPlannedAction(data.plannedAction);
       setNextCursor(data.nextCursor);
       return true;
     } catch {
+      onHistoryCountChange?.(null);
       setNotice(
         createWeeklyCycleNotice(
           "error",
@@ -138,7 +143,7 @@ export function WeeklyImprovementCycle({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onHistoryCountChange]);
 
   useEffect(() => {
     void loadFirstPage();

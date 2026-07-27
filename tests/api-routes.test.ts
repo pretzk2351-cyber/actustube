@@ -237,7 +237,7 @@ function availableUsageStatus(source: "assignment" | "free_fallback" = "assignme
   };
 }
 
-function installChannelFetchMock() {
+function installChannelFetchMock({ empty = false }: { empty?: boolean } = {}) {
   vi.mocked(fetch).mockImplementation(async (input) => {
     const url = new URL(String(input));
     const part = url.searchParams.get("part");
@@ -270,7 +270,27 @@ function installChannelFetchMock() {
     }
 
     if (url.pathname.endsWith("/playlistItems")) {
-      return jsonResponse({ items: [] });
+      return jsonResponse({
+        items: empty
+          ? []
+          : [{ contentDetails: { videoId: "regular0001" } }],
+      });
+    }
+
+    if (url.pathname.endsWith("/videos") && !empty) {
+      return jsonResponse({
+        items: [
+          {
+            id: "regular0001",
+            contentDetails: { duration: "PT2M" },
+            snippet: {
+              title: "Test video",
+              publishedAt: "2026-07-20T00:00:00.000Z",
+            },
+            statistics: { viewCount: "10" },
+          },
+        ],
+      });
     }
 
     throw new Error("Unexpected mocked fetch target.");
@@ -863,7 +883,7 @@ describe("successful usage reservations", () => {
     );
     expect(usageState.finalize).not.toHaveBeenCalled();
     expect(usageState.release).not.toHaveBeenCalled();
-    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledTimes(4);
     expect(body.plan).toBe("free");
     expect(body.analysisRunId).toBe(ANALYSIS_RUN_ID);
     expect(body.usage).toEqual({
@@ -878,6 +898,39 @@ describe("successful usage reservations", () => {
       regularVideoLimit: 10,
       shortsVideoLimit: 10,
     });
+  });
+
+  it("releases an empty analysis without consuming usage or saving history", async () => {
+    installChannelFetchMock({ empty: true });
+
+    const response = await youtubeChannelGet(channelRequest());
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      code: "NO_ANALYZABLE_VIDEOS",
+      channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
+      channelTitle: "Test Channel",
+      regularVideos: [],
+      shortVideos: [],
+    });
+    expect(usageState.reserve).toHaveBeenCalledTimes(1);
+    expect(usageState.reserve).toHaveBeenCalledWith({
+      userId: INTERNAL_USER_ID,
+      sessionVersion: 7,
+      metric: "channel_analysis",
+    });
+    expect(usageState.release).toHaveBeenCalledTimes(1);
+    expect(usageState.release).toHaveBeenCalledWith({
+      reservationId: RESERVATION_ID,
+      userId: INTERNAL_USER_ID,
+    });
+    expect(usageState.finalize).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeChannel).not.toHaveBeenCalled();
+    expect(weeklyCycleState.finalizeAI).not.toHaveBeenCalled();
+    expect(openAIState.create).not.toHaveBeenCalled();
+    expect(body).not.toHaveProperty("analysisRunId");
+    expect(body).not.toHaveProperty("usage");
   });
 
   it("uses only the atomic reservation snapshot for per-type video limits", async () => {
