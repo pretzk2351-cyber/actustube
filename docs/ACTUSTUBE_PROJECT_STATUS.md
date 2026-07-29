@@ -1,6 +1,6 @@
 # ActusTube Project Status
 
-最終更新日：2026-07-27
+最終更新日：2026-07-29
 
 > 2026-07-27 JSTの確認に基づく状態スナップショットです。release candidateは`main`へfast-forward統合済みで、`main` / `origin/main` は `08ec587f7a242b40ada53a0eb69acb33ebb9253b` で同期しています。Current Productionは同じsource commitをREADY / Currentで配信し、トップはHTTP 200です。Migration 0006は正式Production branchへexact 1回適用済みです。Production runtimeの`DATABASE_URL`接続先不一致は、Production scopeだけを正式Production branchの公式pooled接続へ修正し、同一source commitを1回Redeployして解消しました。`/api/usage/status`と`/api/weekly-cycle`はHTTP 200へ復旧し、動画あり最終スモークも合格しています。rollbackとrestoreは実施していません。
 
@@ -52,6 +52,22 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - Production反映：未実施。`main`とCurrent Productionは引き続き`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
 - 認証済みApp Shell操作テスト：Next.js versionの文書不一致により未実施
 - 次工程：文書同期後、ProductionとDB・OAuth・Environment Variablesを完全分離した認証済みstaging環境を構築し、認証済み操作を検証する
+
+## Staging DB postflight verification基盤
+
+- repository管理command：`npm run db:verify:staging`
+- entry：`scripts/verify-staging-database-postflight.mjs`
+- Runbook：[STAGING_DATABASE_RUNBOOK.md](./STAGING_DATABASE_RUNBOOK.md)
+- direct / pooled双方をread-only transactionで確認し、Migration 0000〜0006のjournal、file hash、DB履歴、schema / object、function signature、owner、ACL、implicit PUBLIC EXECUTE、default privilege、security mode、fixed search path、runtime role権限、RLS / policy、同一論理database、合成UUIDによるread-only smoke、前後件数不変をfail-closedで判定する基盤を実装
+- local verification：外部DB環境を除外した使い捨てPostgreSQLで、別owner / runtime role、正常系、direct / pooled別DB、schema drift、未知object、PUBLIC EXECUTE、grant option、column / sequence / default ACL、function default式、Migration hash不一致、secret redaction、read-only instrumentation、bounded cleanupを検証
+- 実staging DB：未作成・未接続・未実行
+- 実provider pooled endpoint：未実行のためtransaction pooler固有挙動はNOT TESTED
+- 実staging owner / ACL：未検証
+- Production DB：未接続・未変更
+- Migration：ローカル使い捨てDBだけへ適用。外部DBへの適用なし
+- 次工程：新しいfeature HEADを基準とした認証済みstaging環境構築・事前監査について、別のproject owner明示承認待ち
+
+この基盤のlocal PASSを「staging DB検証済み」「staging構築完了」とは扱いません。1件でもFAIL、NOT VERIFIED、timeout、cleanup不明があればauthenticated staging工程へ進みません。
 
 ## 承認済み期限付きセキュリティ例外
 
@@ -288,11 +304,12 @@ Persistence 500はこのDBのMigration、schema、権限によるものではあ
 
 ## 現在残っている作業
 
-1. 復旧済みProductionを24〜48時間監視し、PersistenceError、runtime error、fatal、HTTP 5xx、利用枠の重複消費が再発しないことを確認する
-2. 期限付きセキュリティ例外を初回2026-08-02、その後最低週1回の期限で再確認する
-3. planned／進行中で残存するスモーク専用改善項目について、実在データを独断で変更・削除せず、project ownerがcleanup要否を判断する
-4. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
-5. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
+1. staging resourceを作成せず、新しいfeature HEADを基準とした認証済みstaging環境構築・事前監査の別承認を待つ
+2. 復旧済みProductionを24〜48時間監視し、PersistenceError、runtime error、fatal、HTTP 5xx、利用枠の重複消費が再発しないことを確認する
+3. 期限付きセキュリティ例外を初回2026-08-02、その後最低週1回の期限で再確認する
+4. planned／進行中で残存するスモーク専用改善項目について、実在データを独断で変更・削除せず、project ownerがcleanup要否を判断する
+5. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
+6. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
 
 Migration 0006のProduction適用、postflight、Persistence 500復旧、動画あり最終スモークは完了しています。incident限定の環境変数変更許可は終了しました。今回の文書同期ではProduction、アプリコード、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
 
@@ -309,6 +326,6 @@ Migration 0006のProduction適用、postflight、Persistence 500復旧、動画�
 
 ## 次の作業
 
-次工程は、復旧済みProductionの24〜48時間監視、期限付きセキュリティ例外の週次確認、plannedで残存するスモーク専用改善項目のcleanup判断です。監視は読み取り専用とし、データ変更、環境変数変更、Redeploy、rollbackを必要とする場合は別の明示承認を受けます。
+staging関連の次工程は、このfeatureの新しい完全HEADを基準とした認証済みstaging環境構築・事前監査です。staging resourceはまだ作成せず、別の明示承認を待ちます。Production監視、期限付き例外の週次確認、plannedで残存するスモーク専用改善項目のcleanup判断も独立した工程として扱い、データ変更、環境変数変更、Redeploy、rollbackを必要とする場合は別の明示承認を受けます。
 
 この文書同期branchの作成・commit・pushはProduction操作と分離します。`main`へcommit、merge、pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。

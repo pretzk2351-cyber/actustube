@@ -150,7 +150,10 @@ const postgres = new EmbeddedPostgres({
   user: "fixture_admin",
   password: adminPassword,
   port,
-  persistent: false,
+  // The harness owns and verifies removal of the guarded temporary root after
+  // every PostgreSQL process has exited. Avoid the library's earlier Windows
+  // data-directory removal racing with PostgreSQL child-process shutdown.
+  persistent: true,
   authMethod: "scram-sha-256",
   initdbFlags: ["--encoding=UTF8", "--locale=C"],
   postgresFlags: ["-c", "listen_addresses=127.0.0.1"],

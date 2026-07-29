@@ -17,9 +17,11 @@
     "test:watch": "vitest",
     "test:usage-integration": "node scripts/verify-usage-limits-integration.mjs",
     "test:migration:local": "node scripts/run-usage-migration-postgres.mjs",
+    "test:db-postflight:local": "node scripts/run-staging-database-postflight-postgres.mjs",
     "usage:recover-stale": "node scripts/recover-stale-usage-reservations.mjs",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate"
+    "db:migrate": "drizzle-kit migrate",
+    "db:verify:staging": "node scripts/verify-staging-database-postflight.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "1.1.0",
