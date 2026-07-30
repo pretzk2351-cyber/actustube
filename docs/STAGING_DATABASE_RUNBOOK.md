@@ -44,6 +44,20 @@ postflightには次の名前が必要です。値はterminal出力、文書、Gi
 
 postflight scriptは子processです。親shellのEnvironment Variablesを削除できず、削除したとも報告しません。
 
+## staging Web deployment専用の検索index防止
+
+認証済みstaging Web deploymentでは、staging専用Vercel projectのProduction scopeだけに、server / build側Environment Variable `ACTUSTUBE_STAGING_NOINDEX=1`を設定します。この変数はsecretではありませんが、Production ActusTube projectや他のenvironment scopeへ設定しません。DB postflight processには不要で、`DIRECT_DATABASE_URL`等の接続情報とも共有しません。
+
+値が文字列`1`と完全一致するbuildだけで、Next.js設定が全pathへ次のHTTP headerを追加します。
+
+```text
+X-Robots-Tag: noindex, nofollow, noarchive, nosnippet
+```
+
+未定義、空文字、`0`、`false`、その他の値ではheader設定を返しません。このdefault-off動作により、Environment Variableを設定しない現在のProductionの検索index挙動と既存metadataを変更しません。`NEXT_PUBLIC_`変数、robots metadata、robots.txtは使用しません。
+
+staging deployment前にexact `1`とscopeをmetadataだけで確認し、deployment後は固定staging URLのrootと正式8routeのresponse headerを確認します。1routeでもheaderが欠落する場合、Production側へ変数を追加して補わず、追加deploymentを行わず停止します。
+
 ## 安全ゲート
 
 database接続adapterを呼び出す前に、次をすべて検証します。

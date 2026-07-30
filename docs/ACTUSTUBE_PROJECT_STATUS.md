@@ -69,6 +69,19 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 
 この基盤のlocal PASSを「staging DB検証済み」「staging構築完了」とは扱いません。1件でもFAIL、NOT VERIFIED、timeout、cleanup不明があればauthenticated staging工程へ進みません。
 
+## Staging専用検索index防止基盤
+
+- server / build側Environment Variable：`ACTUSTUBE_STAGING_NOINDEX`
+- 有効条件：値が文字列`1`と完全一致する場合だけ
+- header：`X-Robots-Tag: noindex, nofollow, noarchive, nosnippet`
+- 適用範囲：全path。staging専用Vercel projectのProduction scopeだけに設定する
+- default：未定義、空文字、`0`、`false`、その他の値ではheaderを追加しない
+- Production保護：現在のProduction projectへ変数を設定せず、既存metadata、robots metadata、robots.txtを変更しない
+- 検証：設定関数の自動テストと、staging条件を有効にしたProduction buildを必須とする。実deployment後はrootと正式8routeのresponse headerを確認する
+- 実staging resource：未作成。Vercel、Neon、Google Cloud、OAuth、DB、Migration、deploymentは本実装工程の対象外
+
+既存の認証済みstaging環境・完全構築指示は、このfeatureの新しい完全HEAD、`ACTUSTUBE_STAGING_NOINDEX`のscope、build時のexact値、deployment後のheader検証方法を反映して更新されるまで再利用しません。
+
 ## 承認済み期限付きセキュリティ例外
 
 現在のProduction sourceには、[GHSA-mh99-v99m-4gvg / CVE-2026-14257の正式な期限付き例外](./SECURITY_EXCEPTION_GHSA-MH99-V99M-4GVG.md)を含む承認済みrelease candidateが統合されています。
@@ -326,6 +339,6 @@ Migration 0006のProduction適用、postflight、Persistence 500復旧、動画�
 
 ## 次の作業
 
-staging関連の次工程は、このfeatureの新しい完全HEADを基準とした認証済みstaging環境構築・事前監査です。staging resourceはまだ作成せず、別の明示承認を待ちます。Production監視、期限付き例外の週次確認、plannedで残存するスモーク専用改善項目のcleanup判断も独立した工程として扱い、データ変更、環境変数変更、Redeploy、rollbackを必要とする場合は別の明示承認を受けます。
+staging関連の次工程は、staging専用検索index防止を含むこのfeatureの新しい完全HEADを基準とし、`ACTUSTUBE_STAGING_NOINDEX=1`のscopeとheader検証を反映した完全構築指示を新たに承認することです。既存の完全構築指示は再利用しません。staging resourceはまだ作成せず、別の明示承認を待ちます。Production監視、期限付き例外の週次確認、plannedで残存するスモーク専用改善項目のcleanup判断も独立した工程として扱い、データ変更、環境変数変更、Redeploy、rollbackを必要とする場合は別の明示承認を受けます。
 
 この文書同期branchの作成・commit・pushはProduction操作と分離します。`main`へcommit、merge、pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
