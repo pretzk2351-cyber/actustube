@@ -8,6 +8,10 @@ export const REQUIRED_ENVIRONMENT_KEYS = Object.freeze([
 ]);
 
 export const EXPECTED_IDENTITY_KEY = "ACTUSTUBE_EXPECTED_STAGING_IDENTITY";
+export const POSTFLIGHT_CONFIRMATION_KEY =
+  "ACTUSTUBE_ALLOW_STAGING_DB_VERIFY";
+export const PREFLIGHT_CONFIRMATION_KEY =
+  "ACTUSTUBE_ALLOW_STAGING_DB_PREFLIGHT";
 
 const POSTGRES_PROTOCOLS = new Set(["postgres:", "postgresql:"]);
 const FORBIDDEN_TARGET_PART =
@@ -64,13 +68,16 @@ function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
   } catch {
     throw safetyIssue(`${kind.toUpperCase()}_URL_INVALID`);
   }
-  const targetMetadata = [
+  const stagingClassificationMetadata = [
     hostname,
     databasePath,
     decodedUsername,
+  ].join("/");
+  const forbiddenTargetMetadata = [
+    stagingClassificationMetadata,
     ...Array.from(parsed.searchParams.entries()).flat(),
   ].join("/");
-  if (FORBIDDEN_TARGET_PART.test(targetMetadata)) {
+  if (FORBIDDEN_TARGET_PART.test(forbiddenTargetMetadata)) {
     throw safetyIssue(`${kind.toUpperCase()}_FORBIDDEN_TARGET`);
   }
 
@@ -91,7 +98,7 @@ function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
     if ((kind === "direct" && isPooled) || (kind === "pooled" && !isPooled)) {
       throw safetyIssue(`${kind.toUpperCase()}_ENDPOINT_KIND_REJECTED`);
     }
-    if (!STAGING_TARGET_PART.test(targetMetadata)) {
+    if (!STAGING_TARGET_PART.test(stagingClassificationMetadata)) {
       throw safetyIssue(`${kind.toUpperCase()}_STAGING_MARKER_REQUIRED`);
     }
   }
@@ -117,11 +124,15 @@ function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
 }
 
 export function validateSafetyGate(environment, options = {}) {
+  const confirmationKey =
+    options.confirmationKey || POSTFLIGHT_CONFIRMATION_KEY;
+  const confirmationErrorCode =
+    options.confirmationErrorCode || "STAGING_CONFIRMATION_REQUIRED";
   if (environment.ACTUSTUBE_DB_ENV !== "staging") {
     throw safetyIssue("STAGING_ENVIRONMENT_REQUIRED");
   }
-  if (environment.ACTUSTUBE_ALLOW_STAGING_DB_VERIFY !== "1") {
-    throw safetyIssue("STAGING_CONFIRMATION_REQUIRED");
+  if (environment[confirmationKey] !== "1") {
+    throw safetyIssue(confirmationErrorCode);
   }
 
   const direct = parseDatabaseUrl(

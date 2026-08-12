@@ -21,6 +21,7 @@
     "usage:recover-stale": "node scripts/recover-stale-usage-reservations.mjs",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "db:preflight:staging": "node scripts/verify-staging-database-preflight.mjs",
     "db:verify:staging": "node scripts/verify-staging-database-postflight.mjs"
   },
   "dependencies": {

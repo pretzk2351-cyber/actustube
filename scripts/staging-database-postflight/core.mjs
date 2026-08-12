@@ -95,6 +95,25 @@ async function withTimeout(promise, milliseconds, code) {
   }
 }
 
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw notVerified("DATABASE_OPERATION_ABORTED");
+}
+
+async function withAbortSignal(promise, signal) {
+  if (!signal) return await promise;
+  throwIfAborted(signal);
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(notVerified("DATABASE_OPERATION_ABORTED"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export async function loadRepositorySpecification(repositoryRoot) {
   const migrationRoot = join(repositoryRoot, "drizzle");
   let journal;
@@ -965,34 +984,59 @@ const SQL = Object.freeze({
   preparedSmoke: "SELECT ($1::uuid IS NOT NULL) AS parameterized",
 });
 
-async function runQuery(connection, statement, parameters = [], onQuery) {
+async function runQuery(
+  connection,
+  statement,
+  parameters = [],
+  onQuery,
+  { signal } = {}
+) {
+  throwIfAborted(signal);
   assertReadOnlySql(statement);
   onQuery?.(statement);
+  throwIfAborted(signal);
   try {
-    return await withTimeout(
-      Promise.resolve(connection.query(statement, parameters)),
-      QUERY_TIMEOUT_MILLISECONDS,
-      "DATABASE_QUERY_TIMEOUT"
+    return await withAbortSignal(
+      withTimeout(
+        Promise.resolve(connection.query(statement, parameters)),
+        QUERY_TIMEOUT_MILLISECONDS,
+        "DATABASE_QUERY_TIMEOUT"
+      ),
+      signal
     );
   } catch (error) {
     throw safeIssueFrom(error, "DATABASE_QUERY_UNAVAILABLE", 3);
   }
 }
 
-async function openReadOnlyConnection(adapter, kind, url, onQuery) {
+async function openReadOnlyConnection(
+  adapter,
+  kind,
+  url,
+  onQuery,
+  { signal } = {}
+) {
   let connection;
   try {
-    connection = await adapter.connect(kind, url, {
-      timeoutMilliseconds: CONNECTION_TIMEOUT_MILLISECONDS,
-    });
-    await runQuery(connection, SQL.begin, [], onQuery);
-    await runQuery(connection, SQL.statementTimeout, [], onQuery);
-    await runQuery(connection, SQL.lockTimeout, [], onQuery);
+    throwIfAborted(signal);
+    connection = await withAbortSignal(
+      Promise.resolve(
+        adapter.connect(kind, url, {
+          timeoutMilliseconds: CONNECTION_TIMEOUT_MILLISECONDS,
+          signal,
+        })
+      ),
+      signal
+    );
+    await runQuery(connection, SQL.begin, [], onQuery, { signal });
+    await runQuery(connection, SQL.statementTimeout, [], onQuery, { signal });
+    await runQuery(connection, SQL.lockTimeout, [], onQuery, { signal });
     const readOnly = await runQuery(
       connection,
       SQL.transactionReadOnly,
       [],
-      onQuery
+      onQuery,
+      { signal }
     );
     const value = readOnly.rows?.[0]?.transaction_read_only;
     if (value !== "on") throw verifiedFailure("TRANSACTION_NOT_READ_ONLY");
@@ -1019,18 +1063,22 @@ async function openReadOnlyConnection(adapter, kind, url, onQuery) {
   }
 }
 
-async function closeReadOnlyConnection(connection, onQuery) {
+async function closeReadOnlyConnection(connection, onQuery, { signal } = {}) {
+  throwIfAborted(signal);
   let rollbackFailed = false;
   try {
-    await runQuery(connection, SQL.rollback, [], onQuery);
+    await runQuery(connection, SQL.rollback, [], onQuery, { signal });
   } catch {
     rollbackFailed = true;
   }
   try {
-    await withTimeout(
-      Promise.resolve().then(() => connection.close()),
-      CLEANUP_TIMEOUT_MILLISECONDS,
-      "CONNECTION_CLEANUP_TIMEOUT"
+    await withAbortSignal(
+      withTimeout(
+        Promise.resolve().then(() => connection.close()),
+        CLEANUP_TIMEOUT_MILLISECONDS,
+        "CONNECTION_CLEANUP_TIMEOUT"
+      ),
+      signal
     );
   } catch (error) {
     if (error instanceof PostflightIssue) throw error;
@@ -1039,7 +1087,7 @@ async function closeReadOnlyConnection(connection, onQuery) {
   if (rollbackFailed) throw notVerified("TRANSACTION_ROLLBACK_UNVERIFIED");
 }
 
-function validateMigrationHistory(specification, evidence) {
+function validateMigrationTableShape(evidence) {
   const columns = evidence.migrationColumns;
   requireCondition(columns.length === 3, "MIGRATION_HISTORY_COLUMN_COUNT_MISMATCH");
   const expectedColumns = [
@@ -1069,6 +1117,10 @@ function validateMigrationHistory(specification, evidence) {
         JSON.stringify(["id"]),
     "MIGRATION_HISTORY_PRIMARY_KEY_MISMATCH"
   );
+}
+
+function validateMigrationHistory(specification, evidence) {
+  validateMigrationTableShape(evidence);
   requireCondition(
     evidence.migrationHistory.length === specification.migrations.length,
     "MIGRATION_HISTORY_COUNT_MISMATCH"
@@ -1937,6 +1989,8 @@ export {
   closeReadOnlyConnection,
   comparableEvidence,
   normalizeSqlExpression,
+  openReadOnlyConnection,
+  runQuery,
   validateColumns,
   validateConstraints,
   validateDirectPrivileges,
@@ -1944,6 +1998,7 @@ export {
   validateFunctions,
   validateIndexes,
   validateMigrationHistory,
+  validateMigrationTableShape,
   validateRuntimePrivileges,
   validateTablesAndSecurity,
 };

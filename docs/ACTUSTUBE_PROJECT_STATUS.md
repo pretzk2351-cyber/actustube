@@ -1,8 +1,8 @@
 # ActusTube Project Status
 
-最終更新日：2026-07-29
+最終更新日：2026-08-12
 
-> 2026-07-27 JSTの確認に基づく状態スナップショットです。release candidateは`main`へfast-forward統合済みで、`main` / `origin/main` は `08ec587f7a242b40ada53a0eb69acb33ebb9253b` で同期しています。Current Productionは同じsource commitをREADY / Currentで配信し、トップはHTTP 200です。Migration 0006は正式Production branchへexact 1回適用済みです。Production runtimeの`DATABASE_URL`接続先不一致は、Production scopeだけを正式Production branchの公式pooled接続へ修正し、同一source commitを1回Redeployして解消しました。`/api/usage/status`と`/api/weekly-cycle`はHTTP 200へ復旧し、動画あり最終スモークも合格しています。rollbackとrestoreは実施していません。
+> Production節は2026-07-27 JSTの確認に基づく履歴スナップショットです。今回の2026-08-12 local product recoveryではGitHub、Vercel、Neon、Google Cloudへ接続しておらず、Production / provider状態は再確認していません。現在確認したGit状態とlocal staging-preflight検証結果は本書末尾の候補節に記載します。
 
 ## プロジェクト概要
 
@@ -53,19 +53,26 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - 認証済みApp Shell操作テスト：Next.js versionの文書不一致により未実施
 - 次工程：文書同期後、ProductionとDB・OAuth・Environment Variablesを完全分離した認証済みstaging環境を構築し、認証済み操作を検証する
 
-## Staging DB postflight verification基盤
+## Staging DB preflight / postflight verification基盤
 
-- repository管理command：`npm run db:verify:staging`
-- entry：`scripts/verify-staging-database-postflight.mjs`
+- Migration前preflight command：`npm run db:preflight:staging`
+- preflight entry：`scripts/verify-staging-database-preflight.mjs`
+- Migration後postflight command：`npm run db:verify:staging`
+- postflight entry：`scripts/verify-staging-database-postflight.mjs`
 - Runbook：[STAGING_DATABASE_RUNBOOK.md](./STAGING_DATABASE_RUNBOOK.md)
+- preflightは、既存postflightのstaging URL分類、provider identity照合、read-only transaction、timeout、固定エラー分類、bounded cleanupを共用しつつ、Migration適用済みschema判定とは分離する。固定read-only queryでPostgreSQL versionを最初に取得し、正式対象をmajor 18だけに限定する。direct / pooled初回・再取得・before / afterのすべてでmajor 18かつ同一versionを要求し、取得不能はexit code 3、major 18以外または検証済み不一致はexit code 1でMigrationを禁止する。reportへ実versionは出さず固定statusだけを返す
+- preflightが許可する初期状態は、Migration管理schema自体がないpristine状態、またはDrizzle runnerが事前作成し得るexact形状のmigration tableが履歴0件で存在する状態だけ。既知のActusTube名に限定せずuser-defined residual objectを固定catalog queryで列挙し、system schemaを限定除外する。extension evidenceをcandidate signature単位へ集約し、direct membershipと正式`_RETURN` rule／FK enforcement triggerだけを`managed support`、generic `deptype='a'`・非許可internal・後付けobjectを`residual support`、candidate markerと通常構造参照`deptype='n'`を`neutral evidence`とする。managed＋residual混在、neutral-only、未知・欠落・重複はexit code 3であり、managed supportの存在だけでresidual evidenceを無視しない。`pg_extension.extnamespace`一致やprovider風名称だけでは許可しない。candidate／evidence、computed／SQL managed、computed／SQL residualをすべて双方向完全照合し、candidate・evidence signature一意、candidate総数＝managed＋residual、両集合の交差0件、residual／object signature／集計一致を要求する。hidden residual、片側へ寄せるfalse-clean、direct / pooled差、before / after差を拒否する
+- 空migration tableは正式3 columns、primary key、serial sequence、relation property、ownership / default dependencyに加え、sequence現在状態が`last_value=1`かつ`is_called=false`であることまで検証する。`pg_attribute`はrelation対応、物理列数、attnum順序、drop / inheritance、built-in type、length / pass-by-value / alignment、typmod / dimension、domain、identity / generated、collation、NOT NULL、default有無、ACL / option / FDW option、storage / compression、fresh PostgreSQL 18での単一`attstattarget IS NULL`状態をexact検証する。`pg_class`はrelation kind、namespace、access method、persistence、replica identity、RLS、populated / partition / shared / rewrite / row-type / typed-table、TOAST、tablespace等のstable fieldを検証し、物理配置・planner統計・VACUUM / freeze / transaction依存fieldだけをfield別理由付きで除外する。`pg_index`は正式全fieldをexact値、relation対応、sanitized vector、null状態へ分類し、`pg_constraint`はprimary key／NOT NULLの正式全field、action chars、FK／exclusion配列、expressionまでcoverageする。stable fieldの未検査とcatalog field取得不能を拒否し、direct / pooled初回・相互比較・再取得・前後比較へ同じversion / catalog / sequence evidenceを含める。applied 0件、pending 0000〜0006 exact 7件、user-defined object / data 0件を要求し、実値はreportへ出さず固定statusだけを返す
 - direct / pooled双方をread-only transactionで確認し、Migration 0000〜0006のjournal、file hash、DB履歴、schema / object、function signature、owner、ACL、implicit PUBLIC EXECUTE、default privilege、security mode、fixed search path、runtime role権限、RLS / policy、同一論理database、合成UUIDによるread-only smoke、前後件数不変をfail-closedで判定する基盤を実装
-- local verification：外部DB環境を除外した使い捨てPostgreSQLで、別owner / runtime role、正常系、direct / pooled別DB、schema drift、未知object、PUBLIC EXECUTE、grant option、column / sequence / default ACL、function default式、Migration hash不一致、secret redaction、read-only instrumentation、bounded cleanupを検証
-- 実staging DB：未作成・未接続・未実行
+- local verification：repositoryと同じ`embedded-postgres 18.4`をloopbackだけで使用し、repository Migration SQL適用0回のfresh catalogと固定fixtureで、PostgreSQL version、exact catalog field、extension classification、direct / pooled、before / after、固定report、cleanup、listener解除、exit code 0 / 1 / 2 / 3を検証する。guardを明示したNode childではTCP / TLSの非loopback、DNS、UDP、非loopback listenerを拒否する。guard未導入process、successful external connection、native child external connection、実package entrypoint、実Neon catalog／transaction pooler／staging owner／ACLはNOT VERIFIEDまたはNOT TESTEDであり、local PASSを実staging DB検証済みとは扱わない
+- staging専用provider resource：文書上は別の承認済み工程で作成済み。今回のlocal product recoveryではprovider状態をNOT VERIFIED
+- 実staging DB：未接続。preflight、Migration、postflightはすべて実行0回
 - 実provider pooled endpoint：未実行のためtransaction pooler固有挙動はNOT TESTED
+- Production非複製：DB queryでは証明せず、provider metadata preflightで別途証明する必須gateを維持
 - 実staging owner / ACL：未検証
 - Production DB：未接続・未変更
 - Migration：ローカル使い捨てDBだけへ適用。外部DBへの適用なし
-- 次工程：新しいfeature HEADを基準とした認証済みstaging環境構築・事前監査について、別のproject owner明示承認待ち
+- 次工程：preflight実装・テスト・Runbookの独立監査とGit確定を別工程で完了し、新しい完全HEADを固定した認証済みstaging構築の再開指示を待つ
 
 この基盤のlocal PASSを「staging DB検証済み」「staging構築完了」とは扱いません。1件でもFAIL、NOT VERIFIED、timeout、cleanup不明があればauthenticated staging工程へ進みません。
 
@@ -78,7 +85,7 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - default：未定義、空文字、`0`、`false`、その他の値ではheaderを追加しない
 - Production保護：現在のProduction projectへ変数を設定せず、既存metadata、robots metadata、robots.txtを変更しない
 - 検証：設定関数の自動テストと、staging条件を有効にしたProduction buildを必須とする。実deployment後はrootと正式8routeのresponse headerを確認する
-- 実staging resource：未作成。Vercel、Neon、Google Cloud、OAuth、DB、Migration、deploymentは本実装工程の対象外
+- staging専用resourceと`ACTUSTUBE_STAGING_NOINDEX`設定：別の承認済み工程で作成・設定済み。DB接続、Migration、deploymentは未実施
 
 既存の認証済みstaging環境・完全構築指示は、このfeatureの新しい完全HEAD、`ACTUSTUBE_STAGING_NOINDEX`のscope、build時のexact値、deployment後のheader検証方法を反映して更新されるまで再利用しません。
 
@@ -91,7 +98,8 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - 失効日：2026-08-24 23:59 JST
 - 初回週次確認期限：2026-08-02
 - Runtime `npm audit --omit=dev`：全severity 0件
-- full `npm audit`：対象GHSAによるHigh 9件のみ。対象GHSA以外は0件
+- full `npm audit`：exit code 1、High 1件、Critical 0件、total 1件。`brace-expansion`のaffected dependency node 2件が同一のGHSA-mh99-v99m-4gvgに由来し、対象GHSA以外のHigh / Criticalは0件。判定は`NOT PASS — known advisory only`
+- このHigh 1件は依存関係変更禁止のため本工程では修正せず、将来の別dependency remediationで対応します。runtime auditが全severity 0件で、今回変更が到達性を拡大しないことを条件に、本preflight独立レビューのblockerとはしません。これはProduction全体に脆弱性がないという判定ではありません
 - Production dependency / trace / bundle / route / action / user-input経路：対象packageへの到達なし
 - Preview：Node.js 24.x、Corepack、npm 11.18.0、既定install、`npm run build`を実証済み
 - ローカル回帰検証：247件成功、4件skip、React act警告0件
@@ -197,7 +205,7 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 - TypeScript：成功
 - Production build：成功
 - Runtime audit：全severity 0件
-- full audit：承認済み単一GHSAによるHigh 9件。例外対象外のHigh / Criticalは0件
+- full audit：exit code 1、High advisory 1件、Critical 0件、`brace-expansion`のaffected dependency node 2件。advisoryは承認済みのGHSA-mh99-v99m-4gvgだけで、statusは`NOT PASS — known advisory only`。dependencyと`package-lock.json`は不変
 - npm 11.18.0のclean installと `npm ls --depth=0`：extraneous / invalid 0件
 - `sharp`：0.35.3のみ
 - `libvips`：package 1.3.2 / runtime 8.18.3
@@ -339,6 +347,16 @@ Migration 0006のProduction適用、postflight、Persistence 500復旧、動画�
 
 ## 次の作業
 
-staging関連の次工程は、staging専用検索index防止を含むこのfeatureの新しい完全HEADを基準とし、`ACTUSTUBE_STAGING_NOINDEX=1`のscopeとheader検証を反映した完全構築指示を新たに承認することです。既存の完全構築指示は再利用しません。staging resourceはまだ作成せず、別の明示承認を待ちます。Production監視、期限付き例外の週次確認、plannedで残存するスモーク専用改善項目のcleanup判断も独立した工程として扱い、データ変更、環境変数変更、Redeploy、rollbackを必要とする場合は別の明示承認を受けます。
+staging関連の次工程は、Migration前read-only preflight実装の独立監査とGit確定を完了し、その新しい完全HEADを基準に認証済みstaging構築の再開指示を新たに承認することです。preflight exit code 0まではMigrationへ進まず、今回の実装工程ではDB接続、Migration、postflight、deployment、OAuth検証を行いません。Production監視、期限付き例外の週次確認、plannedで残存するスモーク専用改善項目のcleanup判断も独立した工程として扱い、データ変更、環境変数変更、Redeploy、rollbackを必要とする場合は別の明示承認を受けます。
 
 この文書同期branchの作成・commit・pushはProduction操作と分離します。`main`へcommit、merge、pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
+
+## Staging database preflight hardening candidate
+
+- `ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS`を必須のserver-side process入力とし、schemaVersion 1、最大32,768 bytes、最大128 entries、各string最大128 charactersの固定contractで検証します。
+- extension name／schema／versionはdirect／pooledのbefore／afterで順序非依存のexact比較を行い、期待値不足、入力不正、catalog取得不能、inventory不一致を別checkIdでfail-closedにします。
+- terminal reportはmemory上の単一bufferをterminal barrier後に同期write 1回だけcommitし、commit前fatalをmain結果より優先します。main AbortSignalはDB open／query scheduling／query待機／comparison／report準備／cleanup開始判断のorchestration境界へ伝播します。cleanupはmainとは別のcontrollerでdirect／pooledを同時に開始し、全体を最大5,000msに制限します。exit code 3はreport commitとlistener解除後にprocessを終了します。provider driverのnative cancellationは実provider未接続のためNOT TESTEDです。
+- network evidenceはguardを明示的に導入したNode childの拒否観測だけを示します。expected probeは専用DNS childに分離します。接続成功を観測する経路ではないため、successful guarded Node API external connectionとnative child external connectionはどちらも`NOT VERIFIED`です。
+- repository Migration SQL、journal、application runtime code、Production設定は変更していません。実Neon extension catalogの検証完了は主張しません。
+
+このlocal harnessの観測範囲はguardを明示的に導入したNode childだけであり、Next.js、npm、Vitest、Corepackその他のprocessが`.env.local`を読み取らなかったことは証明しません。
