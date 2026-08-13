@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { spawnSync } from "node:child_process";
+import { Client as NeonClient } from "@neondatabase/serverless";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -176,6 +177,68 @@ function expectedIndexRows(snapshot: Record<string, any>) {
 describe("staging postflight safety gate", () => {
   it("accepts only the exact staging confirmation and matching opaque identity", () => {
     expect(validateSafetyGate(validEnvironment()).directUrl).toBe(directUrl);
+  });
+
+  it.each([
+    ["host override", "host=other.example.test"],
+    ["percent-encoded host override", "%68ost=other.example.test"],
+    ["mixed-case host override", "HoSt=other.example.test"],
+    ["duplicate allowed key", "sslmode=require&SSLMODE=require"],
+    ["service file routing", "service=staging"],
+    ["password file routing", "passfile=fixture"],
+    ["TLS key file routing", "sslkey=fixture"],
+    ["libpq options routing", "options=-csearch_path%3Dpublic"],
+    ["unknown query key", "application_name=staging"],
+    ["empty query key", "=require"],
+    ["empty query value", "sslmode="],
+  ])("rejects %s before starting a connection", async (_label, query) => {
+    const connect = vi.fn();
+    const environment = validEnvironment();
+    environment.DIRECT_DATABASE_URL = directUrl.replace(
+      "sslmode=require",
+      query
+    );
+    const report: any = await verifyStagingDatabasePostflight({
+      environment,
+      repositoryRoot,
+      adapter: { connect },
+    });
+    expect(report.exitCode).toBe(2);
+    expect(report.failure.checkId).toBe("DIRECT_URL_QUERY_REJECTED");
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("accepts only bounded non-routing query parameters or no query", () => {
+    const bounded = validEnvironment();
+    bounded.DIRECT_DATABASE_URL = directUrl.replace(
+      "sslmode=require",
+      "sslmode=require&channel_binding=require"
+    );
+    bounded.DATABASE_URL = pooledUrl.replace(
+      "sslmode=require",
+      "sslmode=require&channel_binding=require"
+    );
+    expect(validateSafetyGate(bounded).directUrl).toBe(
+      bounded.DIRECT_DATABASE_URL
+    );
+
+    const queryless = validEnvironment();
+    queryless.DIRECT_DATABASE_URL = directUrl.replace("?sslmode=require", "");
+    queryless.DATABASE_URL = pooledUrl.replace("?sslmode=require", "");
+    expect(validateSafetyGate(queryless).pooledUrl).toBe(
+      queryless.DATABASE_URL
+    );
+  });
+
+  it("matches Neon driver-effective authority to the validated URL authority", () => {
+    const safety: any = validateSafetyGate(validEnvironment());
+    const client: any = new NeonClient({ connectionString: safety.directUrl });
+    expect({
+      host: client.host,
+      port: Number(client.port),
+      database: client.database,
+      user: client.user,
+    }).toEqual(safety.directAuthority);
   });
 
   it.each([

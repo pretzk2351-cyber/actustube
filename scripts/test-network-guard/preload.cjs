@@ -217,13 +217,43 @@ function isPipe(value) {
   return typeof value === "string" && !/^\d+$/.test(value);
 }
 
-function connectionHost(argumentsList) {
+function isCanonicalWindowsLocalPipe(value) {
+  if (typeof value !== "string") return false;
+  const prefix = "\\\\.\\pipe\\";
+  if (!value.toLowerCase().startsWith(prefix)) return false;
+  const remainder = value.slice(prefix.length);
+  if (!remainder || remainder.includes("/")) return false;
+  return remainder
+    .split("\\")
+    .every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+function connectionTarget(argumentsList, platform = process.platform) {
   const first = argumentsList[0];
-  if (Array.isArray(first)) return connectionHost(first);
-  if (isPipe(first)) return { pipe: true, host: null };
+  if (Array.isArray(first)) return connectionTarget(first, platform);
+  let pipePath = null;
+  if (isPipe(first)) pipePath = first;
   if (first && typeof first === "object") {
-    if (typeof first.path === "string") return { pipe: true, host: null };
+    if (typeof first.path === "string") pipePath = first.path;
+    if (pipePath !== null) {
+      return {
+        pipe: true,
+        localPipe:
+          platform === "win32"
+            ? isCanonicalWindowsLocalPipe(pipePath)
+            : true,
+        host: null,
+      };
+    }
     return { pipe: false, host: first.host ?? first.hostname ?? null };
+  }
+  if (pipePath !== null) {
+    return {
+      pipe: true,
+      localPipe:
+        platform === "win32" ? isCanonicalWindowsLocalPipe(pipePath) : true,
+      host: null,
+    };
   }
   return {
     pipe: false,
@@ -231,29 +261,65 @@ function connectionHost(argumentsList) {
   };
 }
 
-function requireLoopback(argumentsList, code) {
-  const target = connectionHost(argumentsList);
-  if (!target.pipe && !loopbackHosts.has(target.host)) {
-    rejectNetwork(code);
+function requireLoopback(
+  argumentsList,
+  code,
+  { platform = process.platform, reject = rejectNetwork } = {}
+) {
+  const target = connectionTarget(argumentsList, platform);
+  if (target.pipe) {
+    if (!target.localPipe) reject("REMOTE_NAMED_PIPE_REJECTED");
+    return target;
   }
+  if (!loopbackHosts.has(target.host)) reject(code);
+  return target;
 }
+
+function invokeGuardedConnection(
+  original,
+  receiver,
+  argumentsList,
+  code,
+  options
+) {
+  requireLoopback(argumentsList, code, options);
+  return original.apply(receiver, argumentsList);
+}
+
+module.exports = Object.freeze({
+  connectionTarget,
+  invokeGuardedConnection,
+  isCanonicalWindowsLocalPipe,
+});
 
 const originalSocketConnect = net.Socket.prototype.connect;
 net.Socket.prototype.connect = function guardedSocketConnect(...argumentsList) {
-  requireLoopback(argumentsList, "NON_LOOPBACK_TCP_REJECTED");
-  return originalSocketConnect.apply(this, argumentsList);
+  return invokeGuardedConnection(
+    originalSocketConnect,
+    this,
+    argumentsList,
+    "NON_LOOPBACK_TCP_REJECTED"
+  );
 };
 
 const originalTlsConnect = tls.connect;
 tls.connect = function guardedTlsConnect(...argumentsList) {
-  requireLoopback(argumentsList, "NON_LOOPBACK_TLS_REJECTED");
-  return originalTlsConnect.apply(this, argumentsList);
+  return invokeGuardedConnection(
+    originalTlsConnect,
+    this,
+    argumentsList,
+    "NON_LOOPBACK_TLS_REJECTED"
+  );
 };
 
 const originalServerListen = net.Server.prototype.listen;
 net.Server.prototype.listen = function guardedListen(...argumentsList) {
-  requireLoopback(argumentsList, "NON_LOOPBACK_LISTENER_REJECTED");
-  return originalServerListen.apply(this, argumentsList);
+  return invokeGuardedConnection(
+    originalServerListen,
+    this,
+    argumentsList,
+    "NON_LOOPBACK_LISTENER_REJECTED"
+  );
 };
 
 dgram.Socket.prototype.connect = function blockedDatagramConnect() {

@@ -1,6 +1,6 @@
 # ActusTube Staging Database Preflight / Postflight Runbook
 
-最終更新日：2026-08-12
+最終更新日：2026-08-13
 
 ## 目的と適用範囲
 
@@ -74,14 +74,15 @@ database接続adapterを呼び出す前に、次をすべて検証します。
 - environment名が大小文字・空白を含めずexact `staging`
 - 実行commandに対応するpreflightまたはpostflight confirmationがexact `1`
 - direct / pooledの両URLが存在し、PostgreSQL形式として解析可能
+- URL queryはdecode後のpositive allowlistで検査し、`sslmode=require`と`channel_binding=require`だけを許可。未知、重複、空key / value、大小文字やpercent encodingで表記を変えたrouting key、host / port / database / user / password / service / local-file / libpq optionsを変更するparameterは拒否
 - direct endpointとpooled endpointの役割が一致
 - direct / pooledから導出した非表示のtarget identityが一致
 - operatorがprovider UIで別経路から確認したexpected endpoint identityと一致
-- host、database、またはrole metadataに境界付き`staging` markerがあり、role名を含む全target metadataにProduction等の禁止語がない
+- host、database、またはrole metadataに境界付き`staging` markerがあり、role名を含む全target metadataにProduction等の禁止語がない。接続後は固定queryの`current_user`が各URLのdecode済みroleと完全一致する
 - Production、prod、rehearsal、backup、default、main、template database等の明示的な禁止targetではない
 - loopbackは正式commandでは拒否し、programmatic local harnessだけが明示的に許可
 
-URLに`staging`という文字があること、database名、schema、Migration履歴が同じことだけではPASSにしません。接続後は、direct / pooled双方のdatabase OID、catalog identity、Migration fingerprint、管理対象schema fingerprint、object signature fingerprintを内部で完全比較します。実値は出力しません。同一論理databaseを証明できなければexit code 3です。
+URLに`staging`という文字があること、database名、schema、Migration履歴が同じことだけではPASSにしません。許可されたquery parameterはrouting authorityを変更しない固定値だけです。接続後は、direct / pooled双方のdatabase OID、catalog identity、実database role、Migration fingerprint、管理対象schema fingerprint、object signature fingerprintを内部で完全比較します。実値は出力しません。同一論理databaseまたは期待roleを証明できなければexit code 1または3です。
 
 preflightが正式対応するdatabase engineはPostgreSQL major 18だけです。固定read-only queryで`server_version_num`を最初に取得し、direct / pooled初回、再取得、before / afterのすべてでmajor 18かつ同一versionであることを確認します。version取得不能はexit code 3、major 18以外または検証済みversion不一致はexit code 1でMigrationを禁止します。reportは実version文字列を出さず、固定`supported` / `not_verified` statusだけを保持します。
 
@@ -116,13 +117,13 @@ canonical値はrepositoryと同じ`embedded-postgres 18.4`をloopbackだけで�
 
 user-defined tableが0件であることによりapplication dataを保持するtableが存在しないことを確認し、catalog統計値にデータ残存が示される場合もFAILです。user-defined object evidenceとsequence current-state evidenceを、direct / pooled初回、両者比較、direct / pooled再取得、preflight前後比較のすべてへ含めます。preflightはprovider resourceの作成履歴や複製元をDB queryだけで証明しません。Productionから複製されていないことは、Neon側のprovider metadata preflightで別途証明する必須条件として維持します。
 
-preflightはdirect / pooledのURL上のprovider identity、別経路で入力されたexpected identity、接続後のdatabase OIDとcatalog identityを照合します。両接続の初期状態も一致しなければなりません。実identity、host、database名、role名、provider IDは出力しません。
+preflightはdirect / pooledのURL上のprovider identityとroutingを変更しないauthority、別経路で入力されたexpected identity、接続後のdatabase OID、catalog identity、`current_user`を照合します。両接続の初期状態も一致しなければなりません。実identity、host、database名、role名、provider IDは出力しません。
 
 exit code 0の場合だけ、別途承認済みの`corepack npm run db:migrate`へ進めます。exit code 1 / 2 / 3、timeout、切断、cleanup不明、結果不明ではMigrationを実行しません。失敗または結果不明でもpreflightを再実行しません。
 
 ## 読み取り専用保証
 
-direct / pooledはそれぞれ、bounded connection timeoutの後に`REPEATABLE READ READ ONLY` transactionを開始します。transactionのread-only状態を確認し、statement timeoutとlock timeoutをtransaction内だけに設定します。
+direct / pooledはそれぞれ、bounded connection timeoutの後にbefore用の`REPEATABLE READ READ ONLY` transactionを開始します。transactionのread-only状態を確認し、statement timeoutとlock timeoutをtransaction内だけに設定します。before収集後はdirect / pooled双方のtransactionを安全に終了し、その両方の終了を確認してからafter用の新しい`REPEATABLE READ READ ONLY` transactionを双方で開始します。afterはbeforeと同じMVCC snapshotを再利用しません。終了または再開始を一方でも確認できなければexit code 3です。
 
 repository管理の固定queryだけを許可し、次の処理を拒否します。
 
@@ -207,9 +208,20 @@ role名、owner名、grantee名は出力しません。
 11. preflight / postflightそれぞれのJSONとhuman summaryを確認し、全必須項目PASSかつexit code 0の場合だけ次のauthenticated staging test工程へ進める。
 12. 1件でもFAIL / NOT VERIFIED / skipped / timeout / cleanup不明があれば続行せず、親shellからstaging用Environment Variablesを削除して停止する。
 
+## preflight後からMigration開始前のTOCTOU
+
+preflightのfresh after snapshotはpreflight実行中のdriftを検出しますが、preflight終了後のconcurrency barrierではありません。exit code 0は将来の任意時点のMigrationを許可しません。
+
+- project ownerが明示承認した排他的maintenance window内で実行する
+- preflight成功後は、別command、provider管理操作、schema変更、接続先・Environment Variable変更を挟まず、同じ担当と固定targetで直ちに承認済みMigration commandへ進む
+- 遅延、terminal再接続、担当者変更、provider操作、予期しないdatabase activity、target metadataの変化があれば、そのpreflight PASSを流用せず停止し、新しい明示承認の下でpreflightからやり直す
+- 将来のMigration runnerでは、preflightとMigrationが共有するadvisory lock、またはMigration開始直前の同等なcatalog / identity再検証を導入候補とする
+
+現行実装はpreflightとMigrationを同一lockで束縛しておらず、lock実装済みとは扱いません。
+
 ## 出力とexit code
 
-preflight / postflightの出力は機械可読JSONと人間向けsummaryです。出力可能なのは固定check ID、status、分類別件数、Migration tag、exit codeだけです。URL、host、database、user、role、owner、object / schema名、OID、branch / endpoint / project ID、query parameter、raw hash、hash prefix、raw driver error、stack、cause、実データを出力しません。preflightはterminal出力前にexact public schemaへ投影し、unknown key、許可外status、非sanitized文字列を含むreportを固定`PREFLIGHT_PUBLIC_REPORT_INVALID`のexit code 3へ置換します。preflightの`userDefinedObjects`はexit code 0 / 1 / 2 / 3の全経路で`direct`、`pooled`、`directAfter`、`pooledAfter`を保持し、未取得値は`not_verified`です。formatterは欠落fieldを防御的に扱い、formatter failureはraw errorを出さない固定exit code 3 reportへ置換します。JSONとhuman summaryは同じreportから各1回だけ出力します。CLIの`uncaughtException` / `unhandledRejection` listenerは参照を保持し、正常終了、検証済み失敗、top-level failure、fatal eventの各経路で解除します。fatal後のexit code 3は後続結果で上書きしません。
+preflight / postflightの出力は機械可読JSONと人間向けsummaryです。出力可能なのは固定check ID、status、分類別件数、Migration tag、exit codeだけです。URL、host、database、user、role、owner、object / schema名、OID、branch / endpoint / project ID、query parameter、raw hash、hash prefix、raw driver error、stack、cause、実データを出力しません。preflightはterminal出力前にexact public schemaへ投影し、unknown key、許可外status、非sanitized文字列を含むreportを固定`PREFLIGHT_PUBLIC_REPORT_INVALID`のexit code 3へ置換します。さらにexit 0は単一のcanonical semantic predicateでPostgreSQL version、connection authority、database / role identity、extension inventory、migration history / column / exact catalog、user-defined object catalog、read-only invariant、fresh before / after比較、cleanup、canonical summary、overall statusを再検証します。missing、duplicate、fail、`not_verified`、unknown check ID、summary / overall contradictionがあれば、main resultがexit 0でも固定exit 3 reportへ置換します。preflightの`userDefinedObjects`はexit code 0 / 1 / 2 / 3の全経路で`direct`、`pooled`、`directAfter`、`pooledAfter`を保持し、未取得値は`not_verified`です。formatterは欠落fieldを防御的に扱い、formatter failureはraw errorを出さない固定exit code 3 reportへ置換します。JSONとhuman summaryは同じreportから各1回だけ出力します。CLIの`uncaughtException` / `unhandledRejection` listenerは参照を保持し、正常終了、検証済み失敗、top-level failure、fatal eventの各経路で解除します。fatal後のexit code 3は後続結果で上書きしません。
 
 - `0`：全必須検証PASS
 - `1`：検証できた不一致 / FAIL
@@ -222,7 +234,7 @@ preflightのexit code 1はMigration履歴が空でない、unknown / duplicate�
 
 ## local harnessの証明範囲
 
-`tests/staging-database-preflight.test.ts`は外部接続なしのadapterで、pristine / exact empty migration table、PostgreSQL 18 / 17 / version不明、全安全gate、identity不一致、partial / applied / unknown / duplicate Migration、各residual object分類、sequence current state、direct / pooled差、before / after差、固定report shape、timeout、rollback / close、cleanup rejection / timeout、listener解除、secret-safe出力を検証します。column / relation catalogはcanonical 3列、generated / identity / domain / collation / dropped / inherited / ACL / option / storage / statistics target、tablespace、exclusion flag、constraint enforcement / period / mapping / conkey / name drift、field取得不能を検証します。extension分類はProduction validation pathへdirect membership、正式`_RETURN` rule、正式FK enforcement trigger、automatic dependency、後付けindex / trigger、false-clean、candidate欠落・重複等のfixtureを通します。実子processテストは外部DBへ接続しないadapterとdependency-injected entrypoint runnerを使い、検証、単一report、cleanup、listener解除、exit code 3の強制終了を通します。実package command、direct-entry判定後のdefault Neon adapter、実Neon DB、provider transaction poolerはNOT TESTEDです。通常のexit code 0 / 1 / 2に強制終了は使いません。
+`tests/staging-database-preflight.test.ts`の修正前の実PostgreSQL検証はextension分類fragment中心で、identity、migration catalog、user-defined object catalog、before / afterの主要preflight経路はmock adapterでした。今回追加したlocal integrationはrepositoryと同じ`embedded-postgres 18.4`に対し、preflight本体と同じproduction query実行関数を使用してdatabase / role / server identity、extension inventory、migration table / column inventory、exact migration catalog、user-defined object catalog / count、read-only transaction、fresh before / afterを検証します。exact empty migration tableの安定状態はexit 0となり、独立した第三sessionのDDL commitはfresh after snapshotでdriftとして検出されexit 0を拒否します。embedded PostgreSQLの子process起動時はDB、PostgreSQL、proxy、token、password、secret、credential、API key、auth系Environment Variableを継承させず、値を出力・file保存せずに親test workerへ復元します。mock adapterによるPostgreSQL 17 / version不明、安全gate、partial / applied / unknown / duplicate Migration、各catalog field drift、timeout、cleanup、listener、secret-safe出力の単体検証も維持します。実子processテストは外部DBへ接続しないadapterとdependency-injected entrypoint runnerを使います。実package command、direct-entry判定後のdefault Neon adapter、実Neon DB、provider transaction pooler、実staging owner / ACL、native cancellationはNOT TESTEDです。通常のexit code 0 / 1 / 2に強制終了は使いません。
 
 `npm run test:db-postflight:local`は外部DB関連Environment Variablesを子processへ渡さず、loopbackだけにbindした使い捨てPostgreSQLを起動します。Migration 0000〜0006、別owner / runtime role、正常系、別DB不一致、schema drift、未知table / function / enum、PUBLIC EXECUTE、grant option、column ACL、sequence SELECT、default ACL想定外grantee、function default式drift、Migration hash不一致、read-only SQL instrumentation、stdout / stderr redaction、timeout cleanupを確認し、process、port、data directoryを削除します。
 
@@ -245,8 +257,8 @@ staging resourceを将来削除する場合は、対象、影響、backup要否�
 
 実行前にserver-side process入力として`ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS`を必須とします。値は`{"schemaVersion":1,"extensions":[{"name":"...","schema":"...","version":"..."}]}`形式のJSONで、最大32,768 bytes、最大128 entries、各string最大128 charactersです。plain own objectとexact keyだけを受理し、unknown／dangerous key、prototype pollution形状、duplicate name、control character、NUL、path separator、空値、型不正、malformed／oversize JSONを拒否します。期待値とdirect／pooledのbefore／after inventoryは順序非依存でexact比較し、name／schema／versionの不足・余分・不一致を`STAGING_EXTENSION_INVENTORY_MISMATCH`として停止します。未設定は`STAGING_EXTENSION_INVENTORY_REQUIRED`、入力不正は`STAGING_EXTENSION_INVENTORY_INVALID`、実catalog取得不能は`STAGING_EXTENSION_INVENTORY_UNAVAILABLE`です。実際のstaging extension inventoryを本人が安全に確認し、値をcommand line、Git、reportへ露出せずprocess入力してください。
 
-terminal reportはJSON summaryとhuman summaryをmemory上で単一buffer化し、terminal barrier後に同期write 1回だけで出力します。commit前のfatalはmain結果より優先し、exit 3のfatal report pairだけを出力します。main処理のAbortSignalはDB open、query scheduling、query待機、direct／pooled比較、report準備、cleanup開始判断のorchestration境界へ伝播します。cleanupはmainとは別のcontrollerを使い、direct／pooledを同時に開始して全体を最大5,000msに制限します。開始済みのprovider adapter connect / queryをdriverがnative cancelすることは、実provider未接続のためNOT TESTEDです。exit code 3では同期report commitとlistener解除後にprocessを終了します。
+terminal reportはJSON summaryとhuman summaryをmemory上で単一buffer化し、terminal barrier後に同期write 1回だけで出力します。commit前のfatalはmain結果より優先し、exit 3のfatal report pairだけを出力します。main処理のAbortSignalはDB open、query scheduling、query待機、direct／pooled比較、before transaction終了、after transaction開始、report準備、cleanup開始判断のorchestration境界へ伝播します。cleanupはmainとは別のcontrollerを使い、direct／pooledを同時に開始して全体を最大5,000msに制限します。開始済みのprovider adapter connect / queryをdriverがnative cancelすることは、実provider未接続のためNOT TESTEDです。exit code 3では同期report commitとlistener解除後にprocessを終了します。
 
-network evidenceの証明範囲はguardを明示的に導入したNode childだけです。報告項目は`guarded Node API unexpected violation`と`expected blocked DNS probe`の観測件数です。接続成功を観測する経路ではないため、`successful guarded Node API external connection`と`native child external connection`はどちらも`NOT VERIFIED`とします。expected probe IDは専用DNS probe childだけへ設定し、親profileへ設定しません。
+network evidenceの証明範囲はguardを明示的に導入したNode childだけです。報告項目は`guarded Node API unexpected violation`と`expected blocked DNS probe`の観測件数です。Windowsではcanonical `\\.\pipe\...`だけをlocal named pipeとして許可し、remote UNC、slash表記、extended UNC、`options.path`のremote形式をoriginal connect前にunexpected violationとして拒否します。POSIX local Unix domain socketはlocal IPCとして維持します。接続成功を観測する経路ではないため、`successful guarded Node API external connection`と`native child external connection`はどちらも`NOT VERIFIED`とします。expected probe IDは専用DNS probe childだけへ設定し、親profileへ設定しません。
 
 このlocal harnessの観測範囲はguardを明示的に導入したNode childだけです。Next.js、npm、Vitest、Corepackその他のprocessが`.env.local`を読み取らなかったことや、native childの外部接続がなかったことは証明しません。

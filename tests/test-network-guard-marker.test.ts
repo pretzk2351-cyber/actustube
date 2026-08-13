@@ -690,6 +690,113 @@ describe("test network guard occurrence markers", () => {
     expect(child.unexpectedViolationMarkers).toHaveLength(6);
   });
 
+  it("rejects Windows remote named pipes before connect and records an occurrence", () => {
+    const preloadPath = resolve("scripts/test-network-guard/preload.cjs");
+    const localPipe = "\\\\.\\pipe\\actustube-local";
+    const remotePipe = "\\\\server\\pipe\\actustube-remote";
+    const slashRemotePipe = "//server/pipe/actustube-remote";
+    const extendedRemotePipe = "\\\\?\\UNC\\server\\pipe\\actustube-remote";
+    const posixSocket = "/tmp/actustube-local.sock";
+    const child = runGuardedDnsChild(
+      `
+        const net = process.getBuiltinModule("net");
+        const guard = require(${JSON.stringify(preloadPath)});
+        const localPipe = ${JSON.stringify(localPipe)};
+        const remoteTargets = [
+          [${JSON.stringify(remotePipe)}],
+          [${JSON.stringify(slashRemotePipe)}],
+          [${JSON.stringify(extendedRemotePipe)}],
+          [{ path: ${JSON.stringify(remotePipe)} }],
+        ];
+        let remoteOriginalCalls = 0;
+        const remoteCodes = [];
+        for (const argumentsList of remoteTargets) {
+          try {
+            guard.invokeGuardedConnection(
+              () => { remoteOriginalCalls += 1; },
+              null,
+              argumentsList,
+              "NON_LOOPBACK_TCP_REJECTED",
+              {
+                platform: "win32",
+                reject: (code) => { throw new Error(code); },
+              }
+            );
+          } catch (error) {
+            remoteCodes.push(error?.message);
+          }
+        }
+        let localOriginalCalls = 0;
+        guard.invokeGuardedConnection(
+          () => { localOriginalCalls += 1; },
+          null,
+          [localPipe],
+          "NON_LOOPBACK_TCP_REJECTED",
+          { platform: "win32", reject: (code) => { throw new Error(code); } }
+        );
+        guard.invokeGuardedConnection(
+          () => { localOriginalCalls += 1; },
+          null,
+          [${JSON.stringify(posixSocket)}],
+          "NON_LOOPBACK_TCP_REJECTED",
+          { platform: "linux", reject: (code) => { throw new Error(code); } }
+        );
+        guard.invokeGuardedConnection(
+          () => { localOriginalCalls += 1; },
+          null,
+          [{ host: "127.0.0.1", port: 5432 }],
+          "NON_LOOPBACK_TCP_REJECTED",
+          { platform: "win32", reject: (code) => { throw new Error(code); } }
+        );
+        let actualGuardCode = null;
+        try {
+          net.Socket.prototype.connect.call({}, ${JSON.stringify(remotePipe)});
+        } catch (error) {
+          actualGuardCode = error?.message;
+        }
+        console.log(JSON.stringify({
+          localPipe: guard.connectionTarget([localPipe], "win32"),
+          remotePipe: guard.connectionTarget([${JSON.stringify(remotePipe)}], "win32"),
+          slashRemotePipe: guard.connectionTarget([${JSON.stringify(slashRemotePipe)}], "win32"),
+          extendedRemotePipe: guard.connectionTarget([${JSON.stringify(extendedRemotePipe)}], "win32"),
+          optionsRemotePipe: guard.connectionTarget([{ path: ${JSON.stringify(remotePipe)} }], "win32"),
+          posixSocket: guard.connectionTarget([${JSON.stringify(posixSocket)}], "linux"),
+          loopback: guard.connectionTarget([{ host: "127.0.0.1", port: 5432 }], "win32"),
+          remoteOriginalCalls,
+          localOriginalCalls,
+          remoteCodes,
+          actualGuardCode,
+        }));
+      `,
+      {}
+    );
+
+    expect(child.result.error).toBeUndefined();
+    expect(child.result.status).toBe(0);
+    expect(child.result.signal).toBeNull();
+    expect(child.result.stderr).toBe("");
+    const result = JSON.parse(child.result.stdout.trim());
+    expect(result.localPipe).toMatchObject({ pipe: true, localPipe: true });
+    for (const key of [
+      "remotePipe",
+      "slashRemotePipe",
+      "extendedRemotePipe",
+      "optionsRemotePipe",
+    ]) {
+      expect(result[key]).toMatchObject({ pipe: true, localPipe: false });
+    }
+    expect(result.posixSocket).toMatchObject({ pipe: true, localPipe: true });
+    expect(result.loopback).toEqual({ pipe: false, host: "127.0.0.1" });
+    expect(result.remoteOriginalCalls).toBe(0);
+    expect(result.localOriginalCalls).toBe(3);
+    expect(result.remoteCodes).toEqual(
+      Array(4).fill("REMOTE_NAMED_PIPE_REJECTED")
+    );
+    expect(result.actualGuardCode).toBe("REMOTE_NAMED_PIPE_REJECTED");
+    expect(child.unexpectedViolationMarkers).toHaveLength(1);
+    expect(child.unexpectedViolationMarkers[0].role).toBe("network_violation");
+  });
+
   it("allows exactly one expected DNS violation and rejects other probe use", () => {
     const child = runGuardedDnsChild(
       `

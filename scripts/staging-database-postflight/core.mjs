@@ -1028,18 +1028,7 @@ async function openReadOnlyConnection(
       ),
       signal
     );
-    await runQuery(connection, SQL.begin, [], onQuery, { signal });
-    await runQuery(connection, SQL.statementTimeout, [], onQuery, { signal });
-    await runQuery(connection, SQL.lockTimeout, [], onQuery, { signal });
-    const readOnly = await runQuery(
-      connection,
-      SQL.transactionReadOnly,
-      [],
-      onQuery,
-      { signal }
-    );
-    const value = readOnly.rows?.[0]?.transaction_read_only;
-    if (value !== "on") throw verifiedFailure("TRANSACTION_NOT_READ_ONLY");
+    await beginReadOnlyTransaction(connection, onQuery, { signal });
     return connection;
   } catch (error) {
     if (connection) {
@@ -1063,11 +1052,34 @@ async function openReadOnlyConnection(
   }
 }
 
+async function beginReadOnlyTransaction(connection, onQuery, { signal } = {}) {
+  await runQuery(connection, SQL.begin, [], onQuery, { signal });
+  await runQuery(connection, SQL.statementTimeout, [], onQuery, { signal });
+  await runQuery(connection, SQL.lockTimeout, [], onQuery, { signal });
+  const readOnly = await runQuery(
+    connection,
+    SQL.transactionReadOnly,
+    [],
+    onQuery,
+    { signal }
+  );
+  const value = readOnly.rows?.[0]?.transaction_read_only;
+  if (value !== "on") throw verifiedFailure("TRANSACTION_NOT_READ_ONLY");
+}
+
+async function endReadOnlyTransaction(connection, onQuery, { signal } = {}) {
+  try {
+    await runQuery(connection, SQL.rollback, [], onQuery, { signal });
+  } catch {
+    throw notVerified("TRANSACTION_ROLLBACK_UNVERIFIED");
+  }
+}
+
 async function closeReadOnlyConnection(connection, onQuery, { signal } = {}) {
   throwIfAborted(signal);
   let rollbackFailed = false;
   try {
-    await runQuery(connection, SQL.rollback, [], onQuery, { signal });
+    await endReadOnlyTransaction(connection, onQuery, { signal });
   } catch {
     rollbackFailed = true;
   }
@@ -1986,8 +1998,10 @@ export async function verifyStagingDatabasePostflight({
 
 export const POSTFLIGHT_SQL_FOR_TESTS = SQL;
 export {
+  beginReadOnlyTransaction,
   closeReadOnlyConnection,
   comparableEvidence,
+  endReadOnlyTransaction,
   normalizeSqlExpression,
   openReadOnlyConnection,
   runQuery,

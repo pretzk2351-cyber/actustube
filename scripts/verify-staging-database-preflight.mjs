@@ -7,6 +7,7 @@ import {
   verifyStagingDatabasePreflight,
 } from "./staging-database-preflight/core.mjs";
 import { createNeonPostflightAdapter } from "./staging-database-postflight/neon-adapter.mjs";
+import { EXPECTED_MIGRATION_TAGS } from "./staging-database-postflight/manifest.mjs";
 
 export const PARENT_ENVIRONMENT_NOTICE =
   "このscriptは親shellの環境変数を削除できません。呼出し元processからstaging DB用環境変数を削除し、不要ならterminalを閉じてください。";
@@ -16,10 +17,13 @@ const PUBLIC_REPORT_KEYS = Object.freeze([
   "postgresqlVersion",
   "directConnection",
   "pooledConnection",
+  "connectionAuthority",
   "directPooledIdentity",
+  "databaseRoleIdentity",
   "expectedIdentity",
   "extensionInventory",
   "initialState",
+  "migrationCatalog",
   "migrationHistory",
   "applicationTables",
   "applicationFunctions",
@@ -28,8 +32,10 @@ const PUBLIC_REPORT_KEYS = Object.freeze([
   "migrationSequenceState",
   "partialSchema",
   "readOnlyInvariant",
+  "beforeAfterComparison",
   "cleanup",
   "secretRedaction",
+  "overallStatus",
   "exitCode",
 ]);
 const VERSION_KEYS = Object.freeze([
@@ -98,6 +104,8 @@ const PUBLIC_CHECK_IDS = new Set([
   "DIRECT_STAGING_MARKER_REQUIRED",
   "DIRECT_TARGET_UNCLASSIFIED",
   "DIRECT_URL_INVALID",
+  "DIRECT_URL_FRAGMENT_REJECTED",
+  "DIRECT_URL_QUERY_REJECTED",
   "DIRECT_URL_PROTOCOL_REJECTED",
   "DIRECT_URL_REQUIRED",
   "EMPTY_SQL_REJECTED",
@@ -174,9 +182,14 @@ const PUBLIC_CHECK_IDS = new Set([
   "POOLED_ENDPOINT_KIND_REJECTED",
   "POOLED_FORBIDDEN_TARGET",
   "POOLED_LOOPBACK_REJECTED",
+  "POOLED_ROLE_IDENTITY_MISMATCH",
+  "POOLED_ROLE_IDENTITY_UNAVAILABLE",
+  "POOLED_ROLE_UNAVAILABLE",
   "POOLED_STAGING_MARKER_REQUIRED",
   "POOLED_TARGET_UNCLASSIFIED",
   "POOLED_URL_INVALID",
+  "POOLED_URL_FRAGMENT_REJECTED",
+  "POOLED_URL_QUERY_REJECTED",
   "POOLED_URL_PROTOCOL_REJECTED",
   "POOLED_URL_REQUIRED",
   "POSTGRESQL_VERSION_CHANGED",
@@ -186,6 +199,7 @@ const PUBLIC_CHECK_IDS = new Set([
   "PREFLIGHT_FORMATTER_FAILURE",
   "PREFLIGHT_OUTPUT_FAILURE",
   "PREFLIGHT_PUBLIC_REPORT_INVALID",
+  "PREFLIGHT_SNAPSHOT_BOUNDARY_INVALID",
   "PREFLIGHT_TERMINAL_BARRIER_FAILURE",
   "PREFLIGHT_TOP_LEVEL_FAILURE",
   "PREFLIGHT_UNAVAILABLE",
@@ -280,6 +294,69 @@ function publicUserObjectCounts(value) {
   );
 }
 
+function arraysEqual(left, right) {
+  return (
+    Array.isArray(left) &&
+    Array.isArray(right) &&
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
+function assertCanonicalPreflightOutcome(report) {
+  if (report.exitCode !== 0) {
+    const expectedOverall = report.exitCode === 3 ? "not_verified" : "fail";
+    if (report.overallStatus !== expectedOverall) {
+      throw new TypeError("INVALID_PUBLIC_OVERALL_STATUS");
+    }
+    return;
+  }
+
+  const expectedSequenceState =
+    report.initialState === "pristine" ? "not_applicable" : "unused";
+  const successConditions = [
+    report.overallStatus === "pass",
+    Object.values(report.postgresqlVersion).every(
+      (status) => status === "supported"
+    ),
+    report.directConnection === "pass",
+    report.pooledConnection === "pass",
+    report.connectionAuthority === "match",
+    report.directPooledIdentity === "match",
+    report.databaseRoleIdentity === "match",
+    report.expectedIdentity === "match",
+    report.extensionInventory === "match",
+    ["pristine", "empty_migration_table"].includes(report.initialState),
+    report.migrationCatalog === "pass",
+    report.migrationHistory.status === "pass",
+    report.migrationHistory.expected === EXPECTED_MIGRATION_TAGS.length,
+    report.migrationHistory.applied === 0,
+    report.migrationHistory.pending === EXPECTED_MIGRATION_TAGS.length,
+    arraysEqual(report.migrationHistory.pendingTags, EXPECTED_MIGRATION_TAGS),
+    new Set(report.migrationHistory.pendingTags).size ===
+      report.migrationHistory.pendingTags.length,
+    report.migrationHistory.duplicates === 0,
+    report.migrationHistory.unknown === 0,
+    report.applicationTables === 0,
+    report.applicationFunctions === 0,
+    report.applicationData === 0,
+    Object.values(report.userDefinedObjects).every((counts) =>
+      Object.values(counts).every((count) => count === 0)
+    ),
+    Object.values(report.migrationSequenceState).every(
+      (status) => status === expectedSequenceState
+    ),
+    report.partialSchema === "none",
+    report.readOnlyInvariant === "pass",
+    report.beforeAfterComparison === "match",
+    report.cleanup === "pass",
+    report.secretRedaction === "pass",
+  ];
+  if (successConditions.some((condition) => condition !== true)) {
+    throw new TypeError("INVALID_PUBLIC_SUCCESS_SEMANTICS");
+  }
+}
+
 export function projectPublicPreflightReport(report) {
   const hasFailure =
     isPlainRecord(report) && Object.hasOwn(report, "failure");
@@ -355,7 +432,7 @@ export function projectPublicPreflightReport(report) {
     throw new TypeError("INVALID_PUBLIC_FAILURE_STATE");
   }
 
-  return {
+  const projectedReport = {
     environment: publicEnum(report.environment, ["staging"]),
     postgresqlVersion,
     directConnection: publicEnum(report.directConnection, [
@@ -368,7 +445,17 @@ export function projectPublicPreflightReport(report) {
       "fail",
       "not_verified",
     ]),
+    connectionAuthority: publicEnum(report.connectionAuthority, [
+      "match",
+      "fail",
+      "not_verified",
+    ]),
     directPooledIdentity: publicEnum(report.directPooledIdentity, [
+      "match",
+      "fail",
+      "not_verified",
+    ]),
+    databaseRoleIdentity: publicEnum(report.databaseRoleIdentity, [
       "match",
       "fail",
       "not_verified",
@@ -387,6 +474,11 @@ export function projectPublicPreflightReport(report) {
       "empty_migration_table",
       "not_verified",
     ]),
+    migrationCatalog: publicEnum(report.migrationCatalog, [
+      "pass",
+      "fail",
+      "not_verified",
+    ]),
     migrationHistory,
     applicationTables: publicCount(report.applicationTables),
     applicationFunctions: publicCount(report.applicationFunctions),
@@ -398,11 +490,23 @@ export function projectPublicPreflightReport(report) {
       "pass",
       "not_verified",
     ]),
+    beforeAfterComparison: publicEnum(report.beforeAfterComparison, [
+      "match",
+      "fail",
+      "not_verified",
+    ]),
     cleanup: publicEnum(report.cleanup, ["pass", "not_verified"]),
     secretRedaction: publicEnum(report.secretRedaction, ["pass"]),
+    overallStatus: publicEnum(report.overallStatus, [
+      "pass",
+      "fail",
+      "not_verified",
+    ]),
     ...(failure ? { failure } : {}),
     exitCode,
   };
+  assertCanonicalPreflightOutcome(projectedReport);
+  return projectedReport;
 }
 
 function reportValue(report, path) {
@@ -443,7 +547,9 @@ export function formatHumanSummary(report) {
     "ActusTube staging database preflight",
     `direct connection: ${reportValue(report, ["directConnection"])}`,
     `pooled connection: ${reportValue(report, ["pooledConnection"])}`,
+    `connection authority: ${reportValue(report, ["connectionAuthority"])}`,
     `direct / pooled identity: ${reportValue(report, ["directPooledIdentity"])}`,
+    `database role identity: ${reportValue(report, ["databaseRoleIdentity"])}`,
     `expected identity: ${reportValue(report, ["expectedIdentity"])}`,
     `extension inventory: ${reportValue(report, ["extensionInventory"])}`,
     `PostgreSQL version (direct): ${reportValue(report, ["postgresqlVersion", "direct"])}`,
@@ -451,6 +557,7 @@ export function formatHumanSummary(report) {
     `PostgreSQL version (direct after): ${reportValue(report, ["postgresqlVersion", "directAfter"])}`,
     `PostgreSQL version (pooled after): ${reportValue(report, ["postgresqlVersion", "pooledAfter"])}`,
     `initial state: ${reportValue(report, ["initialState"])}`,
+    `migration catalog: ${reportValue(report, ["migrationCatalog"])}`,
     `migration history: ${reportValue(report, ["migrationHistory", "status"])}`,
     `applied migrations: ${reportValue(report, ["migrationHistory", "applied"])}`,
     `pending migrations: ${reportValue(report, ["migrationHistory", "pending"])}`,
@@ -469,8 +576,10 @@ export function formatHumanSummary(report) {
     `user-defined objects (pooled after): ${reportValue(report, ["userDefinedObjects", "pooledAfter", "total"])}`,
     `partial schema: ${reportValue(report, ["partialSchema"])}`,
     `read-only invariant: ${reportValue(report, ["readOnlyInvariant"])}`,
+    `before / after comparison: ${reportValue(report, ["beforeAfterComparison"])}`,
     `cleanup: ${reportValue(report, ["cleanup"])}`,
     `secret redaction: ${reportValue(report, ["secretRedaction"])}`,
+    `overall status: ${reportValue(report, ["overallStatus"])}`,
     ...failureSummary(report),
     `exit code: ${reportValue(report, ["exitCode"])}`,
     PARENT_ENVIRONMENT_NOTICE,

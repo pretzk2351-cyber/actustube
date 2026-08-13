@@ -6,7 +6,9 @@ import {
 } from "../staging-database-postflight/safety.mjs";
 import {
   POSTFLIGHT_SQL_FOR_TESTS,
+  beginReadOnlyTransaction,
   closeReadOnlyConnection,
+  endReadOnlyTransaction,
   loadRepositorySpecification,
   openReadOnlyConnection,
   runQuery,
@@ -387,6 +389,9 @@ const SQL = Object.freeze({
       AS server_version_num
   `,
   identity: POSTFLIGHT_SQL_FOR_TESTS.identity,
+  roleIdentity: `
+    SELECT current_user::text AS role_name
+  `,
   extensionInventory: `
     SELECT
       extension_entry.extname AS name,
@@ -1363,6 +1368,9 @@ async function collectPreflightEvidence(
   const identity = (
     await runQuery(connection, SQL.identity, [], onQuery, { signal })
   ).rows || [];
+  const roleIdentity = (
+    await runQuery(connection, SQL.roleIdentity, [], onQuery, { signal })
+  ).rows || [];
   let extensionInventory;
   try {
     const extensionResult = await runQuery(
@@ -1421,6 +1429,7 @@ async function collectPreflightEvidence(
   return {
     serverVersion,
     identity,
+    roleIdentity,
     extensionInventory,
     migrationCatalog,
     migrationColumns,
@@ -1450,6 +1459,17 @@ function requireIdentityMatch(directEvidence, pooledEvidence) {
     direct.databaseOid === pooled.databaseOid &&
       direct.systemIdentifier === pooled.systemIdentifier,
     "LOGICAL_DATABASE_IDENTITY_MISMATCH"
+  );
+}
+
+function validateRoleIdentity(evidence, expectedRole, kind) {
+  const actualRole = evidence.roleIdentity?.[0]?.role_name;
+  if (typeof actualRole !== "string" || actualRole.length === 0) {
+    throw notVerified(`${kind.toUpperCase()}_ROLE_IDENTITY_UNAVAILABLE`);
+  }
+  requireCondition(
+    actualRole === expectedRole,
+    `${kind.toUpperCase()}_ROLE_IDENTITY_MISMATCH`
   );
 }
 
@@ -2281,10 +2301,13 @@ export function createPreflightBaseReport() {
     },
     directConnection: "not_verified",
     pooledConnection: "not_verified",
+    connectionAuthority: "not_verified",
     directPooledIdentity: "not_verified",
+    databaseRoleIdentity: "not_verified",
     expectedIdentity: "not_verified",
     extensionInventory: "not_verified",
     initialState: "not_verified",
+    migrationCatalog: "not_verified",
     migrationHistory: {
       status: "not_verified",
       expected: 7,
@@ -2311,10 +2334,27 @@ export function createPreflightBaseReport() {
     },
     partialSchema: "not_verified",
     readOnlyInvariant: "not_verified",
+    beforeAfterComparison: "not_verified",
     cleanup: "not_verified",
     secretRedaction: "pass",
+    overallStatus: "not_verified",
     exitCode: 3,
   };
+}
+
+async function applyTransactionBoundary(
+  connections,
+  operation,
+  onQuery,
+  signal
+) {
+  throwIfPreflightAborted(signal);
+  const results = await Promise.allSettled(
+    connections.map((connection) => operation(connection, onQuery, { signal }))
+  );
+  const rejected = results.find((result) => result.status === "rejected");
+  if (rejected) throw rejected.reason;
+  throwIfPreflightAborted(signal);
 }
 
 export async function verifyStagingDatabasePreflight({
@@ -2324,6 +2364,7 @@ export async function verifyStagingDatabasePreflight({
   allowLoopback = false,
   onQuery = undefined,
   signal = undefined,
+  betweenSnapshotTransactions = undefined,
 }) {
   const report = createPreflightBaseReport();
   let directConnection;
@@ -2334,6 +2375,7 @@ export async function verifyStagingDatabasePreflight({
       confirmationKey: PREFLIGHT_CONFIRMATION_KEY,
       confirmationErrorCode: "STAGING_PREFLIGHT_CONFIRMATION_REQUIRED",
     });
+    report.connectionAuthority = "match";
     throwIfPreflightAborted(signal);
     const expectedExtensions = parseExpectedStagingExtensions(environment);
     report.expectedIdentity = "match";
@@ -2383,6 +2425,8 @@ export async function verifyStagingDatabasePreflight({
     );
     requireIdentityMatch(directBefore, pooledBefore);
     report.directPooledIdentity = "match";
+    validateRoleIdentity(directBefore, safety.directRole, "direct");
+    validateRoleIdentity(pooledBefore, safety.pooledRole, "pooled");
 
     const directUserObjects = summarizeUserDefinedObjects(
       directBefore.userDefinedObjects
@@ -2418,6 +2462,26 @@ export async function verifyStagingDatabasePreflight({
     );
     throwIfPreflightAborted(signal);
 
+    await applyTransactionBoundary(
+      [directConnection, pooledConnection],
+      endReadOnlyTransaction,
+      onQuery,
+      signal
+    );
+    if (betweenSnapshotTransactions !== undefined) {
+      if (typeof betweenSnapshotTransactions !== "function") {
+        throw notVerified("PREFLIGHT_SNAPSHOT_BOUNDARY_INVALID");
+      }
+      await betweenSnapshotTransactions({ signal });
+      throwIfPreflightAborted(signal);
+    }
+    await applyTransactionBoundary(
+      [directConnection, pooledConnection],
+      beginReadOnlyTransaction,
+      onQuery,
+      signal
+    );
+
     const directAfter = await collectPreflightEvidence(
       directConnection,
       onQuery,
@@ -2452,6 +2516,9 @@ export async function verifyStagingDatabasePreflight({
     );
     requireIdentityMatch(directAfter, pooledAfter);
     report.directPooledIdentity = "match";
+    validateRoleIdentity(directAfter, safety.directRole, "direct");
+    validateRoleIdentity(pooledAfter, safety.pooledRole, "pooled");
+    report.databaseRoleIdentity = "match";
     throwIfPreflightAborted(signal);
     const directAfterUserObjects = summarizeUserDefinedObjects(
       directAfter.userDefinedObjects
@@ -2476,9 +2543,12 @@ export async function verifyStagingDatabasePreflight({
         comparableEvidence(pooledBefore) === comparableEvidence(pooledAfter),
       "READ_ONLY_INVARIANT_MISMATCH"
     );
+    report.migrationCatalog = "pass";
+    report.beforeAfterComparison = "match";
 
     Object.assign(report, directState, {
       readOnlyInvariant: "pass",
+      overallStatus: "pass",
       exitCode: 0,
     });
   } catch (error) {
@@ -2488,6 +2558,8 @@ export async function verifyStagingDatabasePreflight({
       checkId: issue.code,
       status: issue.exitCode === 3 ? "not_verified" : issue.status,
     };
+    report.overallStatus =
+      issue.exitCode === 3 ? "not_verified" : "fail";
     if (
       issue.code === "EXPECTED_STAGING_IDENTITY_MISMATCH" ||
       issue.code === "EXPECTED_STAGING_IDENTITY_REQUIRED"
@@ -2503,6 +2575,15 @@ export async function verifyStagingDatabasePreflight({
     }
     if (issue.code === "LOGICAL_DATABASE_IDENTITY_MISMATCH") {
       report.directPooledIdentity = "fail";
+    }
+    if (
+      issue.code === "DIRECT_ROLE_IDENTITY_MISMATCH" ||
+      issue.code === "POOLED_ROLE_IDENTITY_MISMATCH"
+    ) {
+      report.databaseRoleIdentity = "fail";
+    }
+    if (issue.code === "READ_ONLY_INVARIANT_MISMATCH") {
+      report.beforeAfterComparison = "fail";
     }
   } finally {
     const cleanupIssues = [];
@@ -2529,6 +2610,7 @@ export async function verifyStagingDatabasePreflight({
     }
     if (cleanupIssues.length > 0) {
       report.cleanup = "not_verified";
+      report.overallStatus = "not_verified";
       report.exitCode = 3;
       report.failure = {
         checkId: "CONNECTION_CLEANUP_UNVERIFIED",

@@ -19,6 +19,10 @@ const FORBIDDEN_TARGET_PART =
 const STAGING_TARGET_PART = /(?:^|[-_.\/])staging(?:$|[-_.\/])/i;
 const SAFE_PROVIDER_IDENTITY = /^ep-[a-z0-9](?:[a-z0-9-]{1,125}[a-z0-9])?$/;
 const LOCAL_PROVIDER_IDENTITY = "local-postflight-fixture";
+const SAFE_DATABASE_QUERY_PARAMETERS = new Map([
+  ["channel_binding", new Set(["require"])],
+  ["sslmode", new Set(["require"])],
+]);
 
 export class PostflightIssue extends Error {
   constructor(code, exitCode, status = "fail") {
@@ -38,6 +42,58 @@ function notVerifiedIssue(code) {
   return new PostflightIssue(code, 3, "not_verified");
 }
 
+function validateDatabaseUrlQuery(rawValue, parsed, kind) {
+  const prefix = kind.toUpperCase();
+  if (parsed.hash) throw safetyIssue(`${prefix}_URL_FRAGMENT_REJECTED`);
+
+  const queryIndex = rawValue.indexOf("?");
+  if (queryIndex === -1) return;
+  const fragmentIndex = rawValue.indexOf("#", queryIndex + 1);
+  const rawQuery = rawValue.slice(
+    queryIndex + 1,
+    fragmentIndex === -1 ? undefined : fragmentIndex
+  );
+  if (rawQuery.length === 0) {
+    throw safetyIssue(`${prefix}_URL_QUERY_REJECTED`);
+  }
+
+  const seenKeys = new Set();
+  for (const rawEntry of rawQuery.split("&")) {
+    const separatorIndex = rawEntry.indexOf("=");
+    if (
+      rawEntry.length === 0 ||
+      separatorIndex <= 0 ||
+      separatorIndex === rawEntry.length - 1
+    ) {
+      throw safetyIssue(`${prefix}_URL_QUERY_REJECTED`);
+    }
+
+    let decodedKey;
+    let decodedValue;
+    try {
+      decodedKey = decodeURIComponent(
+        rawEntry.slice(0, separatorIndex).replaceAll("+", " ")
+      ).toLowerCase();
+      decodedValue = decodeURIComponent(
+        rawEntry.slice(separatorIndex + 1).replaceAll("+", " ")
+      );
+    } catch {
+      throw safetyIssue(`${prefix}_URL_QUERY_REJECTED`);
+    }
+
+    const allowedValues = SAFE_DATABASE_QUERY_PARAMETERS.get(decodedKey);
+    if (
+      decodedKey.length === 0 ||
+      decodedValue.length === 0 ||
+      seenKeys.has(decodedKey) ||
+      !allowedValues?.has(decodedValue)
+    ) {
+      throw safetyIssue(`${prefix}_URL_QUERY_REJECTED`);
+    }
+    seenKeys.add(decodedKey);
+  }
+}
+
 function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
   if (typeof rawValue !== "string" || rawValue.length === 0) {
     throw safetyIssue(`${kind.toUpperCase()}_URL_REQUIRED`);
@@ -53,6 +109,7 @@ function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
   if (!POSTGRES_PROTOCOLS.has(parsed.protocol)) {
     throw safetyIssue(`${kind.toUpperCase()}_URL_PROTOCOL_REJECTED`);
   }
+  validateDatabaseUrlQuery(rawValue, parsed, kind);
   if (!parsed.hostname || !parsed.pathname || parsed.pathname === "/") {
     throw safetyIssue(`${kind.toUpperCase()}_TARGET_UNCLASSIFIED`);
   }
@@ -62,20 +119,22 @@ function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
   let decodedUsername;
   let decodedPassword;
   try {
-    databasePath = decodeURIComponent(parsed.pathname.slice(1)).toLowerCase();
+    databasePath = decodeURIComponent(parsed.pathname.slice(1));
     decodedUsername = decodeURIComponent(parsed.username || "");
     decodedPassword = decodeURIComponent(parsed.password || "");
   } catch {
     throw safetyIssue(`${kind.toUpperCase()}_URL_INVALID`);
   }
+  if (!decodedUsername) {
+    throw safetyIssue(`${kind.toUpperCase()}_ROLE_UNAVAILABLE`);
+  }
   const stagingClassificationMetadata = [
     hostname,
-    databasePath,
+    databasePath.toLowerCase(),
     decodedUsername,
   ].join("/");
   const forbiddenTargetMetadata = [
     stagingClassificationMetadata,
-    ...Array.from(parsed.searchParams.entries()).flat(),
   ].join("/");
   if (FORBIDDEN_TARGET_PART.test(forbiddenTargetMetadata)) {
     throw safetyIssue(`${kind.toUpperCase()}_FORBIDDEN_TARGET`);
@@ -107,6 +166,13 @@ function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
   return {
     rawValue,
     targetKey: `${normalizedHost}\u0000${port}\u0000${databasePath}`,
+    authority: {
+      host: hostname,
+      port: Number(port),
+      database: databasePath,
+      user: decodedUsername,
+    },
+    role: decodedUsername,
     isLoopback,
     isPooled,
     providerIdentity,
@@ -168,6 +234,10 @@ export function validateSafetyGate(environment, options = {}) {
   return {
     directUrl: direct.rawValue,
     pooledUrl: pooled.rawValue,
+    directAuthority: direct.authority,
+    pooledAuthority: pooled.authority,
+    directRole: direct.role,
+    pooledRole: pooled.role,
     secretParts: [
       ...direct.secretParts,
       ...pooled.secretParts,

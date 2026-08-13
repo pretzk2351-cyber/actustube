@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { createPreflightBaseReport } from "../scripts/staging-database-preflight/core.mjs";
+import { EXPECTED_MIGRATION_TAGS } from "../scripts/staging-database-postflight/manifest.mjs";
 import {
   isDirectPreflightInvocation,
   runPreflightCli,
@@ -25,8 +26,65 @@ function createProcessFixture(): ProcessFixture {
 }
 
 function successReport() {
+  const zeroCounts = () => ({
+    total: 0,
+    estimatedDataRows: 0,
+    schemas: 0,
+    relations: 0,
+    routines: 0,
+    types: 0,
+    triggers: 0,
+    rules: 0,
+    policies: 0,
+    constraints: 0,
+    other: 0,
+  });
   return {
     ...createPreflightBaseReport(),
+    postgresqlVersion: {
+      direct: "supported",
+      pooled: "supported",
+      directAfter: "supported",
+      pooledAfter: "supported",
+    },
+    directConnection: "pass",
+    pooledConnection: "pass",
+    connectionAuthority: "match",
+    directPooledIdentity: "match",
+    databaseRoleIdentity: "match",
+    expectedIdentity: "match",
+    extensionInventory: "match",
+    initialState: "pristine",
+    migrationCatalog: "pass",
+    migrationHistory: {
+      status: "pass",
+      expected: EXPECTED_MIGRATION_TAGS.length,
+      applied: 0,
+      pending: EXPECTED_MIGRATION_TAGS.length,
+      pendingTags: [...EXPECTED_MIGRATION_TAGS],
+      duplicates: 0,
+      unknown: 0,
+    },
+    applicationTables: 0,
+    applicationFunctions: 0,
+    applicationData: 0,
+    userDefinedObjects: {
+      direct: zeroCounts(),
+      pooled: zeroCounts(),
+      directAfter: zeroCounts(),
+      pooledAfter: zeroCounts(),
+    },
+    migrationSequenceState: {
+      direct: "not_applicable",
+      pooled: "not_applicable",
+      directAfter: "not_applicable",
+      pooledAfter: "not_applicable",
+    },
+    partialSchema: "none",
+    readOnlyInvariant: "pass",
+    beforeAfterComparison: "match",
+    cleanup: "pass",
+    overallStatus: "pass",
     exitCode: 0,
   };
 }
@@ -76,6 +134,62 @@ describe("staging database preflight entrypoint terminal report gate", () => {
 
     expect(report.exitCode).toBe(0);
     expect(processFixture.exitCode).toBe(0);
+    expectOneReportPair(output);
+    expectNoFatalListeners(processFixture);
+  });
+
+  it.each([
+    [
+      "all required checks not verified",
+      () => ({ ...createPreflightBaseReport(), exitCode: 0 }),
+    ],
+    [
+      "one required check missing",
+      () => {
+        const report: any = successReport();
+        delete report.extensionInventory;
+        return report;
+      },
+    ],
+    [
+      "one required check not verified",
+      () => ({ ...successReport(), cleanup: "not_verified" }),
+    ],
+    [
+      "a duplicated required migration check",
+      () => {
+        const report: any = successReport();
+        report.migrationHistory = {
+          ...report.migrationHistory,
+          pendingTags: [
+            ...EXPECTED_MIGRATION_TAGS.slice(0, -1),
+            EXPECTED_MIGRATION_TAGS[0],
+          ],
+        };
+        return report;
+      },
+    ],
+    [
+      "an overall-status contradiction",
+      () => ({ ...successReport(), overallStatus: "fail" }),
+    ],
+  ])("rejects exit zero with %s", async (_label, createReport) => {
+    const processFixture = createProcessFixture();
+    const output: string[] = [];
+    const report = await runCli({
+      mainFunction: async () => createReport(),
+      processObject: processFixture,
+      stdout: (buffer: string) => output.push(buffer),
+    });
+
+    expect(report).toMatchObject({
+      exitCode: 3,
+      failure: {
+        checkId: "PREFLIGHT_PUBLIC_REPORT_INVALID",
+        status: "not_verified",
+      },
+    });
+    expect(processFixture.exitCode).toBe(3);
     expectOneReportPair(output);
     expectNoFatalListeners(processFixture);
   });
@@ -158,6 +272,22 @@ describe("staging database preflight entrypoint terminal report gate", () => {
     expect(processFixture.exitCode).toBe(3);
     expectOneReportPair(output);
     expect(output[0]).not.toContain(secret);
+    expectNoFatalListeners(processFixture);
+  });
+
+  it("rejects a summary-only pass claim", async () => {
+    const processFixture = createProcessFixture();
+    const output: string[] = [];
+    const report = await runCli({
+      mainFunction: async () => successReport(),
+      processObject: processFixture,
+      stdout: (buffer: string) => output.push(buffer),
+      formatSummary: () => "pass",
+    });
+
+    expect(report.failure.checkId).toBe("PREFLIGHT_FORMATTER_FAILURE");
+    expect(processFixture.exitCode).toBe(3);
+    expect(output.join("\n")).not.toContain("\npass\n");
     expectNoFatalListeners(processFixture);
   });
 

@@ -60,6 +60,7 @@ function baseState(): any {
       database_oid: "100",
       system_identifier: "200",
     },
+    roleIdentity: { role_name: "staging_direct" },
     extensionInventory: [],
     migrationCatalog: {
       schema_exists: false,
@@ -514,6 +515,7 @@ function createConnection(
     failCleanup?: boolean;
     hangCleanup?: boolean;
     hangAt?: string;
+    roleName?: string;
   } = {}
 ) {
   let serverVersionReads = 0;
@@ -550,6 +552,12 @@ function createConnection(
       const identity =
         state.identityForRead?.(identityReads) ?? state.identity;
       return Promise.resolve({ rows: identity ? [identity] : [] });
+    }
+    if (sameSql(statement, PREFLIGHT_SQL_FOR_TESTS.roleIdentity)) {
+      const roleIdentity = state.roleIdentityForRead?.() ?? {
+        role_name: options.roleName ?? state.roleIdentity?.role_name,
+      };
+      return Promise.resolve({ rows: roleIdentity?.role_name ? [roleIdentity] : [] });
     }
     if (sameSql(statement, PREFLIGHT_SQL_FOR_TESTS.extensionInventory)) {
       extensionInventoryReads += 1;
@@ -624,8 +632,14 @@ function createAdapter({
   directOptions,
   pooledOptions,
 }: any = {}) {
-  const directConnection = createConnection(() => directState, directOptions);
-  const pooledConnection = createConnection(() => pooledState, pooledOptions);
+  const directConnection = createConnection(() => directState, {
+    roleName: "staging_direct",
+    ...directOptions,
+  });
+  const pooledConnection = createConnection(() => pooledState, {
+    roleName: "staging_runtime",
+    ...pooledOptions,
+  });
   const connect = vi.fn(
     (
       kind: string,
@@ -779,6 +793,16 @@ async function runCliChild(scenario: string) {
         if (sameSql(statement, PREFLIGHT_SQL_FOR_TESTS.identity)) {
           return { rows: [state.identity] };
         }
+        if (sameSql(statement, PREFLIGHT_SQL_FOR_TESTS.roleIdentity)) {
+          return {
+            rows: [
+              {
+                role_name:
+                  kind === "direct" ? "staging_direct" : "staging_runtime",
+              },
+            ],
+          };
+        }
         if (sameSql(statement, PREFLIGHT_SQL_FOR_TESTS.extensionInventory)) {
           return { rows: state.extensionInventory };
         }
@@ -894,6 +918,42 @@ let semanticPostgres:
     }
   | undefined;
 let semanticPostgresStart: Promise<EmbeddedPostgres> | undefined;
+const semanticPostgresUser = "preflight_semantic_admin";
+const semanticPostgresPassword = randomUUID();
+const semanticPostgresChildEnvironmentAllowlist = new Set([
+  "COMSPEC",
+  "NUMBER_OF_PROCESSORS",
+  "OS",
+  "PATH",
+  "PATHEXT",
+  "PROCESSOR_ARCHITECTURE",
+  "PROCESSOR_IDENTIFIER",
+  "PROCESSOR_LEVEL",
+  "PROCESSOR_REVISION",
+  "SYSTEMROOT",
+  "TEMP",
+  "TMP",
+  "WINDIR",
+]);
+
+function isAllowedSemanticPostgresChildEnvironmentKey(key: string) {
+  return semanticPostgresChildEnvironmentAllowlist.has(key.toUpperCase());
+}
+
+async function withoutSensitiveChildEnvironment<T>(operation: () => Promise<T>) {
+  const removed = new Map<string, string>();
+  for (const key of Object.keys(process.env)) {
+    if (isAllowedSemanticPostgresChildEnvironmentKey(key)) continue;
+    const value = process.env[key];
+    if (value !== undefined) removed.set(key, value);
+    delete process.env[key];
+  }
+  try {
+    return await operation();
+  } finally {
+    for (const [key, value] of removed) process.env[key] = value;
+  }
+}
 
 function findSemanticPostgresPort() {
   const windowsRoot = process.env.SystemRoot || process.env.WINDIR;
@@ -988,8 +1048,8 @@ async function getSemanticPostgres() {
     );
     const cluster = new EmbeddedPostgres({
       databaseDir: join(root, "database"),
-      user: "preflight_semantic_admin",
-      password: randomUUID(),
+      user: semanticPostgresUser,
+      password: semanticPostgresPassword,
       port: semanticPostgresPortAllocation.port,
       persistent: true,
       authMethod: "scram-sha-256",
@@ -999,12 +1059,99 @@ async function getSemanticPostgres() {
       onError: () => undefined,
     });
     semanticPostgres = { cluster, root, started: false };
-    await cluster.initialise();
-    await cluster.start();
+    await withoutSensitiveChildEnvironment(async () => {
+      if (
+        Object.keys(process.env).some(
+          (key) => !isAllowedSemanticPostgresChildEnvironmentKey(key)
+        )
+      ) {
+        throw new Error("PREFLIGHT_SEMANTIC_CHILD_ENVIRONMENT_NOT_SANITIZED");
+      }
+      await cluster.initialise();
+      await cluster.start();
+    });
     semanticPostgres.started = true;
     return cluster;
   })();
   return semanticPostgresStart;
+}
+
+async function withSemanticDatabase<T>(
+  operation: (cluster: EmbeddedPostgres, database: string) => Promise<T>
+) {
+  const cluster = await getSemanticPostgres();
+  const database = `preflight_${randomUUID().replaceAll("-", "")}`;
+  const admin = cluster.getPgClient("postgres", "127.0.0.1");
+  await admin.connect();
+  try {
+    await admin.query(`CREATE DATABASE "${database}"`);
+  } finally {
+    await admin.end();
+  }
+  try {
+    return await operation(cluster, database);
+  } finally {
+    const cleanup = cluster.getPgClient("postgres", "127.0.0.1");
+    await cleanup.connect();
+    try {
+      await cleanup.query(`DROP DATABASE "${database}"`);
+    } finally {
+      await cleanup.end();
+    }
+  }
+}
+
+function createEmbeddedPreflightAdapter(
+  cluster: EmbeddedPostgres,
+  database: string
+) {
+  return {
+    async connect() {
+      const client = cluster.getPgClient(database, "127.0.0.1");
+      await client.connect();
+      return {
+        query(statement: string, parameters: unknown[] = []) {
+          return client.query(statement, parameters);
+        },
+        close() {
+          return client.end();
+        },
+      };
+    },
+  };
+}
+
+async function semanticPreflightEnvironment(
+  cluster: EmbeddedPostgres,
+  database: string
+) {
+  const client = cluster.getPgClient(database, "127.0.0.1");
+  await client.connect();
+  try {
+    const version = await client.query(PREFLIGHT_SQL_FOR_TESTS.serverVersion);
+    const extensions = await client.query(
+      PREFLIGHT_SQL_FOR_TESTS.extensionInventory
+    );
+    const encodedUser = encodeURIComponent(semanticPostgresUser);
+    const encodedPassword = encodeURIComponent(semanticPostgresPassword);
+    const url = `postgresql://${encodedUser}:${encodedPassword}@127.0.0.1:${semanticPostgresPortAllocation.port}/${database}`;
+    return {
+      versionNumber: String(version.rows[0]?.server_version_num ?? ""),
+      environment: {
+        ACTUSTUBE_DB_ENV: "staging",
+        ACTUSTUBE_ALLOW_STAGING_DB_PREFLIGHT: "1",
+        DIRECT_DATABASE_URL: url,
+        DATABASE_URL: url,
+        ACTUSTUBE_EXPECTED_STAGING_IDENTITY: "local-postflight-fixture",
+        ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS: JSON.stringify({
+          schemaVersion: 1,
+          extensions: extensions.rows,
+        }),
+      },
+    };
+  } finally {
+    await client.end();
+  }
 }
 
 async function queryExtensionClassification({
@@ -1097,6 +1244,140 @@ afterAll(async () => {
 
 beforeAll(async () => {
   await getSemanticPostgres();
+});
+
+describe("PostgreSQL 18 production preflight integration", () => {
+  it.each([
+    "DATABASE_URL",
+    "DIRECT_DATABASE_URL",
+    "PGHOST",
+    "HTTP_PROXY",
+    "npm_config_https_proxy",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "NPM_TOKEN",
+    "SERVICE_PASSWORD",
+    "CLIENT_SECRET",
+    "AUTHORIZATION",
+  ])("excludes %s from the embedded PostgreSQL child environment", (key) => {
+    expect(isAllowedSemanticPostgresChildEnvironmentKey(key)).toBe(false);
+  });
+
+  it("runs the production identity and catalog queries in two fresh read-only snapshots", async () => {
+    await withSemanticDatabase(async (cluster, database) => {
+      const setup = cluster.getPgClient(database, "127.0.0.1");
+      await setup.connect();
+      try {
+        await setup.query("CREATE SCHEMA drizzle");
+        await setup.query(`
+          CREATE TABLE drizzle.__drizzle_migrations (
+            id serial PRIMARY KEY,
+            hash text NOT NULL,
+            created_at bigint
+          )
+        `);
+      } finally {
+        await setup.end();
+      }
+
+      const { environment, versionNumber } = await semanticPreflightEnvironment(
+        cluster,
+        database
+      );
+      expect(versionNumber).toBe("180004");
+      expect(Math.trunc(Number(versionNumber) / 10_000)).toBe(18);
+      const statements: string[] = [];
+      const report: any = await (verifyStagingDatabasePreflight as any)({
+        environment,
+        repositoryRoot,
+        adapter: createEmbeddedPreflightAdapter(cluster, database),
+        allowLoopback: true,
+        onQuery: (statement: string) => statements.push(statement),
+      });
+
+      expect(report).toMatchObject({
+        exitCode: 0,
+        overallStatus: "pass",
+        initialState: "empty_migration_table",
+        connectionAuthority: "match",
+        directPooledIdentity: "match",
+        databaseRoleIdentity: "match",
+        extensionInventory: "match",
+        migrationCatalog: "pass",
+        readOnlyInvariant: "pass",
+        beforeAfterComparison: "match",
+        cleanup: "pass",
+      });
+      for (const queryName of [
+        "serverVersion",
+        "identity",
+        "roleIdentity",
+        "extensionInventory",
+        "migrationCatalog",
+        "migrationColumns",
+        "migrationColumnExact",
+        "migrationPrimaryKey",
+        "migrationHistory",
+        "migrationExact",
+        "userDefinedObjects",
+      ]) {
+        expect(
+          statements.filter((statement) =>
+            sameSql(statement, (PREFLIGHT_SQL_FOR_TESTS as any)[queryName])
+          )
+        ).toHaveLength(4);
+      }
+      expect(
+        statements.filter((statement) =>
+          sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.begin)
+        )
+      ).toHaveLength(4);
+      expect(
+        statements.filter((statement) =>
+          sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.rollback)
+        )
+      ).toHaveLength(4);
+    });
+  });
+
+  it("detects committed third-session drift in the fresh after snapshots", async () => {
+    await withSemanticDatabase(async (cluster, database) => {
+      const { environment, versionNumber } = await semanticPreflightEnvironment(
+        cluster,
+        database
+      );
+      expect(versionNumber).toBe("180004");
+      expect(Math.trunc(Number(versionNumber) / 10_000)).toBe(18);
+      let thirdSessionWrites = 0;
+      const report: any = await (verifyStagingDatabasePreflight as any)({
+        environment,
+        repositoryRoot,
+        adapter: createEmbeddedPreflightAdapter(cluster, database),
+        allowLoopback: true,
+        betweenSnapshotTransactions: async () => {
+          const thirdSession = cluster.getPgClient(database, "127.0.0.1");
+          await thirdSession.connect();
+          try {
+            await thirdSession.query(
+              "CREATE TABLE public.preflight_mvcc_drift (id integer)"
+            );
+            thirdSessionWrites += 1;
+          } finally {
+            await thirdSession.end();
+          }
+        },
+      });
+
+      expect(thirdSessionWrites).toBe(1);
+      expect(report.exitCode).toBe(1);
+      expect(report.overallStatus).toBe("fail");
+      expect(report.beforeAfterComparison).toBe("fail");
+      expect(report.failure).toEqual({
+        checkId: "READ_ONLY_INVARIANT_MISMATCH",
+        status: "fail",
+      });
+      expect(report.cleanup).toBe("pass");
+    });
+  });
 });
 
 describe("terminal abort propagation", () => {
@@ -1400,7 +1681,7 @@ describe("staging database preflight safety gate", () => {
     expect(fixture.connect).not.toHaveBeenCalled();
   });
 
-  it("does not accept a staging marker supplied only by a URL query value", async () => {
+  it("rejects an unknown query before it can supply a staging marker", async () => {
     const fixture = createAdapter();
     const report = await runPreflight(fixture, {
       ...validEnvironment(),
@@ -1410,7 +1691,7 @@ describe("staging database preflight safety gate", () => {
         "postgresql://runtime:dummy-password@ep-actustube-safe-pooler.example.test/app?application_name=staging",
     });
     expect(report.exitCode).toBe(2);
-    expect(report.failure.checkId).toBe("DIRECT_STAGING_MARKER_REQUIRED");
+    expect(report.failure.checkId).toBe("DIRECT_URL_QUERY_REJECTED");
     expect(fixture.connect).not.toHaveBeenCalled();
   });
 
@@ -1455,6 +1736,19 @@ describe("staging database preflight safety gate", () => {
     expect(report.exitCode).toBe(1);
     expect(report.directPooledIdentity).toBe("fail");
     expect(report.failure.checkId).toBe("LOGICAL_DATABASE_IDENTITY_MISMATCH");
+  });
+
+  it("rejects an actual database role that differs from the validated URL role", async () => {
+    const directState = baseState();
+    directState.roleIdentityForRead = () => ({
+      role_name: "different_staging_role",
+    });
+    const report = await runPreflight(
+      createAdapter({ directState, pooledState: baseState() })
+    );
+    expect(report.exitCode).toBe(1);
+    expect(report.databaseRoleIdentity).toBe("fail");
+    expect(report.failure.checkId).toBe("DIRECT_ROLE_IDENTITY_MISMATCH");
   });
 
   it("rejects a logical database identity change between before and after reads", async () => {
@@ -2635,7 +2929,10 @@ describe("connections, read-only invariant, cleanup, and output", () => {
     ]) {
       expect(
         countSqlCalls(connection, POSTFLIGHT_SQL_FOR_TESTS.rollback)
-      ).toBe(1);
+      ).toBe(2);
+      expect(
+        countSqlCalls(connection, POSTFLIGHT_SQL_FOR_TESTS.begin)
+      ).toBe(2);
       expect(connection.close).toHaveBeenCalledOnce();
     }
   });
@@ -2741,7 +3038,7 @@ describe("connections, read-only invariant, cleanup, and output", () => {
             fixture.directConnection,
             POSTFLIGHT_SQL_FOR_TESTS.rollback
           )
-        ).toBe(1);
+        ).toBe(2);
         expect(fixture.directConnection.close).toHaveBeenCalledOnce();
       } finally {
         fixture.directConnection.clearCleanupHandle();
@@ -2845,48 +3142,23 @@ describe("connections, read-only invariant, cleanup, and output", () => {
       const processObject = Object.assign(new EventEmitter(), {
         exitCode: undefined as number | undefined,
       });
+      const mainReport =
+        exitCode === 0
+          ? await runPreflight(createAdapter())
+          : {
+              ...createPreflightBaseReport(),
+              overallStatus: "fail",
+              failure: {
+                checkId:
+                  exitCode === 1
+                    ? "USER_DEFINED_OBJECT_PRESENT"
+                    : "STAGING_ENVIRONMENT_REQUIRED",
+                status: "fail",
+              },
+              exitCode,
+            };
       await (runPreflightCli as any)({
-        mainFunction: async () => ({
-          ...createPreflightBaseReport(),
-          ...(exitCode === 0
-            ? {
-                extensionInventory: "match",
-                initialState: "pristine",
-                migrationHistory: {
-                  status: "pass",
-                  expected: 7,
-                  applied: 0,
-                  pending: 7,
-                  pendingTags: [
-                    "0000_crazy_spyke",
-                    "0001_fix_google_oauth_account_variable_conflict",
-                    "0002_add_atomic_usage_reservation",
-                    "0003_add_usage_reservation_release",
-                    "0004_add_stale_reservation_recovery",
-                    "0005_silky_mystique",
-                    "0006_usage_status_plan_snapshot",
-                  ],
-                  duplicates: 0,
-                  unknown: 0,
-                },
-                applicationTables: 0,
-                applicationFunctions: 0,
-                applicationData: 0,
-                partialSchema: "none",
-                readOnlyInvariant: "pass",
-                cleanup: "pass",
-              }
-            : {
-                failure: {
-                  checkId:
-                    exitCode === 1
-                      ? "USER_DEFINED_OBJECT_PRESENT"
-                      : "STAGING_ENVIRONMENT_REQUIRED",
-                  status: "fail",
-                },
-              }),
-          exitCode,
-        }),
+        mainFunction: async () => mainReport,
         processObject,
         stdout: vi.fn(),
       });
