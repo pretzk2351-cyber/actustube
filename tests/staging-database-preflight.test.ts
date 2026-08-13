@@ -1,13 +1,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import EmbeddedPostgres from "embedded-postgres";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   PREFLIGHT_EXTENSION_CLASSIFICATION_SQL_FOR_TESTS,
@@ -22,6 +19,11 @@ import {
   loadRepositorySpecification,
 } from "../scripts/staging-database-postflight/core.mjs";
 import { assertReadOnlySql } from "../scripts/staging-database-postflight/safety.mjs";
+import {
+  allocatePostgresHarnessPort,
+  createPostgresHarnessEnvironment,
+  runOwnedPostgresHarness,
+} from "../scripts/test-staging-database-preflight-postgres.mjs";
 import {
   PARENT_ENVIRONMENT_NOTICE,
   createFatalExitLatch,
@@ -910,340 +912,183 @@ async function runCliChild(scenario: string) {
   });
 }
 
-let semanticPostgres:
-  | {
-      cluster: EmbeddedPostgres;
-      root: string;
-      started: boolean;
-    }
-  | undefined;
-let semanticPostgresStart: Promise<EmbeddedPostgres> | undefined;
-const semanticPostgresUser = "preflight_semantic_admin";
-const semanticPostgresPassword = randomUUID();
-const semanticPostgresChildEnvironmentAllowlist = new Set([
-  "COMSPEC",
-  "NUMBER_OF_PROCESSORS",
-  "OS",
-  "PATH",
-  "PATHEXT",
-  "PROCESSOR_ARCHITECTURE",
-  "PROCESSOR_IDENTIFIER",
-  "PROCESSOR_LEVEL",
-  "PROCESSOR_REVISION",
-  "SYSTEMROOT",
-  "TEMP",
-  "TMP",
-  "WINDIR",
-]);
-
-function isAllowedSemanticPostgresChildEnvironmentKey(key: string) {
-  return semanticPostgresChildEnvironmentAllowlist.has(key.toUpperCase());
-}
-
-async function withoutSensitiveChildEnvironment<T>(operation: () => Promise<T>) {
-  const removed = new Map<string, string>();
-  for (const key of Object.keys(process.env)) {
-    if (isAllowedSemanticPostgresChildEnvironmentKey(key)) continue;
-    const value = process.env[key];
-    if (value !== undefined) removed.set(key, value);
-    delete process.env[key];
-  }
-  try {
-    return await operation();
-  } finally {
-    for (const [key, value] of removed) process.env[key] = value;
-  }
-}
-
-function findSemanticPostgresPort() {
-  const windowsRoot = process.env.SystemRoot || process.env.WINDIR;
-  if (!windowsRoot) {
-    throw new Error("PREFLIGHT_SEMANTIC_PORT_PLATFORM_UNAVAILABLE");
-  }
-  const powershell = join(
-    windowsRoot,
-    "System32",
-    "WindowsPowerShell",
-    "v1.0",
-    "powershell.exe"
-  );
-  const source = String.raw`
-$ErrorActionPreference = 'Stop'
-$address = [System.Net.IPAddress]::Parse('127.0.0.1')
-if ($address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
-  throw 'ADDRESS_FAMILY_MISMATCH'
-}
-$listener = [System.Net.Sockets.TcpListener]::new($address, 0)
-$port = 0
-try {
-  $listener.Start()
-  $endpoint = [System.Net.IPEndPoint]$listener.LocalEndpoint
-  $port = $endpoint.Port
-} finally {
-  $listener.Stop()
-}
-if ($port -lt 1 -or $port -gt 65535) {
-  throw 'PORT_RANGE_INVALID'
-}
-[ordered]@{
-  port = $port
-  addressFamily = $address.AddressFamily.ToString()
-  released = $true
-} | ConvertTo-Json -Compress
-`;
-  const environment = Object.fromEntries(
-    ["SystemRoot", "WINDIR", "TEMP", "TMP"].flatMap((key) =>
-      process.env[key] ? [[key, process.env[key]]] : []
-    )
-  ) as NodeJS.ProcessEnv;
-  const result = spawnSync(
-    powershell,
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", source],
-    {
-      encoding: "utf8",
-      env: environment,
-      shell: false,
-      timeout: 5_000,
-      windowsHide: true,
-    }
-  );
-  if (
-    result.error ||
-    result.signal !== null ||
-    result.status !== 0 ||
-    result.stderr.trim() !== ""
-  ) {
-    throw new Error("PREFLIGHT_SEMANTIC_PORT_UNAVAILABLE");
-  }
-  let allocation: unknown;
-  try {
-    allocation = JSON.parse(result.stdout.trim());
-  } catch {
-    throw new Error("PREFLIGHT_SEMANTIC_PORT_INVALID");
-  }
-  if (
-    !allocation ||
-    typeof allocation !== "object" ||
-    !Number.isSafeInteger((allocation as any).port) ||
-    (allocation as any).port < 1 ||
-    (allocation as any).port > 65535 ||
-    (allocation as any).addressFamily !== "InterNetwork" ||
-    (allocation as any).released !== true
-  ) {
-    throw new Error("PREFLIGHT_SEMANTIC_PORT_INVALID");
-  }
-  return allocation as {
-    port: number;
-    addressFamily: "InterNetwork";
-    released: true;
-  };
-}
-
-const semanticPostgresPortAllocation = findSemanticPostgresPort();
-
-async function getSemanticPostgres() {
-  semanticPostgresStart ??= (async () => {
-    const root = await mkdtemp(
-      join(tmpdir(), "actustube-preflight-semantic-")
-    );
-    const cluster = new EmbeddedPostgres({
-      databaseDir: join(root, "database"),
-      user: semanticPostgresUser,
-      password: semanticPostgresPassword,
-      port: semanticPostgresPortAllocation.port,
-      persistent: true,
-      authMethod: "scram-sha-256",
-      initdbFlags: ["--encoding=UTF8", "--locale=C", "--no-sync"],
-      postgresFlags: ["-c", "listen_addresses=127.0.0.1"],
-      onLog: () => undefined,
-      onError: () => undefined,
-    });
-    semanticPostgres = { cluster, root, started: false };
-    await withoutSensitiveChildEnvironment(async () => {
-      if (
-        Object.keys(process.env).some(
-          (key) => !isAllowedSemanticPostgresChildEnvironmentKey(key)
-        )
-      ) {
-        throw new Error("PREFLIGHT_SEMANTIC_CHILD_ENVIRONMENT_NOT_SANITIZED");
-      }
-      await cluster.initialise();
-      await cluster.start();
-    });
-    semanticPostgres.started = true;
-    return cluster;
-  })();
-  return semanticPostgresStart;
-}
-
-async function withSemanticDatabase<T>(
-  operation: (cluster: EmbeddedPostgres, database: string) => Promise<T>
-) {
-  const cluster = await getSemanticPostgres();
-  const database = `preflight_${randomUUID().replaceAll("-", "")}`;
-  const admin = cluster.getPgClient("postgres", "127.0.0.1");
-  await admin.connect();
-  try {
-    await admin.query(`CREATE DATABASE "${database}"`);
-  } finally {
-    await admin.end();
-  }
-  try {
-    return await operation(cluster, database);
-  } finally {
-    const cleanup = cluster.getPgClient("postgres", "127.0.0.1");
-    await cleanup.connect();
-    try {
-      await cleanup.query(`DROP DATABASE "${database}"`);
-    } finally {
-      await cleanup.end();
-    }
-  }
-}
-
-function createEmbeddedPreflightAdapter(
-  cluster: EmbeddedPostgres,
-  database: string
-) {
-  return {
-    async connect() {
-      const client = cluster.getPgClient(database, "127.0.0.1");
-      await client.connect();
-      return {
-        query(statement: string, parameters: unknown[] = []) {
-          return client.query(statement, parameters);
-        },
-        close() {
-          return client.end();
-        },
-      };
-    },
-  };
-}
-
-async function semanticPreflightEnvironment(
-  cluster: EmbeddedPostgres,
-  database: string
-) {
-  const client = cluster.getPgClient(database, "127.0.0.1");
-  await client.connect();
-  try {
-    const version = await client.query(PREFLIGHT_SQL_FOR_TESTS.serverVersion);
-    const extensions = await client.query(
-      PREFLIGHT_SQL_FOR_TESTS.extensionInventory
-    );
-    const encodedUser = encodeURIComponent(semanticPostgresUser);
-    const encodedPassword = encodeURIComponent(semanticPostgresPassword);
-    const url = `postgresql://${encodedUser}:${encodedPassword}@127.0.0.1:${semanticPostgresPortAllocation.port}/${database}`;
-    return {
-      versionNumber: String(version.rows[0]?.server_version_num ?? ""),
-      environment: {
-        ACTUSTUBE_DB_ENV: "staging",
-        ACTUSTUBE_ALLOW_STAGING_DB_PREFLIGHT: "1",
-        DIRECT_DATABASE_URL: url,
-        DATABASE_URL: url,
-        ACTUSTUBE_EXPECTED_STAGING_IDENTITY: "local-postflight-fixture",
-        ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS: JSON.stringify({
-          schemaVersion: 1,
-          extensions: extensions.rows,
-        }),
-      },
-    };
-  } finally {
-    await client.end();
-  }
-}
-
-async function queryExtensionClassification({
-  managed,
-  residual,
-}: {
-  managed: boolean;
-  residual: boolean;
-}) {
-  const cluster = await getSemanticPostgres();
-  const client = cluster.getPgClient("postgres", "127.0.0.1");
-  await client.connect();
-  try {
-    const managedSql = managed
-      ? "SELECT 'pg_class'::pg_catalog.regclass::oid, 90001::oid, 0"
-      : "SELECT 0::oid, 0::oid, 0 WHERE false";
-    const residualSql = residual
-      ? "SELECT 'relation'::text, 'pg_class'::pg_catalog.regclass::oid, 90001::oid, 0"
-      : "SELECT ''::text, 0::oid, 0::oid, 0 WHERE false";
-    return await client.query(`
-      WITH extension_classification(
-        object_signature,
-        evidence_signature,
-        evidence_kind,
-        dependency_type,
-        dependent_class,
-        referenced_class,
-        referenced_is_direct_extension_member,
-        rule_name,
-        relation_kind,
-        trigger_constraint_matches,
-        constraint_type
-      ) AS (
-        VALUES (
-          '1259:90001:0'::text,
-          'dependency:1259:90001:0:fixture'::text,
-          'dependency'::text,
-          'e'::text,
-          'pg_class'::text,
-          'pg_extension'::text,
-          false,
-          NULL::text,
-          NULL::text,
-          false,
-          NULL::text
-        )
-      ), extension_managed(classid, objid, objsubid) AS (
-        ${managedSql}
-      ), residual_objects(kind, classid, objid, objsubid) AS (
-        ${residualSql}
-      ), ${PREFLIGHT_EXTENSION_CLASSIFICATION_SQL_FOR_TESTS}
-      SELECT
-        (SELECT count(*)::integer FROM extension_dependency_evidence)
-          AS evidence_count,
-        (
-          SELECT count(*)::integer
-          FROM extension_dependency_evidence
-          WHERE classification_count = 0
-        ) AS unclassified_count,
-        (
-          SELECT count(*)::integer
-          FROM extension_dependency_evidence
-          WHERE classification_count > 1
-        ) AS ambiguous_count,
-        (
-          SELECT min(classification_count)::integer
-          FROM extension_dependency_evidence
-        ) AS classification_count,
-        (
-          SELECT count(*)::integer
-          FROM extension_classification_complete
-          WHERE evidence_kind = 'dependency'
-        ) AS complete_dependency_count
-    `);
-  } finally {
-    await client.end();
-  }
-}
-
-afterAll(async () => {
-  if (!semanticPostgres) return;
-  if (semanticPostgres.started) await semanticPostgres.cluster.stop();
-  await rm(semanticPostgres.root, {
-    recursive: true,
-    force: true,
-    maxRetries: 20,
-    retryDelay: 250,
-  });
-});
+let semanticPostgresResult: any;
 
 beforeAll(async () => {
-  await getSemanticPostgres();
+  semanticPostgresResult = await runOwnedPostgresHarness({ mode: "integration" });
+  if (semanticPostgresResult.outcome !== "pass") {
+    throw new Error(
+      `OWNED_POSTGRES_INTEGRATION_FAILED_${semanticPostgresResult.childErrorCode}_${semanticPostgresResult.failurePhase}`
+    );
+  }
+  expect(semanticPostgresResult).toMatchObject({
+    outcome: "pass",
+    forcedCleanup: false,
+    processRemaining: false,
+    listenerRemaining: false,
+    dataDirectoryRemaining: false,
+    environmentIsolation: {
+      lifecycle: true,
+      cleanupChild: true,
+    },
+    lifecycle: {
+      normalStopAttempted: true,
+      processRemaining: false,
+      listenerRemaining: false,
+      dataDirectoryRemaining: false,
+    },
+  });
+  expect(
+    semanticPostgresResult.lifecycle.normalStopSucceeded
+  ).toBe(!semanticPostgresResult.lifecycle.forcedCleanupUsed);
+}, 150_000);
+
+function semanticExtensionResult(managed: boolean, residual: boolean) {
+  const entry = semanticPostgresResult.integration.extensionClassifications.find(
+    (candidate: any) =>
+      candidate.managed === managed && candidate.residual === residual
+  );
+  if (!entry) throw new Error("PREFLIGHT_EXTENSION_RESULT_MISSING");
+  return entry.result;
+}
+
+function testProcessAlive(pid: number | undefined) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function stopUnrelatedSentinel(child: ChildProcess) {
+  if (!child.pid || !testProcessAlive(child.pid)) return;
+  const closed = new Promise<void>((resolveClose) =>
+    child.once("close", () => resolveClose())
+  );
+  child.kill();
+  await Promise.race([
+    closed,
+    new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 5_000)),
+  ]);
+  if (child.pid && testProcessAlive(child.pid)) {
+    throw new Error("UNRELATED_SENTINEL_CLEANUP_FAILED");
+  }
+}
+
+describe("owned PostgreSQL fixture lifecycle", () => {
+  it("constructs a positive child environment from OS keys only", () => {
+    const source = {
+      ...process.env,
+      DATABASE_URL: "parent-db-sentinel",
+      direct_database_url: "parent-direct-sentinel",
+      PGHOST: "parent-pg-sentinel",
+      PgPassword: "parent-password-sentinel",
+      HTTP_PROXY: "parent-proxy-sentinel",
+      https_proxy: "parent-proxy-sentinel",
+      NPM_TOKEN: "parent-token-sentinel",
+      GOOGLE_APPLICATION_CREDENTIALS: "parent-credential-sentinel",
+      SERVICE_SECRET: "parent-secret-sentinel",
+      NODE_OPTIONS: "--require parent-sentinel",
+    };
+    const environment = createPostgresHarnessEnvironment(source);
+    expect(Object.keys(environment).sort()).toEqual(
+      Object.keys(environment)
+        .filter((key) =>
+          [
+            "COMSPEC",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LOGONSERVER",
+            "NUMBER_OF_PROCESSORS",
+            "OS",
+            "PATH",
+            "PATHEXT",
+            "PROCESSOR_ARCHITECTURE",
+            "PROCESSOR_IDENTIFIER",
+            "PROCESSOR_LEVEL",
+            "PROCESSOR_REVISION",
+            "SYSTEMROOT",
+            "SYSTEMDRIVE",
+            "TEMP",
+            "TMP",
+            "USERDOMAIN",
+            "USERNAME",
+            "USERPROFILE",
+            "WINDIR",
+          ].includes(key)
+        )
+        .sort()
+    );
+    expect(
+      Object.keys(environment).some((key) =>
+        /DATABASE_URL|^PG|PROXY|CREDENTIAL|TOKEN|SECRET|PASSWORD|NODE_OPTIONS/i.test(
+          key
+        )
+      )
+    ).toBe(false);
+  });
+
+  it.each([
+    ["ready timeout", "fault-ready-hang"],
+    ["partial-start throw", "fault-partial-throw"],
+    ["stop hang", "fault-stop-hang"],
+    ["child crash", "fault-crash"],
+  ] as const)(
+    "recovers an exact owned process tree after %s",
+    async (_label, mode) => {
+      const sentinel = spawn(
+        process.execPath,
+        ["--input-type=module", "-e", "setInterval(()=>{},1000)"],
+        {
+          env: createPostgresHarnessEnvironment(
+            process.env
+          ) as unknown as NodeJS.ProcessEnv,
+          stdio: "ignore",
+          windowsHide: true,
+        }
+      );
+      try {
+        expect(sentinel.pid).toBeTypeOf("number");
+        const result: any = await runOwnedPostgresHarness({
+          mode,
+          sourceEnvironment: {
+            ...process.env,
+            DATABASE_URL: "parent-db-sentinel",
+            DIRECT_DATABASE_URL: "parent-direct-sentinel",
+            PGHOST: "parent-pg-sentinel",
+            PGPORT: "5432",
+            PGUSER: "parent-pg-sentinel",
+            PGPASSWORD: "parent-pg-sentinel",
+            PGDATABASE: "parent-pg-sentinel",
+            PGSERVICE: "parent-pg-sentinel",
+            PGSERVICEFILE: "parent-pg-sentinel",
+            HTTP_PROXY: "parent-proxy-sentinel",
+            HTTPS_PROXY: "parent-proxy-sentinel",
+            ALL_PROXY: "parent-proxy-sentinel",
+            NO_PROXY: "parent-proxy-sentinel",
+            NODE_OPTIONS: "--require parent-sentinel",
+            NPM_TOKEN: "parent-token-sentinel",
+            GOOGLE_APPLICATION_CREDENTIALS: "parent-credential-sentinel",
+            SERVICE_SECRET: "parent-secret-sentinel",
+          },
+        });
+        expect(result).toMatchObject({
+          outcome: "expected_failure",
+          forcedCleanup: true,
+          processRemaining: false,
+          listenerRemaining: false,
+          dataDirectoryRemaining: false,
+        });
+        expect(result.ownership.harnessPid).not.toBe(sentinel.pid);
+        expect(testProcessAlive(sentinel.pid)).toBe(true);
+      } finally {
+        await stopUnrelatedSentinel(sentinel);
+      }
+    },
+    30_000
+  );
 });
 
 describe("PostgreSQL 18 production preflight integration", () => {
@@ -1251,131 +1096,74 @@ describe("PostgreSQL 18 production preflight integration", () => {
     "DATABASE_URL",
     "DIRECT_DATABASE_URL",
     "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "PGSERVICE",
+    "PGSERVICEFILE",
     "HTTP_PROXY",
-    "npm_config_https_proxy",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "NODE_OPTIONS",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "NPM_TOKEN",
     "SERVICE_PASSWORD",
     "CLIENT_SECRET",
     "AUTHORIZATION",
-  ])("excludes %s from the embedded PostgreSQL child environment", (key) => {
-    expect(isAllowedSemanticPostgresChildEnvironmentKey(key)).toBe(false);
-  });
-
-  it("runs the production identity and catalog queries in two fresh read-only snapshots", async () => {
-    await withSemanticDatabase(async (cluster, database) => {
-      const setup = cluster.getPgClient(database, "127.0.0.1");
-      await setup.connect();
-      try {
-        await setup.query("CREATE SCHEMA drizzle");
-        await setup.query(`
-          CREATE TABLE drizzle.__drizzle_migrations (
-            id serial PRIMARY KEY,
-            hash text NOT NULL,
-            created_at bigint
-          )
-        `);
-      } finally {
-        await setup.end();
-      }
-
-      const { environment, versionNumber } = await semanticPreflightEnvironment(
-        cluster,
-        database
-      );
-      expect(versionNumber).toBe("180004");
-      expect(Math.trunc(Number(versionNumber) / 10_000)).toBe(18);
-      const statements: string[] = [];
-      const report: any = await (verifyStagingDatabasePreflight as any)({
-        environment,
-        repositoryRoot,
-        adapter: createEmbeddedPreflightAdapter(cluster, database),
-        allowLoopback: true,
-        onQuery: (statement: string) => statements.push(statement),
-      });
-
-      expect(report).toMatchObject({
-        exitCode: 0,
-        overallStatus: "pass",
-        initialState: "empty_migration_table",
-        connectionAuthority: "match",
-        directPooledIdentity: "match",
-        databaseRoleIdentity: "match",
-        extensionInventory: "match",
-        migrationCatalog: "pass",
-        readOnlyInvariant: "pass",
-        beforeAfterComparison: "match",
-        cleanup: "pass",
-      });
-      for (const queryName of [
-        "serverVersion",
-        "identity",
-        "roleIdentity",
-        "extensionInventory",
-        "migrationCatalog",
-        "migrationColumns",
-        "migrationColumnExact",
-        "migrationPrimaryKey",
-        "migrationHistory",
-        "migrationExact",
-        "userDefinedObjects",
-      ]) {
-        expect(
-          statements.filter((statement) =>
-            sameSql(statement, (PREFLIGHT_SQL_FOR_TESTS as any)[queryName])
-          )
-        ).toHaveLength(4);
-      }
-      expect(
-        statements.filter((statement) =>
-          sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.begin)
-        )
-      ).toHaveLength(4);
-      expect(
-        statements.filter((statement) =>
-          sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.rollback)
-        )
-      ).toHaveLength(4);
+  ])("excludes %s from the actual lifecycle child environment", (key) => {
+    const environment = createPostgresHarnessEnvironment({
+      ...process.env,
+      [key]: "parent-sensitive-sentinel",
+    });
+    expect(
+      Object.keys(environment).some(
+        (candidate) => candidate.toUpperCase() === key.toUpperCase()
+      )
+    ).toBe(false);
+    expect(semanticPostgresResult.environmentIsolation).toEqual({
+      lifecycle: true,
+      cleanupChild: true,
     });
   });
 
-  it("detects committed third-session drift in the fresh after snapshots", async () => {
-    await withSemanticDatabase(async (cluster, database) => {
-      const { environment, versionNumber } = await semanticPreflightEnvironment(
-        cluster,
-        database
-      );
-      expect(versionNumber).toBe("180004");
-      expect(Math.trunc(Number(versionNumber) / 10_000)).toBe(18);
-      let thirdSessionWrites = 0;
-      const report: any = await (verifyStagingDatabasePreflight as any)({
-        environment,
-        repositoryRoot,
-        adapter: createEmbeddedPreflightAdapter(cluster, database),
-        allowLoopback: true,
-        betweenSnapshotTransactions: async () => {
-          const thirdSession = cluster.getPgClient(database, "127.0.0.1");
-          await thirdSession.connect();
-          try {
-            await thirdSession.query(
-              "CREATE TABLE public.preflight_mvcc_drift (id integer)"
-            );
-            thirdSessionWrites += 1;
-          } finally {
-            await thirdSession.end();
-          }
-        },
-      });
+  it("runs the production identity and catalog queries in two fresh read-only snapshots", () => {
+    const stable = semanticPostgresResult.integration.stable;
+    expect(stable.versionNumber).toBe("180004");
+    expect(Math.trunc(Number(stable.versionNumber) / 10_000)).toBe(18);
+    expect(stable.report).toMatchObject({
+      exitCode: 0,
+      overallStatus: "pass",
+      initialState: "empty_migration_table",
+      connectionAuthority: "match",
+      directPooledIdentity: "match",
+      databaseRoleIdentity: "match",
+      extensionInventory: "match",
+      migrationCatalog: "pass",
+      readOnlyInvariant: "pass",
+      beforeAfterComparison: "match",
+      cleanup: "pass",
+    });
+    for (const count of Object.values(stable.queryCounts)) expect(count).toBe(4);
+    expect(stable.beginCount).toBe(4);
+    expect(stable.rollbackCount).toBe(4);
+  });
 
-      expect(thirdSessionWrites).toBe(1);
-      expect(report.exitCode).toBe(1);
-      expect(report.overallStatus).toBe("fail");
-      expect(report.beforeAfterComparison).toBe("fail");
-      expect(report.failure).toEqual({
+  it("detects committed third-session drift in the fresh after snapshots", () => {
+    const drift = semanticPostgresResult.integration.drift;
+    expect(drift.versionNumber).toBe("180004");
+    expect(Math.trunc(Number(drift.versionNumber) / 10_000)).toBe(18);
+    expect(drift).toMatchObject({
+      thirdSessionWrites: 1,
+      exitCode: 1,
+      overallStatus: "fail",
+      beforeAfterComparison: "fail",
+      failure: {
         checkId: "READ_ONLY_INVARIANT_MISMATCH",
         status: "fail",
-      });
-      expect(report.cleanup).toBe("pass");
+      },
+      cleanup: "pass",
     });
   });
 });
@@ -1579,16 +1367,14 @@ describe("staging extension inventory", () => {
 });
 
 describe("staging database preflight safety gate", () => {
-  it("allocates and releases a numeric IPv4 port without DNS", () => {
+  it("allocates and releases a numeric IPv4 port without DNS", async () => {
     const dns = process.getBuiltinModule("dns");
     if (!dns) throw new Error("PREFLIGHT_SEMANTIC_DNS_MODULE_UNAVAILABLE");
     const lookup = vi.spyOn(dns, "lookup");
     try {
-      const allocation = findSemanticPostgresPort();
-      expect(allocation.port).toBeGreaterThan(0);
-      expect(allocation.port).toBeLessThanOrEqual(65535);
-      expect(allocation.addressFamily).toBe("InterNetwork");
-      expect(allocation.released).toBe(true);
+      const port = await allocatePostgresHarnessPort();
+      expect(port).toBeGreaterThan(0);
+      expect(port).toBeLessThanOrEqual(65535);
       expect(lookup).not.toHaveBeenCalled();
     } finally {
       lookup.mockRestore();
@@ -1694,6 +1480,35 @@ describe("staging database preflight safety gate", () => {
     expect(report.failure.checkId).toBe("DIRECT_URL_QUERY_REJECTED");
     expect(fixture.connect).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["direct", "DIRECT_URL_AUTHORITY_REJECTED"],
+    ["pooled", "POOLED_URL_AUTHORITY_REJECTED"],
+    ["both", "DIRECT_URL_AUTHORITY_REJECTED"],
+  ] as const)(
+    "rejects an encoded database authority in %s before connecting",
+    async (side, checkId) => {
+      const fixture = createAdapter();
+      const environment = validEnvironment();
+      if (side === "direct" || side === "both") {
+        environment.DIRECT_DATABASE_URL = directUrl.replace(
+          "staging_database",
+          "app%2Fstaging"
+        );
+      }
+      if (side === "pooled" || side === "both") {
+        environment.DATABASE_URL = pooledUrl.replace(
+          "staging_database",
+          "app%2Fstaging"
+        );
+      }
+      const report = await runPreflight(fixture, environment);
+      expect(report.exitCode).toBe(2);
+      expect(report.failure.checkId).toBe(checkId);
+      expect(fixture.connect).not.toHaveBeenCalled();
+      expect(JSON.stringify(report)).not.toContain("app%2Fstaging");
+    }
+  );
 
   it("rejects direct and pooled URL target mismatch", async () => {
     const fixture = createAdapter();
@@ -2079,22 +1894,16 @@ describe("empty migration and application state", () => {
     expect(PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects).toContain(
       PREFLIGHT_EXTENSION_CLASSIFICATION_SQL_FOR_TESTS
     );
-    const result = await queryExtensionClassification({
-      managed: false,
-      residual: false,
-    });
-    expect(result.rows[0]).toMatchObject({
+    const result = semanticExtensionResult(false, false);
+    expect(result).toMatchObject({
       evidence_count: 1,
       complete_dependency_count: 1,
     });
   });
 
   it("marks dependency evidence outside both managed and residual sets as unclassified", async () => {
-    const result = await queryExtensionClassification({
-      managed: false,
-      residual: false,
-    });
-    expect(result.rows[0]).toMatchObject({
+    const result = semanticExtensionResult(false, false);
+    expect(result).toMatchObject({
       classification_count: 0,
       unclassified_count: 1,
       ambiguous_count: 0,
@@ -2102,11 +1911,8 @@ describe("empty migration and application state", () => {
   });
 
   it("accepts dependency evidence with exactly one SQL classification", async () => {
-    const result = await queryExtensionClassification({
-      managed: true,
-      residual: false,
-    });
-    expect(result.rows[0]).toMatchObject({
+    const result = semanticExtensionResult(true, false);
+    expect(result).toMatchObject({
       classification_count: 1,
       unclassified_count: 0,
       ambiguous_count: 0,
@@ -2114,11 +1920,8 @@ describe("empty migration and application state", () => {
   });
 
   it("marks dependency evidence in both managed and residual sets as ambiguous", async () => {
-    const result = await queryExtensionClassification({
-      managed: true,
-      residual: true,
-    });
-    expect(result.rows[0]).toMatchObject({
+    const result = semanticExtensionResult(true, true);
+    expect(result).toMatchObject({
       classification_count: 2,
       unclassified_count: 0,
       ambiguous_count: 1,

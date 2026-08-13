@@ -92,6 +92,7 @@ const PUBLIC_CHECK_IDS = new Set([
   "DIRECT_CONNECTION_UNAVAILABLE",
   "DIRECT_DATABASE_OWNER_MISMATCH",
   "DIRECT_ENDPOINT_KIND_REJECTED",
+  "DIRECT_DRIVER_AUTHORITY_MISMATCH",
   "DIRECT_FORBIDDEN_TARGET",
   "DIRECT_LOOPBACK_REJECTED",
   "DIRECT_POOLED_PROVIDER_IDENTITY_MISMATCH",
@@ -104,6 +105,7 @@ const PUBLIC_CHECK_IDS = new Set([
   "DIRECT_STAGING_MARKER_REQUIRED",
   "DIRECT_TARGET_UNCLASSIFIED",
   "DIRECT_URL_INVALID",
+  "DIRECT_URL_AUTHORITY_REJECTED",
   "DIRECT_URL_FRAGMENT_REJECTED",
   "DIRECT_URL_QUERY_REJECTED",
   "DIRECT_URL_PROTOCOL_REJECTED",
@@ -180,6 +182,7 @@ const PUBLIC_CHECK_IDS = new Set([
   "PARAMETERIZED_QUERY_SMOKE_MISMATCH",
   "POOLED_CONNECTION_UNAVAILABLE",
   "POOLED_ENDPOINT_KIND_REJECTED",
+  "POOLED_DRIVER_AUTHORITY_MISMATCH",
   "POOLED_FORBIDDEN_TARGET",
   "POOLED_LOOPBACK_REJECTED",
   "POOLED_ROLE_IDENTITY_MISMATCH",
@@ -188,6 +191,7 @@ const PUBLIC_CHECK_IDS = new Set([
   "POOLED_STAGING_MARKER_REQUIRED",
   "POOLED_TARGET_UNCLASSIFIED",
   "POOLED_URL_INVALID",
+  "POOLED_URL_AUTHORITY_REJECTED",
   "POOLED_URL_FRAGMENT_REJECTED",
   "POOLED_URL_QUERY_REJECTED",
   "POOLED_URL_PROTOCOL_REJECTED",
@@ -305,8 +309,16 @@ function arraysEqual(left, right) {
 
 function assertCanonicalPreflightOutcome(report) {
   if (report.exitCode !== 0) {
-    const expectedOverall = report.exitCode === 3 ? "not_verified" : "fail";
-    if (report.overallStatus !== expectedOverall) {
+    const canonical = {
+      1: { overallStatus: "fail", failureStatus: "fail" },
+      2: { overallStatus: "fail", failureStatus: "fail" },
+      3: { overallStatus: "not_verified", failureStatus: "not_verified" },
+    }[report.exitCode];
+    if (
+      !canonical ||
+      report.overallStatus !== canonical.overallStatus ||
+      report.failure?.status !== canonical.failureStatus
+    ) {
       throw new TypeError("INVALID_PUBLIC_OVERALL_STATUS");
     }
     return;
@@ -878,10 +890,7 @@ export async function runPreflightCli({
     } else if (
       outcome.kind === "failure" ||
       !outcome.report ||
-      typeof outcome.report !== "object" ||
-      !Number.isInteger(outcome.report.exitCode) ||
-      outcome.report.exitCode < 0 ||
-      outcome.report.exitCode > 3
+      typeof outcome.report !== "object"
     ) {
       terminalGate.latchFatal("PREFLIGHT_TOP_LEVEL_FAILURE");
       mainReport = createUnverifiedPreflightReport("PREFLIGHT_TOP_LEVEL_FAILURE");

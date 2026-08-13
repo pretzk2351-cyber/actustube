@@ -1,6 +1,16 @@
-import { Pool } from "@neondatabase/serverless";
+import { Client, Pool } from "@neondatabase/serverless";
 
 const POOL_CLOSE_TIMEOUT_MILLISECONDS = 5_000;
+
+export function getNeonDriverEffectiveAuthority(connectionString) {
+  const client = new Client({ connectionString });
+  return Object.freeze({
+    host: String(client.host).toLowerCase(),
+    port: Number(client.port),
+    database: String(client.database),
+    user: String(client.user),
+  });
+}
 
 async function endPoolWithinDeadline(pool) {
   let timer;

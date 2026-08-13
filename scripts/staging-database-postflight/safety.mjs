@@ -1,5 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 
+import { getNeonDriverEffectiveAuthority } from "./neon-adapter.mjs";
+
 export const REQUIRED_ENVIRONMENT_KEYS = Object.freeze([
   "ACTUSTUBE_DB_ENV",
   "ACTUSTUBE_ALLOW_STAGING_DB_VERIFY",
@@ -23,6 +25,7 @@ const SAFE_DATABASE_QUERY_PARAMETERS = new Map([
   ["channel_binding", new Set(["require"])],
   ["sslmode", new Set(["require"])],
 ]);
+const SAFE_AUTHORITY_IDENTIFIER = /^[A-Za-z0-9_.-]+$/;
 
 export class PostflightIssue extends Error {
   constructor(code, exitCode, status = "fail") {
@@ -95,54 +98,83 @@ function validateDatabaseUrlQuery(rawValue, parsed, kind) {
 }
 
 function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
+  const prefix = kind.toUpperCase();
   if (typeof rawValue !== "string" || rawValue.length === 0) {
-    throw safetyIssue(`${kind.toUpperCase()}_URL_REQUIRED`);
+    throw safetyIssue(`${prefix}_URL_REQUIRED`);
   }
 
   let parsed;
   try {
     parsed = new URL(rawValue);
   } catch {
-    throw safetyIssue(`${kind.toUpperCase()}_URL_INVALID`);
+    throw safetyIssue(`${prefix}_URL_INVALID`);
   }
 
   if (!POSTGRES_PROTOCOLS.has(parsed.protocol)) {
-    throw safetyIssue(`${kind.toUpperCase()}_URL_PROTOCOL_REJECTED`);
+    throw safetyIssue(`${prefix}_URL_PROTOCOL_REJECTED`);
   }
   validateDatabaseUrlQuery(rawValue, parsed, kind);
   if (!parsed.hostname || !parsed.pathname || parsed.pathname === "/") {
-    throw safetyIssue(`${kind.toUpperCase()}_TARGET_UNCLASSIFIED`);
+    throw safetyIssue(`${prefix}_TARGET_UNCLASSIFIED`);
   }
 
-  const hostname = parsed.hostname.toLowerCase();
-  let databasePath;
-  let decodedUsername;
+  const hostname = parsed.hostname
+    .replace(/^\[|\]$/g, "")
+    .toLowerCase();
+  const databasePath = parsed.pathname.slice(1);
+  const decodedUsername = parsed.username || "";
   let decodedPassword;
   try {
-    databasePath = decodeURIComponent(parsed.pathname.slice(1));
-    decodedUsername = decodeURIComponent(parsed.username || "");
     decodedPassword = decodeURIComponent(parsed.password || "");
   } catch {
-    throw safetyIssue(`${kind.toUpperCase()}_URL_INVALID`);
+    throw safetyIssue(`${prefix}_URL_INVALID`);
+  }
+  if (
+    !SAFE_AUTHORITY_IDENTIFIER.test(databasePath) ||
+    !SAFE_AUTHORITY_IDENTIFIER.test(decodedUsername)
+  ) {
+    throw safetyIssue(`${prefix}_URL_AUTHORITY_REJECTED`);
   }
   if (!decodedUsername) {
-    throw safetyIssue(`${kind.toUpperCase()}_ROLE_UNAVAILABLE`);
+    throw safetyIssue(`${prefix}_ROLE_UNAVAILABLE`);
+  }
+
+  const port = Number(parsed.port || "5432");
+  let driverAuthority;
+  try {
+    driverAuthority = getNeonDriverEffectiveAuthority(rawValue);
+  } catch {
+    throw safetyIssue(`${prefix}_URL_INVALID`);
+  }
+  const safetyAuthority = {
+    host: hostname,
+    port,
+    database: databasePath,
+    user: decodedUsername,
+  };
+  if (
+    driverAuthority.host !== safetyAuthority.host ||
+    driverAuthority.port !== safetyAuthority.port ||
+    driverAuthority.database !== safetyAuthority.database ||
+    driverAuthority.user !== safetyAuthority.user
+  ) {
+    throw safetyIssue(`${prefix}_DRIVER_AUTHORITY_MISMATCH`);
   }
   const stagingClassificationMetadata = [
-    hostname,
-    databasePath.toLowerCase(),
-    decodedUsername,
+    driverAuthority.host,
+    driverAuthority.database.toLowerCase(),
+    driverAuthority.user,
   ].join("/");
   const forbiddenTargetMetadata = [
     stagingClassificationMetadata,
   ].join("/");
   if (FORBIDDEN_TARGET_PART.test(forbiddenTargetMetadata)) {
-    throw safetyIssue(`${kind.toUpperCase()}_FORBIDDEN_TARGET`);
+    throw safetyIssue(`${prefix}_FORBIDDEN_TARGET`);
   }
 
   const isLoopback = ["127.0.0.1", "::1", "localhost"].includes(hostname);
   if (isLoopback && !allowLoopback) {
-    throw safetyIssue(`${kind.toUpperCase()}_LOOPBACK_REJECTED`);
+    throw safetyIssue(`${prefix}_LOOPBACK_REJECTED`);
   }
 
   let normalizedHost = hostname;
@@ -155,23 +187,17 @@ function parseDatabaseUrl(rawValue, kind, { allowLoopback = false } = {}) {
     providerIdentity = labels[0];
     normalizedHost = labels.join(".");
     if ((kind === "direct" && isPooled) || (kind === "pooled" && !isPooled)) {
-      throw safetyIssue(`${kind.toUpperCase()}_ENDPOINT_KIND_REJECTED`);
+      throw safetyIssue(`${prefix}_ENDPOINT_KIND_REJECTED`);
     }
     if (!STAGING_TARGET_PART.test(stagingClassificationMetadata)) {
-      throw safetyIssue(`${kind.toUpperCase()}_STAGING_MARKER_REQUIRED`);
+      throw safetyIssue(`${prefix}_STAGING_MARKER_REQUIRED`);
     }
   }
 
-  const port = parsed.port || "5432";
   return {
     rawValue,
     targetKey: `${normalizedHost}\u0000${port}\u0000${databasePath}`,
-    authority: {
-      host: hostname,
-      port: Number(port),
-      database: databasePath,
-      user: decodedUsername,
-    },
+    authority: driverAuthority,
     role: decodedUsername,
     isLoopback,
     isPooled,

@@ -242,6 +242,65 @@ describe("staging postflight safety gate", () => {
   });
 
   it.each([
+    ["direct encoded path separator", "direct", "app%2Fstaging"],
+    ["direct lowercase encoded path separator", "direct", "app%2fstaging"],
+    ["direct encoded query delimiter", "direct", "staging%3Fapp"],
+    ["direct encoded fragment delimiter", "direct", "staging%23app"],
+    ["direct encoded backslash", "direct", "staging%5Capp"],
+    ["direct encoded NUL", "direct", "staging%00app"],
+    ["direct double-encoded separator", "direct", "app%252Fstaging"],
+    ["direct invalid percent escape", "direct", "staging%ZZ"],
+    ["pooled encoded path separator", "pooled", "app%2Fstaging"],
+    ["both URLs with the same encoded path", "both", "app%2Fstaging"],
+  ] as const)("rejects %s before starting a connection", async (_label, side, path) => {
+    const connect = vi.fn();
+    const environment = validEnvironment();
+    if (side === "direct" || side === "both") {
+      environment.DIRECT_DATABASE_URL = directUrl.replace(
+        "staging_database",
+        path
+      );
+    }
+    if (side === "pooled" || side === "both") {
+      environment.DATABASE_URL = pooledUrl.replace("staging_database", path);
+    }
+
+    const report: any = await verifyStagingDatabasePostflight({
+      environment,
+      repositoryRoot,
+      adapter: { connect },
+    });
+    expect(report.exitCode).toBe(2);
+    expect(report.failure.checkId).toBe(
+      side === "pooled"
+        ? "POOLED_URL_AUTHORITY_REJECTED"
+        : "DIRECT_URL_AUTHORITY_REJECTED"
+    );
+    expect(connect).not.toHaveBeenCalled();
+    const publicReport = JSON.stringify(report);
+    expect(publicReport).not.toContain(path);
+    expect(publicReport).not.toContain("ep-actustube-safe");
+  });
+
+  it("rejects ambiguous username encoding before starting a connection", async () => {
+    const connect = vi.fn();
+    const environment = validEnvironment();
+    environment.DIRECT_DATABASE_URL = directUrl.replace(
+      "staging_direct",
+      "staging%2Fdirect"
+    );
+    const report: any = await verifyStagingDatabasePostflight({
+      environment,
+      repositoryRoot,
+      adapter: { connect },
+    });
+    expect(report.exitCode).toBe(2);
+    expect(report.failure.checkId).toBe("DIRECT_URL_AUTHORITY_REJECTED");
+    expect(connect).not.toHaveBeenCalled();
+    expect(JSON.stringify(report)).not.toContain("staging%2Fdirect");
+  });
+
+  it.each([
     ["missing environment", { ACTUSTUBE_DB_ENV: undefined }],
     ["empty environment", { ACTUSTUBE_DB_ENV: "" }],
     ["production", { ACTUSTUBE_DB_ENV: "production" }],

@@ -97,6 +97,19 @@ function unverifiedReport(checkId = "PREFLIGHT_TEST_UNVERIFIED") {
   };
 }
 
+function canonicalFailureReport(
+  exitCode: 1 | 2 | 3,
+  checkId: string,
+  status: "fail" | "not_verified"
+) {
+  return {
+    ...createPreflightBaseReport(),
+    overallStatus: exitCode === 3 ? "not_verified" : "fail",
+    failure: { checkId, status },
+    exitCode,
+  };
+}
+
 function expectOneReportPair(output: string[]) {
   expect(output).toHaveLength(1);
   const buffer = output[0];
@@ -136,6 +149,80 @@ describe("staging database preflight entrypoint terminal report gate", () => {
     expect(processFixture.exitCode).toBe(0);
     expectOneReportPair(output);
     expectNoFatalListeners(processFixture);
+  });
+
+  it.each([
+    [1, "READ_ONLY_INVARIANT_MISMATCH", "fail"],
+    [2, "STAGING_ENVIRONMENT_REQUIRED", "fail"],
+    [3, "DATABASE_QUERY_UNAVAILABLE", "not_verified"],
+  ] as const)(
+    "accepts canonical exit %i semantics",
+    async (exitCode, checkId, status) => {
+      const processFixture = createProcessFixture();
+      const output: string[] = [];
+      const report = await runCli({
+        mainFunction: async () =>
+          canonicalFailureReport(exitCode, checkId, status),
+        processObject: processFixture,
+        stdout: (buffer: string) => output.push(buffer),
+      });
+      expect(report).toMatchObject({
+        exitCode,
+        overallStatus: exitCode === 3 ? "not_verified" : "fail",
+        failure: { checkId, status },
+      });
+      expect(processFixture.exitCode).toBe(exitCode);
+      expectOneReportPair(output);
+    }
+  );
+
+  it.each([
+    [1, "READ_ONLY_INVARIANT_MISMATCH", "not_verified", "fail"],
+    [2, "STAGING_ENVIRONMENT_REQUIRED", "not_verified", "fail"],
+    [3, "DATABASE_QUERY_UNAVAILABLE", "fail", "not_verified"],
+    [1, "READ_ONLY_INVARIANT_MISMATCH", "fail", "not_verified"],
+  ] as const)(
+    "rejects noncanonical exit %i semantics",
+    async (exitCode, checkId, failureStatus, overallStatus) => {
+      const processFixture = createProcessFixture();
+      const output: string[] = [];
+      const invalid = {
+        ...canonicalFailureReport(exitCode, checkId, failureStatus),
+        overallStatus,
+      };
+      const report = await runCli({
+        mainFunction: async () => invalid,
+        processObject: processFixture,
+        stdout: (buffer: string) => output.push(buffer),
+      });
+      expect(report).toMatchObject({
+        exitCode: 3,
+        failure: {
+          checkId: "PREFLIGHT_PUBLIC_REPORT_INVALID",
+          status: "not_verified",
+        },
+      });
+      expectOneReportPair(output);
+    }
+  );
+
+  it("rejects an unknown exit code without exposing the raw report", async () => {
+    const processFixture = createProcessFixture();
+    const output: string[] = [];
+    const report = await runCli({
+      mainFunction: async () => ({
+        ...canonicalFailureReport(1, "READ_ONLY_INVARIANT_MISMATCH", "fail"),
+        exitCode: 4,
+      }),
+      processObject: processFixture,
+      stdout: (buffer: string) => output.push(buffer),
+    });
+    expect(report.failure).toEqual({
+      checkId: "PREFLIGHT_PUBLIC_REPORT_INVALID",
+      status: "not_verified",
+    });
+    expect(report.exitCode).toBe(3);
+    expectOneReportPair(output);
   });
 
   it.each([
