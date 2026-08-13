@@ -1,8 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdtemp, readFile, readdir, rmdir, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -22,7 +23,14 @@ import { assertReadOnlySql } from "../scripts/staging-database-postflight/safety
 import {
   allocatePostgresHarnessPort,
   createPostgresHarnessEnvironment,
+  evaluateHarnessTerminationIdentityForTests,
+  invokeTerminationOnlyForExactIdentityForTests,
+  POSTGRES_HARNESS_FAULT_CONTRACTS,
+  runCleanupDeadlineContractForTests,
+  runOwnedRootSafetyProbeForTests,
   runOwnedPostgresHarness,
+  validateWindowsUtilityAuthorityForTests,
+  waitForChildCloseWithTimeout,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
 import {
   PARENT_ENVIRONMENT_NOTICE,
@@ -913,38 +921,36 @@ async function runCliChild(scenario: string) {
 }
 
 let semanticPostgresResult: any;
+let semanticPostgresPromise: Promise<any> | undefined;
 
-beforeAll(async () => {
-  semanticPostgresResult = await runOwnedPostgresHarness({ mode: "integration" });
+async function getSemanticPostgresResult() {
+  semanticPostgresPromise ||= runOwnedPostgresHarness({ mode: "integration" });
+  semanticPostgresResult = await semanticPostgresPromise;
   if (semanticPostgresResult.outcome !== "pass") {
-    throw new Error(
-      `OWNED_POSTGRES_INTEGRATION_FAILED_${semanticPostgresResult.childErrorCode}_${semanticPostgresResult.failurePhase}`
-    );
+    throw new Error("OWNED_POSTGRES_INTEGRATION_FAILED");
   }
   expect(semanticPostgresResult).toMatchObject({
     outcome: "pass",
-    forcedCleanup: false,
-    processRemaining: false,
-    listenerRemaining: false,
-    dataDirectoryRemaining: false,
+    cleanup: { attempted: true, result: "complete" },
+    residue: { process: 0, listener: 0, directory: 0 },
     environmentIsolation: {
       lifecycle: true,
       cleanupChild: true,
     },
     lifecycle: {
       normalStopAttempted: true,
+      normalStopSucceeded: true,
+      parentCleanupRequired: true,
       processRemaining: false,
       listenerRemaining: false,
-      dataDirectoryRemaining: false,
     },
   });
-  expect(
-    semanticPostgresResult.lifecycle.normalStopSucceeded
-  ).toBe(!semanticPostgresResult.lifecycle.forcedCleanupUsed);
-}, 150_000);
+  return semanticPostgresResult;
+}
 
-function semanticExtensionResult(managed: boolean, residual: boolean) {
-  const entry = semanticPostgresResult.integration.extensionClassifications.find(
+async function semanticExtensionResult(managed: boolean, residual: boolean) {
+  const semantic = await getSemanticPostgresResult();
+  const entry = semantic.integration.extensionClassifications.find(
     (candidate: any) =>
       candidate.managed === managed && candidate.residual === residual
   );
@@ -977,121 +983,285 @@ async function stopUnrelatedSentinel(child: ChildProcess) {
   }
 }
 
-describe("owned PostgreSQL fixture lifecycle", () => {
-  it("constructs a positive child environment from OS keys only", () => {
-    const source = {
-      ...process.env,
-      DATABASE_URL: "parent-db-sentinel",
-      direct_database_url: "parent-direct-sentinel",
-      PGHOST: "parent-pg-sentinel",
-      PgPassword: "parent-password-sentinel",
-      HTTP_PROXY: "parent-proxy-sentinel",
-      https_proxy: "parent-proxy-sentinel",
-      NPM_TOKEN: "parent-token-sentinel",
-      GOOGLE_APPLICATION_CREDENTIALS: "parent-credential-sentinel",
-      SERVICE_SECRET: "parent-secret-sentinel",
-      NODE_OPTIONS: "--require parent-sentinel",
-    };
-    const environment = createPostgresHarnessEnvironment(source);
-    expect(Object.keys(environment).sort()).toEqual(
-      Object.keys(environment)
-        .filter((key) =>
-          [
-            "COMSPEC",
-            "HOMEDRIVE",
-            "HOMEPATH",
-            "LOGONSERVER",
-            "NUMBER_OF_PROCESSORS",
-            "OS",
-            "PATH",
-            "PATHEXT",
-            "PROCESSOR_ARCHITECTURE",
-            "PROCESSOR_IDENTIFIER",
-            "PROCESSOR_LEVEL",
-            "PROCESSOR_REVISION",
-            "SYSTEMROOT",
-            "SYSTEMDRIVE",
-            "TEMP",
-            "TMP",
-            "USERDOMAIN",
-            "USERNAME",
-            "USERPROFILE",
-            "WINDIR",
-          ].includes(key)
-        )
-        .sort()
-    );
-    expect(
-      Object.keys(environment).some((key) =>
-        /DATABASE_URL|^PG|PROXY|CREDENTIAL|TOKEN|SECRET|PASSWORD|NODE_OPTIONS/i.test(
-          key
-        )
-      )
-    ).toBe(false);
+const postgresHarnessModule = resolve(
+  repositoryRoot,
+  "scripts/test-staging-database-preflight-postgres.mjs"
+);
+
+async function runDirectHarnessInvocation(arguments_: string[]) {
+  return await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+    (resolveChild, rejectChild) => {
+      const child = spawn(process.execPath, [postgresHarnessModule, ...arguments_], {
+        env: createSanitizedNodeChildEnvironment(),
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => {
+        child.kill();
+        rejectChild(new Error("DIRECT_HARNESS_TIMEOUT"));
+      }, 5_000);
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => (stdout += chunk));
+      child.stderr.on("data", (chunk) => (stderr += chunk));
+      child.once("error", (error) => {
+        clearTimeout(timer);
+        rejectChild(error);
+      });
+      child.once("close", (code) => {
+        clearTimeout(timer);
+        resolveChild({ code, stdout, stderr });
+      });
+    }
+  );
+}
+
+describe("harness root claim and direct invocation", () => {
+  it("rejects child CLI roots and arguments with zero file mutation", async () => {
+    const sentinel = await mkdtemp(join(tmpdir(), "actustube-direct-sentinel-"));
+    const marker = join(sentinel, "marker.txt");
+    await writeFile(marker, "unchanged", { encoding: "utf8", flag: "wx" });
+    const before = await readdir(sentinel);
+    try {
+      for (const arguments_ of [
+        ["--child"],
+        [`--root=${sentinel}`],
+        [`--root=${tmpdir()}`],
+        [`--root=${repositoryRoot}`],
+        ["--unknown"],
+        ["--ipc-child", "--ipc-child"],
+      ]) {
+        const result = await runDirectHarnessInvocation(arguments_);
+        expect(result).toEqual({
+          code: 70,
+          stdout: "",
+          stderr: "POSTGRES_HARNESS_IPC_REQUIRED\n",
+        });
+      }
+      expect(await readdir(sentinel)).toEqual(before);
+      expect(await readFile(marker, "utf8")).toBe("unchanged");
+    } finally {
+      await unlink(marker);
+      await rmdir(sentinel);
+    }
   });
 
-  it.each([
-    ["ready timeout", "fault-ready-hang"],
-    ["partial-start throw", "fault-partial-throw"],
-    ["stop hang", "fault-stop-hang"],
-    ["child crash", "fault-crash"],
-  ] as const)(
-    "recovers an exact owned process tree after %s",
-    async (_label, mode) => {
-      const sentinel = spawn(
-        process.execPath,
-        ["--input-type=module", "-e", "setInterval(()=>{},1000)"],
-        {
-          env: createPostgresHarnessEnvironment(
-            process.env
-          ) as unknown as NodeJS.ProcessEnv,
-          stdio: "ignore",
-          windowsHide: true,
-        }
-      );
-      try {
-        expect(sentinel.pid).toBeTypeOf("number");
-        const result: any = await runOwnedPostgresHarness({
-          mode,
-          sourceEnvironment: {
-            ...process.env,
-            DATABASE_URL: "parent-db-sentinel",
-            DIRECT_DATABASE_URL: "parent-direct-sentinel",
-            PGHOST: "parent-pg-sentinel",
-            PGPORT: "5432",
-            PGUSER: "parent-pg-sentinel",
-            PGPASSWORD: "parent-pg-sentinel",
-            PGDATABASE: "parent-pg-sentinel",
-            PGSERVICE: "parent-pg-sentinel",
-            PGSERVICEFILE: "parent-pg-sentinel",
-            HTTP_PROXY: "parent-proxy-sentinel",
-            HTTPS_PROXY: "parent-proxy-sentinel",
-            ALL_PROXY: "parent-proxy-sentinel",
-            NO_PROXY: "parent-proxy-sentinel",
-            NODE_OPTIONS: "--require parent-sentinel",
-            NPM_TOKEN: "parent-token-sentinel",
-            GOOGLE_APPLICATION_CREDENTIALS: "parent-credential-sentinel",
-            SERVICE_SECRET: "parent-secret-sentinel",
-          },
-        });
-        expect(result).toMatchObject({
-          outcome: "expected_failure",
-          forcedCleanup: true,
-          processRemaining: false,
-          listenerRemaining: false,
-          dataDirectoryRemaining: false,
-        });
-        expect(result.ownership.harnessPid).not.toBe(sentinel.pid);
-        expect(testProcessAlive(sentinel.pid)).toBe(true);
-      } finally {
-        await stopUnrelatedSentinel(sentinel);
-      }
+  it.each(["wrong-token", "duplicate-init", "unknown-init-key"] as const)(
+    "rejects %s before worker startup",
+    async (protocolFault) => {
+      await expect(
+        runOwnedPostgresHarness({ mode: "ready_hang", protocolFault })
+      ).rejects.toThrow(/POSTGRES_HARNESS_IPC_/);
     },
-    30_000
+    15_000
+  );
+
+  it.each(["root-exchange", "nested-link"] as const)(
+    "rejects %s without following an unrelated sentinel",
+    async (kind) => {
+      await expect(runOwnedRootSafetyProbeForTests(kind)).resolves.toEqual({
+        rejected: true,
+        sentinelMaintained: true,
+        ownedRootRemaining: false,
+      });
+    }
   );
 });
 
+describe("trusted Windows utility and harness environment", () => {
+  it("ignores sentinel utility, PATH, and temporary-directory authorities", async () => {
+    const fakeRoot = await mkdtemp(join(tmpdir(), "actustube-fake-windows-"));
+    const fakeUtility = join(fakeRoot, "powershell.exe");
+    await writeFile(fakeUtility, "fake utility must not execute", {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    try {
+      expect(() => validateWindowsUtilityAuthorityForTests(fakeRoot)).toThrow(
+        "POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE"
+      );
+      const ownedRoot = join(tmpdir(), "actustube-preflight-owned-contract");
+      const environment: any = createPostgresHarnessEnvironment(
+        {
+          NODE_ENV: "test",
+          SYSTEMROOT: fakeRoot,
+          WINDIR: fakeRoot,
+          PATH: fakeRoot,
+          TEMP: fakeRoot,
+          TMP: fakeRoot,
+          NODE_OPTIONS: "--require fake",
+          DATABASE_URL: "secret sentinel",
+        },
+        ownedRoot
+      );
+      expect(environment.SYSTEMROOT).not.toBe(fakeRoot);
+      expect(environment.WINDIR).not.toBe(fakeRoot);
+      expect(environment.PATH).not.toContain(fakeRoot);
+      expect(environment.TEMP).toBe(join(ownedRoot, "temporary"));
+      expect(environment.TMP).toBe(join(ownedRoot, "temporary"));
+      expect(Object.keys(environment)).not.toContain("NODE_OPTIONS");
+      expect(validateWindowsUtilityAuthorityForTests(undefined)).toEqual({
+        platform: "win32",
+        powershellBasename: "powershell.exe",
+        taskkillBasename: "taskkill.exe",
+      });
+    } finally {
+      await unlink(fakeUtility);
+      await rmdir(fakeRoot);
+    }
+  });
+});
+
+describe("fault oracle negative controls", () => {
+  it.each(Object.entries(POSTGRES_HARNESS_FAULT_CONTRACTS))(
+    "accepts only the canonical %s phase and reason",
+    async (mode, contract: any) => {
+      const result: any = await runOwnedPostgresHarness({ mode });
+      expect(result).toEqual({
+        schemaVersion: 2,
+        occurrenceId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        mode,
+        phaseSequence: contract.phases,
+        intendedFaultReached: true,
+        terminalReason: contract.terminalReason,
+        environmentIsolation: {
+          sourceSeparated: true,
+          cleanupProbe: true,
+          temporaryRootOwned: true,
+        },
+        cleanup: { attempted: true, result: "complete" },
+        residue: { process: 0, listener: 0, directory: 0 },
+      });
+    },
+    30_000
+  );
+
+  it.each(Object.keys(POSTGRES_HARNESS_FAULT_CONTRACTS))(
+    "rejects an early unrelated failure for %s",
+    async (mode) => {
+      await expect(
+        runOwnedPostgresHarness({ mode, faultControl: "early-failure" })
+      ).rejects.toThrow("POSTGRES_HARNESS_FAULT_ORACLE_REJECTED");
+    },
+    20_000
+  );
+});
+
+describe("global cleanup deadline and cancelable timer", () => {
+  it("shares one monotonic budget and starts nothing after expiry", () => {
+    expect(
+      runCleanupDeadlineContractForTests(
+        [
+          { kind: "utility", duration: 6 },
+          { kind: "kill", duration: 4 },
+          { kind: "utility", duration: 1 },
+          { kind: "kill", duration: 1 },
+        ],
+        10
+      )
+    ).toEqual({
+      elapsed: 10,
+      remainingByStage: [10, 4, 0],
+      utilitySpawnCount: 1,
+      killCount: 1,
+      expired: true,
+    });
+  });
+
+  it.each([
+    ["close", Promise.resolve({ closed: true })],
+    ["timeout", new Promise(() => undefined)],
+  ] as const)("cancels its timer after %s wins", async (_label, closePromise) => {
+    const cancel = vi.fn();
+    const timeoutPromise =
+      _label === "timeout"
+        ? Promise.resolve({ timedOut: true })
+        : new Promise(() => undefined);
+    await waitForChildCloseWithTimeout(closePromise, 1, () => ({
+      promise: timeoutPromise,
+      cancel,
+    }));
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+});
+
+describe("PID generation and unrelated sentinel", () => {
+  const expected = {
+    pid: 4242,
+    parentPid: 2121,
+    creationIdentity: "638000000000000000",
+    executablePath: "C:\\Program Files\\nodejs\\node.exe",
+  };
+  const childState = {
+    pid: 4242,
+    exitCode: null,
+    signalCode: null,
+    closed: false,
+  };
+  const base = {
+    childState,
+    expected,
+    observed: expected,
+    occurrenceId: "occurrence",
+    ipcOccurrenceId: "occurrence",
+  };
+
+  it("allows only the original spawn generation", () => {
+    expect(evaluateHarnessTerminationIdentityForTests(base)).toBe(true);
+    for (const observed of [
+      { ...expected, creationIdentity: "638000000000000001" },
+      { ...expected, executablePath: "C:\\Windows\\System32\\cmd.exe" },
+      { ...expected, parentPid: 3131 },
+    ]) {
+      const terminate = vi.fn();
+      expect(
+        invokeTerminationOnlyForExactIdentityForTests(
+          { ...base, observed },
+          terminate
+        )
+      ).toBe(false);
+      expect(terminate).not.toHaveBeenCalled();
+    }
+    expect(
+      evaluateHarnessTerminationIdentityForTests({
+        ...base,
+        childState: { ...childState, closed: true },
+      })
+    ).toBe(false);
+  });
+
+  it("does not terminate an unrelated live sentinel on PID-reuse rejection", async () => {
+    const sentinel = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", "setInterval(()=>{},1000)"],
+      { stdio: "ignore", windowsHide: true }
+    );
+    try {
+      const terminate = vi.fn(() => sentinel.kill());
+      expect(
+        invokeTerminationOnlyForExactIdentityForTests(
+          {
+            ...base,
+            observed: { ...expected, creationIdentity: "reused" },
+          },
+          terminate
+        )
+      ).toBe(false);
+      expect(terminate).not.toHaveBeenCalled();
+      expect(testProcessAlive(sentinel.pid)).toBe(true);
+    } finally {
+      await stopUnrelatedSentinel(sentinel);
+    }
+  });
+});
+
 describe("PostgreSQL 18 production preflight integration", () => {
+  beforeAll(async () => {
+    await getSemanticPostgresResult();
+  }, 150_000);
+
   it.each([
     "DATABASE_URL",
     "DIRECT_DATABASE_URL",
@@ -1894,7 +2064,7 @@ describe("empty migration and application state", () => {
     expect(PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects).toContain(
       PREFLIGHT_EXTENSION_CLASSIFICATION_SQL_FOR_TESTS
     );
-    const result = semanticExtensionResult(false, false);
+    const result = await semanticExtensionResult(false, false);
     expect(result).toMatchObject({
       evidence_count: 1,
       complete_dependency_count: 1,
@@ -1902,7 +2072,7 @@ describe("empty migration and application state", () => {
   });
 
   it("marks dependency evidence outside both managed and residual sets as unclassified", async () => {
-    const result = semanticExtensionResult(false, false);
+    const result = await semanticExtensionResult(false, false);
     expect(result).toMatchObject({
       classification_count: 0,
       unclassified_count: 1,
@@ -1911,7 +2081,7 @@ describe("empty migration and application state", () => {
   });
 
   it("accepts dependency evidence with exactly one SQL classification", async () => {
-    const result = semanticExtensionResult(true, false);
+    const result = await semanticExtensionResult(true, false);
     expect(result).toMatchObject({
       classification_count: 1,
       unclassified_count: 0,
@@ -1920,7 +2090,7 @@ describe("empty migration and application state", () => {
   });
 
   it("marks dependency evidence in both managed and residual sets as ambiguous", async () => {
-    const result = semanticExtensionResult(true, true);
+    const result = await semanticExtensionResult(true, true);
     expect(result).toMatchObject({
       classification_count: 2,
       unclassified_count: 0,
