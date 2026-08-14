@@ -1,6 +1,6 @@
 # ActusTube Staging Database Preflight / Postflight Runbook
 
-最終更新日：2026-08-13
+最終更新日：2026-08-14
 
 ## 目的と適用範囲
 
@@ -16,7 +16,8 @@
 - postflight package command：`npm run db:verify:staging`
 - postflight entry script：`scripts/verify-staging-database-postflight.mjs`
 - shared safety / postflight validation：`scripts/staging-database-postflight/`
-- local integration harness：`npm run test:db-postflight:local`
+- disposable external fixture workflow：`.github/workflows/staging-database-preflight.yml`
+- connection-only verifier：`scripts/test-staging-database-preflight-postgres.mjs`
 - Migration command：`npm run db:migrate`
 
 `db:preflight:staging`、`db:migrate`、`db:verify:staging`はすべて別commandです。preflightとpostflightは互いを呼び出さず、Migration commandも呼び出しません。どちらの検証commandもDDL、DML、reservation、release、finalize、stale recovery、cleanup functionを実行しません。
@@ -81,7 +82,7 @@ database接続adapterを呼び出す前に、次をすべて検証します。
 - operatorがprovider UIで別経路から確認したexpected endpoint identityと一致
 - host、database、またはrole metadataに境界付き`staging` markerがあり、role名を含む全target metadataにProduction等の禁止語がない。接続後は固定queryの`current_user`が各URLのdecode済みroleと完全一致する
 - Production、prod、rehearsal、backup、default、main、template database等の明示的な禁止targetではない
-- loopbackは正式commandでは拒否し、programmatic local harnessだけが明示的に許可
+- loopbackは正式commandでは拒否し、GitHub Actions disposable fixtureのconnection-only verifierだけがprogrammaticに明示許可
 
 URLに`staging`という文字があること、database名、schema、Migration履歴が同じことだけではPASSにしません。staging marker判定は別の`decodeURIComponent`結果ではなくNeon driverが実際に使うdatabase / host / role authorityへ適用し、`app%2Fstaging`をstaging targetとして認定しません。許可されたquery parameterはrouting authorityを変更しない固定値だけです。接続後は、direct / pooled双方のdatabase OID、catalog identity、実database role、Migration fingerprint、管理対象schema fingerprint、object signature fingerprintを内部で完全比較します。実値は出力しません。同一論理databaseまたは期待roleを証明できなければexit code 1または3です。
 
@@ -110,7 +111,7 @@ Production SQLは全candidate signature、一意なevidence signatureを持つra
 
 `drizzle` schemaだけ、migration tableの形状不一致、migration管理objectの不足・追加、履歴1件以上、unknown / duplicate履歴、user-defined residual objectが1件でも存在する状態はpartialまたは既適用状態としてFAILです。空migration tableは正式な3 columns、primary key 1件、serial sequence 1件だけを許可します。3 columnsは、物理列数、relation対応、`attnum`順序、drop済み列0件、inheritance / local状態、built-in type、type length / pass-by-value / alignment、typmod、dimension、domain不使用、identity / generated不使用、canonical collation / NOT NULL / default有無、column ACL / option / FDW option、storage / compression、fresh PostgreSQL 18で得た単一の`attstattarget IS NULL`状態、missing-value状態まで`pg_attribute`の正式fieldをexact検証します。
 
-canonical値はrepositoryと同じ`embedded-postgres 18.4`をloopbackだけで使う使い捨てPostgreSQLから導出し、repository Migration SQLは適用しません。Production preflight SQLとは別の固定raw `pg_catalog` queryを使い、raw値をscript側でOID実値を残さないzero / nonzero・relation対応へ変換して期待値と独立比較します。guardを明示したNode childでは、TCP / TLSの非loopback、DNS、UDP、非loopback listenerを拒否します。このguardはsuccessful external connection、native child、guard未導入processを観測しないため、それらを0件とは主張しません。Environment Variable値、URL、host、database名、role名、owner名、OID実値、credential、raw error、stack、causeは出力しません。
+canonical catalog契約はproduction preflight SQLとrepository metadata / testで固定します。実PostgreSQLでのgateはGitHub Actions Linux service containerが所有するdigest固定`postgres:18.6-bookworm`だけで実行し、repository harnessはdatabase process、port、data directory、PID、停止、削除を作成・所有しません。connection-only verifierはraw numeric `127.0.0.1`と明示portへだけ接続し、Production query関数を空ledger、fresh before / after、第三session drift、extension分類4種へ通します。Migration 0000〜0006適用後はschema、column、index、FK、unique、check、type、default、nullability、function、owner、ACL、ledger、transaction rollback、postflightとdrift拒否を確認します。Environment Variable値、URL、host、database名、role名、owner名、OID実値、credential、raw error、stack、causeは出力しません。このworkflowは実staging / Production検証の代替ではありません。
 
 `pg_class`はtable / sequence / primary-key indexについてrelation kind、namespace、access method、persistence、replica identity、RLS、populated / partition / shared / rewrite / row-type / typed-table状態、tablespace、TOASTのzero / nonzeroと参照対応、ACL / option、owner関係、固定boolean / charを検証します。`relfilenode`、`relpages`、`reltuples`、`relallvisible`、`relallfrozen`、`relfrozenxid`、`relminmxid`はrewrite、planner統計、VACUUM、freeze、transaction状態で変動するためfield別理由をcoverage matrixへ記録してexact固定から除外します。その他のstable fieldに未検査を残しません。
 
@@ -233,26 +234,24 @@ directだけ、pooledだけ、partial PASS、check skippedは成功ではあり�
 
 preflightのexit code 1はMigration履歴が空でない、unknown / duplicate履歴、migration管理objectやapplication objectの残存、partial schema、direct / pooledの検証済み状態不一致を含みます。exit code 2はenvironment、許可フラグ、URL分類、expected provider identity等の接続前安全gate違反です。identityや接続結果を確認できない場合はexit code 3です。
 
-## local harnessの証明範囲
+## external fixture harnessの証明範囲
 
-`tests/staging-database-preflight.test.ts`のlocal PostgreSQL検証は、production codeから到達しない専用Node harnessへ隔離します。親VitestがOS temporary directory直下へ固定prefix付きの専用rootを`mkdtemp`で新規作成し、作成時の`lstat` identityと`realpath`、unique occurrence ID、harness／cleanup別one-time capabilityを記録します。child CLIはroot、data directory、port、削除対象を受け取らず、親が開いたprivate Node IPC channel上の初回exact initだけをrole別root claimのSHA-256と照合して受理します。IPCなしのdirect invocation、`--root`、unknown / duplicate argument、wrong / duplicate initはfile作成やprocess起動前に拒否します。filesystem上のlifecycle state fileは作成せず、PID、process role、kill、delete authorityをfile contentから復元しません。rootは各書込み、PostgreSQL起動、cleanup、quarantine、削除直前に再照合し、repository / home / drive / OS temp root、root外entryをfail-closedで拒否します。
+通常のlocal VitestはPostgreSQLを起動・接続しません。URL parserがlowercase `postgres` / `postgresql`、raw numeric `127.0.0.1`、明示的な1〜65535のcanonical port、expected database / role、major 18、Migration max 0006だけを受理し、`localhost`、DNS、IPv6、IPv4-mapped IPv6、percent-encoded hostname / user / password / database、query、fragment、multi-host、whitespace / control、missing credential、identity不一致をconnection factory呼出し0件で拒否することを確認します。fixture未設定のdirect invocationは非0と固定`EXTERNAL_FIXTURE_NOT_CONFIGURED`だけを出力します。
 
-harness、PostgreSQL、通常stopが内部利用するWindows utility、cleanup worker／probeには、親のsentinel用environmentとは別のpositive environmentだけを渡します。Windows utility authorityはcallerの`SYSTEMROOT` / `WINDIR` / `PATH`から選ばず、実行中Node executableのcanonical volume上でdrive root、Windows、System32、WindowsPowerShell、v1.0、executableのlexical全componentを`lstat` / `realpath`検証し、中間reparse、canonical不一致、parent／type不一致を拒否します。固定basenameのregular executableをabsolute path、argument array、`shell: false`で起動し、authorityを確定できなければPATHへfallbackせず停止します。childの`SYSTEMROOT` / `WINDIR`はそのcanonical root、`PATH`は検証済みSystem32 / WindowsPowerShell directoryだけ、`TEMP` / `TMP`はowned root配下へ固定し、DB / PostgreSQL / proxy / token / credential / secret / password / auth / `NODE_OPTIONS`を大小文字非依存で除外します。親test workerの`process.env`は変更しません。
+repository側のconnection-only verifierが受け取るfixture入力は、`ACTUSTUBE_STAGING_HARNESS_DATABASE_URL`、`ACTUSTUBE_STAGING_HARNESS_EXPECTED_DATABASE`、`ACTUSTUBE_STAGING_HARNESS_EXPECTED_ROLE`、`ACTUSTUBE_STAGING_HARNESS_EXPECTED_MAJOR`、`ACTUSTUBE_STAGING_HARNESS_EXPECTED_MIGRATION_MAX`の5個だけです。generic `DATABASE_URL`、`.env` file、CLI URL fallbackは使いません。GitHub Actions jobだけが、固定されたdisposable CI用database / role / passwordとrandom host-mapped portからURLをstep environment内で組み立てます。この値はstaging / Production credentialではなく、log、artifact、reportへ出しません。
 
-repositoryと同じ`embedded-postgres 18.4`で、database / role / server identity、extension inventory、migration table / column inventory、exact migration catalog、user-defined object catalog / count、read-only transaction、fresh before / afterをproduction query実行関数へ通します。exact empty migration tableの安定状態はexit 0、独立した第三sessionのDDL commitはdriftとしてexit 0を拒否します。期限はinitialise 30秒、process spawn 5秒、ready 20秒、test execution 60秒、normal stop 10秒、fault phase 1.5秒です。forced cleanupはprivate IPCの専用workerへ隔離し、親が開始時に作る単一monotonic absolute deadlineからprocess query／kill、listener、probe、utility、quarantine、filesystem cleanupへremaining budgetを渡して合計最大10秒に制限します。cancel不能operationが停止した場合は親がreserve内にexact cleanup-worker treeだけを終了し、deadline後の追加port probe、filesystem probe、kill、deleteを開始せずcleanup incompleteとします。harnessは親spawn時、descendantは認証済みspawn IPC受信時に親がOS側のPID、creation generation、canonical executable、parent PIDを独立取得してin-memory registryへ登録し、kill直前に完全再照合します。state file、role文字列、port、process名、stdout JSONだけからkill authorityを作りません。processとlistenerの消滅後、rootを同一temporary parent内のrandom quarantine名へatomic renameし、entry identityをoperation直前に再確認します。linkはtargetを辿らずentryだけを除去し、hardlink contentを書き換えず、identity不明または変化時は削除0でcleanup incompleteにします。
+PostgreSQL lifecycleは`.github/workflows/staging-database-preflight.yml`のUbuntu 24.04 service containerが所有します。workflowはdigest固定PostgreSQL 18.6、read-only repository permission、15分job timeout、credentialを永続化しないcheckout、Node 24、`npm ci --ignore-scripts`を固定し、verifier、TypeScript、full Vitest、full ESLintを順に実行します。repository verifierにはdatabase process API、port allocation、filesystem root、cleanup worker、watchdog、process query、PID / kill、OS utility、recursive delete、quarantine、reparse handling、IPC lifecycle ownership、native broker / Job ObjectのコードもDI seamもありません。
 
-fault testは`ready_hang`、`partial_start_throw`、`stop_hang`、`child_crash`ごとに、親がprivate IPCで受けたordered phaseと、親が直接観測したexit／close／exit code／signal／deadline発火／deadline時alive／実cleanup triggerを比較します。terminal reasonはchild自己申告ではなく親がcanonical生成します。wrong／zero exit、wrong signal、early close、phase前failure、phase後予定外正常終了、child terminal reason偽装をrejectし、任意の非0終了を指定fault成功とは扱いません。実cleanup workerへのport／lstat／readdir／unlink／rmdir／process query／utility hang injection、deadline後operation／final probe 0、junction／link／hardlink／root rename／ancestor change、modified state fileからkill 0、unrelated sentinel維持、default timerのclose／timeout／reject／abort後のpending timer 0とlistener解除を対象testで確認します。実Neon DB、provider transaction pooler、実staging owner / ACL、native cancellation、external connection成功有無の包括的証明、Production環境は引き続きNOT TESTED / NOT VERIFIEDであり、local PASSをそれらの成功へ拡張しません。
+P3 unit gateだけは固定sourceのbenign Node childを使います。parentが固定modeをprivate IPCで1回渡し、childのexact schema / occurrence / capability / sequence / phaseを検証した上で、parentが`exit`と`close`のevent count、code、signal、monotonic timestampを別々に記録し、error eventとauthenticated phase sequenceも保持します。exact nonzero code、exact signal、deadline時aliveだけをacceptedとし、wrong / zero exit、wrong signal、deadline前正常終了、phase前failure、phase後正常終了、terminal reason偽装、duplicate / malformed / replayed phaseをrejectします。result keyはexact allowlistであり、private bindingとPID情報を含めません。これはdatabase processのownership、termination、cleanupをテストするものではありません。
 
-`npm run test:db-postflight:local`は外部DB関連Environment Variablesを子processへ渡さず、loopbackだけにbindした使い捨てPostgreSQLを起動します。Migration 0000〜0006、別owner / runtime role、正常系、別DB不一致、schema drift、未知table / function / enum、PUBLIC EXECUTE、grant option、column ACL、sequence SELECT、default ACL想定外grantee、function default式drift、Migration hash不一致、read-only SQL instrumentation、stdout / stderr redaction、timeout cleanupを確認し、process、port、data directoryを削除します。
-
-- local separate-role connection：検証対象
+- external fixture separate-role connection：GitHub Actions実行前のためNOT RUN
 - staging専用provider resource：文書上は別工程で作成済み。今回のlocal product recoveryではprovider状態をNOT VERIFIED
 - 実staging DB：未接続・未検証。preflight / Migration / postflightは実行0回
 - real transaction pooler behavior：実provider endpoint未接続のためNOT TESTED
 - 実staging owner / ACL：実staging DB未接続のためNOT TESTED
 - Production：未接続・不変
 
-local harnessのPASSを、実provider poolerや実staging DBのPASSとして扱いません。
+local unit PASSまたはGitHub Actions disposable fixture PASSを、実provider poolerや実staging DBのPASSとして扱いません。workflow未実行時はexternal fixture検証をPASSと記録しません。
 
 ## 成功・停止・cleanup
 
@@ -268,4 +267,4 @@ terminal reportはJSON summaryとhuman summaryをmemory上で単一buffer化し�
 
 network evidenceの証明範囲はguardを明示的に導入したNode childだけです。報告項目は`guarded Node API unexpected violation`と`expected blocked DNS probe`の観測件数です。Windowsではcanonical `\\.\pipe\...`だけをlocal named pipeとして許可し、remote UNC、slash表記、extended UNC、`options.path`のremote形式をoriginal connect前にunexpected violationとして拒否します。POSIX local Unix domain socketはlocal IPCとして維持します。接続成功を観測する経路ではないため、`successful guarded Node API external connection`と`native child external connection`はどちらも`NOT VERIFIED`とします。expected probe IDは専用DNS probe childだけへ設定し、親profileへ設定しません。
 
-このlocal harnessの観測範囲はguardを明示的に導入したNode childだけです。Next.js、npm、Vitest、Corepackその他のprocessが`.env.local`を読み取らなかったことや、native childの外部接続がなかったことは証明しません。
+このnetwork-guard unit testの観測範囲はguardを明示的に導入したNode childだけです。Next.js、npm、Vitest、Corepackその他のprocessがsensitive environment fileを読み取らなかったことや、native childの外部接続がなかったことは証明しません。

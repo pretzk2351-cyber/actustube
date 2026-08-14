@@ -1,21 +1,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import {
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rename,
-  rmdir,
-  symlink,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   PREFLIGHT_EXTENSION_CLASSIFICATION_SQL_FOR_TESTS,
@@ -31,20 +20,11 @@ import {
 } from "../scripts/staging-database-postflight/core.mjs";
 import { assertReadOnlySql } from "../scripts/staging-database-postflight/safety.mjs";
 import {
-  allocatePostgresHarnessPort,
-  cancelableDelay,
-  createPostgresHarnessEnvironment,
-  evaluateHarnessTerminationIdentityForTests,
-  evaluateOwnershipRegistrationForTests,
-  evaluateParentObservedFaultForTests,
-  invokeTerminationOnlyForExactIdentityForTests,
-  runCleanupWorkerDeadlineProbeForTests,
-  runOwnedRootSafetyProbeForTests,
-  runOwnedRootRaceProbeForTests,
-  runOwnedPostgresHarness,
-  validateLexicalUtilityChainForTests,
-  validateWindowsUtilityAuthorityForTests,
-  waitForChildCloseWithTimeout,
+  externalFixtureSuccessResultForTests,
+  harnessAuthorityBoundaryForTests,
+  runBenignChildLifecycleProbeForTests,
+  runConnectionOnlyHarness,
+  validateExternalFixtureConfigurationForTests,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
 import {
   PARENT_ENVIRONMENT_NOTICE,
@@ -934,79 +914,33 @@ async function runCliChild(scenario: string) {
   });
 }
 
-let semanticPostgresResult: any;
-let semanticPostgresPromise: Promise<any> | undefined;
-
-async function getSemanticPostgresResult() {
-  semanticPostgresPromise ||= runOwnedPostgresHarness({ mode: "integration" });
-  semanticPostgresResult = await semanticPostgresPromise;
-  if (semanticPostgresResult.outcome !== "pass") {
-    throw new Error("OWNED_POSTGRES_INTEGRATION_FAILED");
-  }
-  expect(semanticPostgresResult).toMatchObject({
-    outcome: "pass",
-    cleanup: { attempted: true, result: "complete" },
-    residue: { process: 0, listener: 0, directory: 0 },
-    environmentIsolation: {
-      lifecycle: true,
-      cleanupChild: true,
-    },
-    lifecycle: {
-      normalStopAttempted: true,
-      normalStopSucceeded: true,
-      parentCleanupRequired: true,
-      processRemaining: false,
-      listenerRemaining: false,
-    },
-  });
-  return semanticPostgresResult;
-}
-
-async function semanticExtensionResult(managed: boolean, residual: boolean) {
-  const semantic = await getSemanticPostgresResult();
-  const entry = semantic.integration.extensionClassifications.find(
-    (candidate: any) =>
-      candidate.managed === managed && candidate.residual === residual
-  );
-  if (!entry) throw new Error("PREFLIGHT_EXTENSION_RESULT_MISSING");
-  return entry.result;
-}
-
-function testProcessAlive(pid: number | undefined) {
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function stopUnrelatedSentinel(child: ChildProcess) {
-  if (!child.pid || !testProcessAlive(child.pid)) return;
-  const closed = new Promise<void>((resolveClose) =>
-    child.once("close", () => resolveClose())
-  );
-  child.kill();
-  await Promise.race([
-    closed,
-    new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 5_000)),
-  ]);
-  if (child.pid && testProcessAlive(child.pid)) {
-    throw new Error("UNRELATED_SENTINEL_CLEANUP_FAILED");
-  }
-}
-
 const postgresHarnessModule = resolve(
   repositoryRoot,
   "scripts/test-staging-database-preflight-postgres.mjs"
 );
 
-async function runDirectHarnessInvocation(arguments_: string[]) {
+function externalFixtureEnvironment(
+  overrides: Partial<NodeJS.ProcessEnv> = {}
+): NodeJS.ProcessEnv {
+  return {
+    NODE_ENV: "test",
+    ACTUSTUBE_STAGING_HARNESS_DATABASE_URL:
+      "postgresql://actustube_ci_fixture:ci_fixture_only_not_a_secret@127.0.0.1:5432/actustube_ci_fixture",
+    ACTUSTUBE_STAGING_HARNESS_EXPECTED_DATABASE: "actustube_ci_fixture",
+    ACTUSTUBE_STAGING_HARNESS_EXPECTED_ROLE: "actustube_ci_fixture",
+    ACTUSTUBE_STAGING_HARNESS_EXPECTED_MAJOR: "18",
+    ACTUSTUBE_STAGING_HARNESS_EXPECTED_MIGRATION_MAX: "6",
+    ...overrides,
+  };
+}
+
+async function runDirectHarnessInvocation(
+  environment: Partial<NodeJS.ProcessEnv> = {}
+) {
   return await new Promise<{ code: number | null; stdout: string; stderr: string }>(
     (resolveChild, rejectChild) => {
-      const child = spawn(process.execPath, [postgresHarnessModule, ...arguments_], {
-        env: createSanitizedNodeChildEnvironment(),
+      const child = spawn(process.execPath, [postgresHarnessModule], {
+        env: { ...createSanitizedNodeChildEnvironment(), ...environment },
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
@@ -1032,615 +966,352 @@ async function runDirectHarnessInvocation(arguments_: string[]) {
   );
 }
 
-describe("harness root claim and direct invocation", () => {
-  it("rejects child CLI roots and arguments with zero file mutation", async () => {
-    const sentinel = await mkdtemp(join(tmpdir(), "actustube-direct-sentinel-"));
-    const marker = join(sentinel, "marker.txt");
-    await writeFile(marker, "unchanged", { encoding: "utf8", flag: "wx" });
-    const before = await readdir(sentinel);
-    try {
-      for (const arguments_ of [
-        ["--child"],
-        [`--root=${sentinel}`],
-        [`--root=${tmpdir()}`],
-        [`--root=${repositoryRoot}`],
-        ["--unknown"],
-        ["--ipc-child", "--ipc-child"],
-      ]) {
-        const result = await runDirectHarnessInvocation(arguments_);
-        expect(result).toEqual({
-          code: 70,
-          stdout: "",
-          stderr: "POSTGRES_HARNESS_IPC_REQUIRED\n",
-        });
-      }
-      expect(await readdir(sentinel)).toEqual(before);
-      expect(await readFile(marker, "utf8")).toBe("unchanged");
-    } finally {
-      await unlink(marker);
-      await rmdir(sentinel);
-    }
-  });
-
-  it.each(["wrong-token", "duplicate-init", "unknown-init-key"] as const)(
-    "rejects %s before worker startup",
-    async (protocolFault) => {
-      await expect(
-        runOwnedPostgresHarness({ mode: "ready_hang", protocolFault })
-      ).rejects.toThrow(/POSTGRES_HARNESS_IPC_/);
-    },
-    15_000
-  );
-
-  it.each(["root-exchange", "nested-link"] as const)(
-    "handles %s without following an unrelated sentinel",
-    async (kind) => {
-      await expect(runOwnedRootSafetyProbeForTests(kind)).resolves.toEqual({
-        rejected: kind === "root-exchange",
-        sentinelMaintained: true,
-        ownedRootRemaining: false,
-      });
-    }
-  );
-
-  it.each([
-    ["concurrent-junction-swap", true],
-    ["concurrent-symlink-swap", true],
-    ["hardlink-swap", true],
-    ["root-rename-race", true],
-    ["ancestor-identity-change", true],
-    ["predictable-temp-precreation", false],
-    ["normal-owned-tree", false],
-  ] as const)("applies the no-follow policy for %s", async (kind, rejected) => {
-    const result = await runOwnedRootRaceProbeForTests(kind);
-    expect(result).toMatchObject({
-      kind,
-      rejected,
-      outsideContent: "preserve",
-      deleteOutsideCount: 0,
-      ownedRootRemaining: false,
+describe("connection-only external fixture boundary", () => {
+  it("has no database lifecycle authority or lifecycle adapter seam", async () => {
+    expect(harnessAuthorityBoundaryForTests()).toEqual({
+      databaseProcessAuthority: 0,
+      databasePortAuthority: 0,
+      databaseFilesystemAuthority: 0,
+      databaseTerminationAuthority: 0,
+      databaseLifecycleAdapters: 0,
+      fixtureOwner: "github_actions_service_container",
+      connectionInputs: [
+        "ACTUSTUBE_STAGING_HARNESS_DATABASE_URL",
+        "ACTUSTUBE_STAGING_HARNESS_EXPECTED_DATABASE",
+        "ACTUSTUBE_STAGING_HARNESS_EXPECTED_ROLE",
+        "ACTUSTUBE_STAGING_HARNESS_EXPECTED_MAJOR",
+        "ACTUSTUBE_STAGING_HARNESS_EXPECTED_MIGRATION_MAX",
+      ],
     });
-  });
-});
 
-describe("trusted Windows utility and harness environment", () => {
-  it("ignores sentinel utility, PATH, and temporary-directory authorities", async () => {
-    const fakeRoot = await mkdtemp(join(tmpdir(), "actustube-fake-windows-"));
-    const fakeUtility = join(fakeRoot, "powershell.exe");
-    await writeFile(fakeUtility, "fake utility must not execute", {
-      encoding: "utf8",
-      flag: "wx",
-    });
-    try {
-      expect(() => validateWindowsUtilityAuthorityForTests(fakeRoot)).toThrow(
-        "POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE"
-      );
-      const ownedRoot = join(tmpdir(), "actustube-preflight-owned-contract");
-      const environment: any = createPostgresHarnessEnvironment(
-        {
-          NODE_ENV: "test",
-          SYSTEMROOT: fakeRoot,
-          WINDIR: fakeRoot,
-          PATH: fakeRoot,
-          TEMP: fakeRoot,
-          TMP: fakeRoot,
-          NODE_OPTIONS: "--require fake",
-          DATABASE_URL: "secret sentinel",
-        },
-        ownedRoot
-      );
-      expect(environment.SYSTEMROOT).not.toBe(fakeRoot);
-      expect(environment.WINDIR).not.toBe(fakeRoot);
-      expect(environment.PATH).not.toContain(fakeRoot);
-      expect(environment.TEMP).toBe(join(ownedRoot, "temporary"));
-      expect(environment.TMP).toBe(join(ownedRoot, "temporary"));
-      expect(Object.keys(environment)).not.toContain("NODE_OPTIONS");
-      expect(validateWindowsUtilityAuthorityForTests(undefined)).toEqual({
-        platform: "win32",
-        powershellBasename: "powershell.exe",
-        taskkillBasename: "taskkill.exe",
-      });
-    } finally {
-      await unlink(fakeUtility);
-      await rmdir(fakeRoot);
+    const source = await readFile(postgresHarnessModule, "utf8");
+    for (const forbidden of [
+      "embedded-postgres",
+      "EmbeddedPostgres",
+      "spawnSync",
+      "taskkill",
+      "powershell",
+      "postmaster.pid",
+      "process.kill",
+      "mkdtemp",
+      "tmpdir",
+      "createServer",
+      "node:fs",
+      "node:net",
+      "node:os",
+      "databaseDir",
+      "persistent: true",
+    ]) {
+      expect(source).not.toContain(forbidden);
     }
+    expect(source).toContain("github_actions_service_container");
+    expect(source).toContain("clientFactory");
+
+    const connectionFactory = vi.fn();
+    const processAdapter = vi.fn();
+    const filesystemAdapter = vi.fn();
+    await expect(
+      runConnectionOnlyHarness({
+        environment: externalFixtureEnvironment({
+          ACTUSTUBE_STAGING_HARNESS_DATABASE_URL:
+            "postgresql://actustube_ci_fixture:p@localhost:5432/actustube_ci_fixture",
+        }),
+        clientFactory: connectionFactory,
+        processAdapter,
+        filesystemAdapter,
+      } as any)
+    ).rejects.toThrow("EXTERNAL_FIXTURE_URL_INVALID");
+    expect(connectionFactory).not.toHaveBeenCalled();
+    expect(processAdapter).not.toHaveBeenCalled();
+    expect(filesystemAdapter).not.toHaveBeenCalled();
   });
 
-  it("rejects a lexical intermediate junction before utility execution", async () => {
-    const volumeRoot = await mkdtemp(join(tmpdir(), "actustube-utility-chain-"));
-    const windowsRoot = join(volumeRoot, "Windows");
-    const system32 = join(windowsRoot, "System32");
-    const windowsPowerShell = join(system32, "WindowsPowerShell");
-    const powershellDirectory = join(windowsPowerShell, "v1.0");
-    const powershell = join(powershellDirectory, "powershell.exe");
-    const replacement = join(volumeRoot, "replacement");
-    const preserved = `${windowsPowerShell}-preserved`;
-    await mkdir(powershellDirectory, { recursive: true });
-    await writeFile(powershell, "sentinel executable", { flag: "wx" });
-    await mkdir(replacement);
-    expect(
-      validateLexicalUtilityChainForTests({
-        volumeRoot,
-        windowsRoot,
-        system32,
-        windowsPowerShell,
-        powershellDirectory,
-        powershell,
-      })
-    ).toBe(powershell);
-    await rename(windowsPowerShell, preserved);
-    await symlink(replacement, windowsPowerShell, "junction");
-    try {
-      expect(() =>
-        validateLexicalUtilityChainForTests({
-          volumeRoot,
-          windowsRoot,
-          system32,
-          windowsPowerShell,
-          powershellDirectory,
-          powershell,
+  it.each(["postgres", "postgresql"])(
+    "accepts only the canonical %s numeric-loopback shape",
+    (protocol) => {
+      const credential = "ci_fixture_only_not_a_secret";
+      const result = validateExternalFixtureConfigurationForTests(
+        externalFixtureEnvironment({
+          ACTUSTUBE_STAGING_HARNESS_DATABASE_URL:
+            `${protocol}://actustube_ci_fixture:${credential}@127.0.0.1:5432/actustube_ci_fixture`,
         })
-      ).toThrow("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
-      expect(await readFile(join(preserved, "v1.0", "powershell.exe"), "utf8")).toBe(
-        "sentinel executable"
       );
-    } finally {
-      await rmdir(windowsPowerShell);
-      await rename(preserved, windowsPowerShell);
-      await unlink(powershell);
-      await rmdir(powershellDirectory);
-      await rmdir(windowsPowerShell);
-      await rmdir(system32);
-      await rmdir(windowsRoot);
-      await rmdir(replacement);
-      await rmdir(volumeRoot);
+      expect(result).toEqual({
+        valid: true,
+        numericLoopback: true,
+        explicitPort: true,
+        databaseIdentity: "match",
+        roleIdentity: "match",
+        postgresqlMajor: 18,
+        migrationMax: 6,
+      });
+      expect(JSON.stringify(result)).not.toContain(credential);
     }
+  );
+
+  it.each([
+    ["uppercase protocol", "Postgresql://actustube_ci_fixture:p@127.0.0.1:5432/actustube_ci_fixture"],
+    ["localhost", "postgresql://actustube_ci_fixture:p@localhost:5432/actustube_ci_fixture"],
+    ["DNS host", "postgresql://actustube_ci_fixture:p@db.example.test:5432/actustube_ci_fixture"],
+    ["IPv6", "postgresql://actustube_ci_fixture:p@[::1]:5432/actustube_ci_fixture"],
+    ["mapped IPv6", "postgresql://actustube_ci_fixture:p@[::ffff:127.0.0.1]:5432/actustube_ci_fixture"],
+    ["encoded host", "postgresql://actustube_ci_fixture:p@127%2e0%2e0%2e1:5432/actustube_ci_fixture"],
+    ["missing port", "postgresql://actustube_ci_fixture:p@127.0.0.1/actustube_ci_fixture"],
+    ["zero port", "postgresql://actustube_ci_fixture:p@127.0.0.1:0/actustube_ci_fixture"],
+    ["overflow port", "postgresql://actustube_ci_fixture:p@127.0.0.1:65536/actustube_ci_fixture"],
+    ["noncanonical port", "postgresql://actustube_ci_fixture:p@127.0.0.1:05432/actustube_ci_fixture"],
+    ["database mismatch", "postgresql://actustube_ci_fixture:p@127.0.0.1:5432/other_fixture"],
+    ["role mismatch", "postgresql://other_fixture:p@127.0.0.1:5432/actustube_ci_fixture"],
+    ["query", "postgresql://actustube_ci_fixture:p@127.0.0.1:5432/actustube_ci_fixture?sslmode=disable"],
+    ["fragment", "postgresql://actustube_ci_fixture:p@127.0.0.1:5432/actustube_ci_fixture#fragment"],
+    ["multi-host", "postgresql://actustube_ci_fixture:p@127.0.0.1:5432,127.0.0.1:5433/actustube_ci_fixture"],
+    ["whitespace", "postgresql://actustube_ci_fixture:p@127.0.0.1:5432/actustube_ci_fixture "],
+    ["control", "postgresql://actustube_ci_fixture:p@127.0.0.1:5432/actustube_ci_fixture\n"],
+    ["missing user", "postgresql://:p@127.0.0.1:5432/actustube_ci_fixture"],
+    ["missing password", "postgresql://actustube_ci_fixture@127.0.0.1:5432/actustube_ci_fixture"],
+    ["encoded user", "postgresql://actustube%5fci_fixture:p@127.0.0.1:5432/actustube_ci_fixture"],
+    ["encoded password", "postgresql://actustube_ci_fixture:p%21@127.0.0.1:5432/actustube_ci_fixture"],
+    ["encoded database", "postgresql://actustube_ci_fixture:p@127.0.0.1:5432/actustube%5fci_fixture"],
+  ])("rejects %s before the connection factory is called", async (_label, url) => {
+    const clientFactory = vi.fn();
+    await expect(
+      runConnectionOnlyHarness({
+        environment: externalFixtureEnvironment({
+          ACTUSTUBE_STAGING_HARNESS_DATABASE_URL: url,
+        }),
+        clientFactory,
+      })
+    ).rejects.toThrow(/EXTERNAL_FIXTURE_/);
+    expect(clientFactory).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["ACTUSTUBE_STAGING_HARNESS_EXPECTED_DATABASE", "other_fixture"],
+    ["ACTUSTUBE_STAGING_HARNESS_EXPECTED_ROLE", "other_fixture"],
+    ["ACTUSTUBE_STAGING_HARNESS_EXPECTED_MAJOR", "17"],
+    ["ACTUSTUBE_STAGING_HARNESS_EXPECTED_MIGRATION_MAX", "7"],
+    ["ACTUSTUBE_STAGING_HARNESS_UNEXPECTED", "1"],
+  ])("rejects a mismatched %s before any connection", async (key, value) => {
+    const clientFactory = vi.fn();
+    await expect(
+      runConnectionOnlyHarness({
+        environment: externalFixtureEnvironment({ [key]: value }),
+        clientFactory,
+      })
+    ).rejects.toThrow(/EXTERNAL_FIXTURE_/);
+    expect(clientFactory).not.toHaveBeenCalled();
+  });
+
+  it("emits the fixed missing-fixture marker and never attempts a connection", async () => {
+    const clientFactory = vi.fn();
+    await expect(
+      runConnectionOnlyHarness({
+        environment: {
+          NODE_ENV: "test",
+          DATABASE_URL:
+            "postgresql://generic:ignored@127.0.0.1:5432/generic",
+        },
+        clientFactory,
+      })
+    ).rejects.toThrow("EXTERNAL_FIXTURE_NOT_CONFIGURED");
+    expect(clientFactory).not.toHaveBeenCalled();
+
+    await expect(
+      runDirectHarnessInvocation({
+        DATABASE_URL:
+          "postgresql://generic:ignored@127.0.0.1:5432/generic",
+      })
+    ).resolves.toEqual({
+      code: 1,
+      stdout: "",
+      stderr: "EXTERNAL_FIXTURE_NOT_CONFIGURED\n",
+    });
+  });
+
+  it("keeps credentials and target identity out of all validation output", async () => {
+    const environment = externalFixtureEnvironment();
+    const publicResult =
+      validateExternalFixtureConfigurationForTests(environment);
+    const serialized = JSON.stringify(publicResult);
+    for (const forbidden of [
+      environment.ACTUSTUBE_STAGING_HARNESS_DATABASE_URL,
+      "ci_fixture_only_not_a_secret",
+      "actustube_ci_fixture",
+      "127.0.0.1",
+      "5432",
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+
+    const success = externalFixtureSuccessResultForTests();
+    expect(Object.keys(success).sort()).toEqual(
+      [
+        "extensionClassification",
+        "fixtureConfigured",
+        "lifecycleOwner",
+        "migrationCount",
+        "migrationOrderAndReplay",
+        "outputRedaction",
+        "postflight",
+        "postflightDriftRejected",
+        "postgresqlMajor",
+        "snapshotDriftRejected",
+        "stablePreflight",
+        "success",
+        "transactionRollback",
+        "verifierQueriesReadOnly",
+      ].sort()
+    );
+    const successSerialized = JSON.stringify(success);
+    expect(successSerialized).not.toContain("ci_fixture_only_not_a_secret");
+    expect(successSerialized).not.toContain("actustube_ci_fixture");
+    expect(successSerialized).not.toContain("127.0.0.1");
+
+    const credential = "credential_must_not_be_reported";
+    const cli = await runDirectHarnessInvocation(
+      externalFixtureEnvironment({
+        ACTUSTUBE_STAGING_HARNESS_DATABASE_URL:
+          `postgresql://actustube_ci_fixture:${credential}@localhost:5432/actustube_ci_fixture`,
+      })
+    );
+    expect(cli).toEqual({
+      code: 1,
+      stdout: "",
+      stderr: "EXTERNAL_FIXTURE_VERIFICATION_FAILED\n",
+    });
+    expect(JSON.stringify(cli)).not.toContain(credential);
   });
 });
 
-describe("fault oracle negative controls", () => {
-  const expectations = {
-    ready_hang: {
-      phases: ["created", "start_spawned", "ready_pending"],
-      terminalReason: "FORCED_CLEANUP_READY_HANG",
-      kind: "deadline",
-      exitCode: null,
-    },
-    partial_start_throw: {
-      phases: ["created", "start_spawned", "partial_start_failure"],
-      terminalReason: "CHILD_EXIT_PARTIAL_START_THROW",
-      kind: "exit",
-      exitCode: 70,
-    },
-    stop_hang: {
-      phases: ["created", "start_spawned", "ready", "stopping"],
-      terminalReason: "FORCED_CLEANUP_STOP_HANG",
-      kind: "deadline",
-      exitCode: null,
-    },
-    child_crash: {
-      phases: ["created", "start_spawned", "child_crash"],
-      terminalReason: "CHILD_EXIT_CRASH",
-      kind: "exit",
-      exitCode: 72,
-    },
-  } as const;
-
-  it.each(Object.entries(expectations))(
-    "accepts only the canonical %s phase and reason",
-    async (mode, contract: any) => {
-      const result: any = await runOwnedPostgresHarness({ mode });
-      expect(result).toMatchObject({
-        schemaVersion: 3,
-        occurrenceId: expect.stringMatching(/^[0-9a-f-]{36}$/),
-        mode,
-        phaseSequence: contract.phases,
-        intendedFaultReached: true,
-        terminalReason: contract.terminalReason,
-        parentObservation:
-          contract.kind === "deadline"
-            ? {
-                deadlineFired: true,
-                aliveAtDeadline: true,
-                closedBeforeDeadline: false,
-                cleanupTrigger: "deadline",
-                exitCode: null,
-                signal: null,
-              }
-            : {
-                deadlineFired: false,
-                aliveAtDeadline: false,
-                closedBeforeDeadline: true,
-                cleanupTrigger: "exit",
-                exitCode: contract.exitCode,
-                signal: null,
-              },
-        environmentIsolation: {
-          sourceSeparated: true,
-          cleanupProbe: true,
-          temporaryRootOwned: true,
-        },
-        cleanup: {
-          attempted: true,
-          result: "complete",
-          terminatedCount: expect.any(Number),
-        },
-        residue: { process: 0, listener: 0, directory: 0 },
-      });
-    },
-    30_000
-  );
-
-  it.each(Object.keys(expectations))(
-    "rejects an early unrelated failure for %s",
-    async (mode) => {
-      await expect(
-        runOwnedPostgresHarness({ mode, faultControl: "early-failure" })
-      ).rejects.toThrow("POSTGRES_HARNESS_FAULT_ORACLE_REJECTED");
-    },
-    20_000
-  );
-
-  it.each(Object.entries(expectations))(
-    "derives %s only from the parent observation",
-    (mode, contract: any) => {
-      const canonical: any = {
-        mode,
-        phases: [...contract.phases],
-        protocolAuthenticated: true,
-        deadlineFired: contract.kind === "deadline",
-        aliveAtDeadline: contract.kind === "deadline",
-        closedBeforeDeadline: contract.kind !== "deadline",
-        cleanupTrigger: contract.kind,
-        close:
-          contract.kind === "exit"
-            ? { code: contract.exitCode, signal: null }
-            : undefined,
-        childTerminalReason: "SPOOFED_BY_CHILD",
-      };
-      expect(evaluateParentObservedFaultForTests(canonical)).toEqual({
-        accepted: true,
-        terminalReason: contract.terminalReason,
-      });
-      const rejected = [
-        { ...canonical, phases: contract.phases.slice(0, -1) },
-        { ...canonical, cleanupTrigger: "close" },
-        { ...canonical, close: { code: 0, signal: null } },
-        { ...canonical, close: { code: 73, signal: null } },
-        { ...canonical, close: { code: contract.exitCode, signal: "SIGTERM" } },
-        {
-          ...canonical,
-          deadlineFired: false,
-          aliveAtDeadline: false,
-          closedBeforeDeadline: true,
-          cleanupTrigger: "exit",
-          close: { code: 0, signal: null },
-        },
-      ];
-      for (const observation of rejected) {
-        expect(evaluateParentObservedFaultForTests(observation)).toEqual({
-          accepted: false,
-        });
-      }
-    }
-  );
-});
-
-describe("global cleanup deadline and cancelable timer", () => {
+describe("benign child parent-observed P3 oracle", () => {
   it.each([
-    "port",
-    "lstat",
-    "readdir",
-    "unlink",
-    "rmdir",
-    "process-query",
-    "utility",
-  ] as const)("hard-bounds a hanging %s cleanup operation", async (stage) => {
-    const result = await runCleanupWorkerDeadlineProbeForTests(stage);
-    expect(result).toMatchObject({
-      errorCode: "POSTGRES_HARNESS_FORCED_CLEANUP_TIMEOUT",
-      postDeadlineOperationStarts: 0,
-      finalProbeCount: 0,
-      workerListenerResidue: 0,
-      cleanupResult: "incomplete",
-      testFixtureRecovery: "complete",
+    ["correct-nonzero", true, 70, null, ["created", "running", "terminal"]],
+    ["correct-signal", true, null, "SIGTERM", ["created", "signal_ready"]],
+    ["deadline", true, null, "SIGTERM", ["created", "deadline_pending"]],
+    ["wrong-nonzero", false, 71, null, ["created", "running", "terminal"]],
+    ["exit-zero", false, 0, null, ["created", "running", "terminal"]],
+    ["wrong-signal", false, null, "SIGKILL", ["created", "signal_ready"]],
+    ["normal-before-deadline", false, 0, null, ["created", "deadline_pending"]],
+    ["pre-phase-failure", false, 73, null, []],
+    ["unexpected-normal-after-phase", false, 0, null, ["created", "running"]],
+    ["forged-terminal-reason", false, 71, null, ["created", "running"]],
+    ["duplicate-phase", false, 70, null, ["created"]],
+    ["malformed-phase", false, 70, null, ["created"]],
+    ["replayed-phase", false, 70, null, ["created", "running"]],
+  ] as const)("classifies the actual %s child from parent events", async (
+    mode,
+    accepted,
+    expectedCode,
+    expectedSignal,
+    expectedPhases
+  ) => {
+    const result = await runBenignChildLifecycleProbeForTests(mode);
+    expect(result.accepted).toBe(accepted);
+    expect(result.authenticatedPhases).toEqual(expectedPhases);
+    expect(result.exitObservation).toMatchObject({
+      count: 1,
+      code: expectedCode,
+      signal: expectedSignal,
+      timestampMilliseconds: expect.any(Number),
     });
-    expect(result.operationStarts).toContain(stage);
-    expect(result.elapsedMilliseconds).toBeLessThan(2_750);
+    expect(result.closeObservation).toMatchObject({
+      count: 1,
+      code: expectedCode,
+      signal: expectedSignal,
+      timestampMilliseconds: expect.any(Number),
+    });
+    expect(result.closeObservation.timestampMilliseconds).toBeGreaterThanOrEqual(
+      result.exitObservation.timestampMilliseconds
+    );
+    expect(result.errorObservation).toEqual({
+      count: 0,
+      timestampMilliseconds: null,
+    });
+    expect(Object.keys(result).sort()).toEqual(
+      [
+        "accepted",
+        "authenticatedPhases",
+        "closeObservation",
+        "deadlineAlive",
+        "errorObservation",
+        "exitObservation",
+        "messageContract",
+        "mode",
+        "phaseContract",
+        "schemaVersion",
+        "terminalContract",
+      ].sort()
+    );
+    for (const key of ["exitObservation", "closeObservation"] as const) {
+      expect(Object.keys(result[key]).sort()).toEqual(
+        ["code", "count", "signal", "timestampMilliseconds"].sort()
+      );
+    }
+    expect(Object.keys(result.errorObservation).sort()).toEqual(
+      ["count", "timestampMilliseconds"].sort()
+    );
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toMatch(/pid|ppid|capabilityToken|occurrenceId/i);
   }, 10_000);
 
-  it.each([
-    ["close", Promise.resolve({ closed: true })],
-    ["timeout", new Promise(() => undefined)],
-  ] as const)("cancels its timer after %s wins", async (_label, closePromise) => {
-    const cancel = vi.fn();
-    const timeoutPromise =
-      _label === "timeout"
-        ? Promise.resolve({ timedOut: true })
-        : new Promise(() => undefined);
-    await waitForChildCloseWithTimeout(closePromise, 1, () => ({
-      promise: timeoutPromise,
-      cancel,
-    }));
-    expect(cancel).toHaveBeenCalledOnce();
-  });
-
-  it("clears the real default timer after close, timeout, rejection, and abort", async () => {
-    vi.useFakeTimers();
-    try {
-      await expect(
-        waitForChildCloseWithTimeout(Promise.resolve({ closed: true }), 100)
-      ).resolves.toEqual({ closed: true });
-      expect(vi.getTimerCount()).toBe(0);
-
-      const timeoutResult = waitForChildCloseWithTimeout(
-        new Promise(() => undefined),
-        100
-      );
-      await vi.advanceTimersByTimeAsync(100);
-      await expect(timeoutResult).resolves.toEqual({ timedOut: true });
-      expect(vi.getTimerCount()).toBe(0);
-
-      await expect(
-        waitForChildCloseWithTimeout(Promise.reject(new Error("expected")), 100)
-      ).rejects.toThrow("expected");
-      expect(vi.getTimerCount()).toBe(0);
-
-      const controller = new AbortController();
-      const add = vi.spyOn(controller.signal, "addEventListener");
-      const remove = vi.spyOn(controller.signal, "removeEventListener");
-      const aborted = waitForChildCloseWithTimeout(
-        new Promise(() => undefined),
-        100,
-        cancelableDelay,
-        controller.signal
-      );
-      controller.abort();
-      await expect(aborted).rejects.toThrow("POSTGRES_HARNESS_WAIT_ABORTED");
-      expect(add).toHaveBeenCalledOnce();
-      expect(remove).toHaveBeenCalledOnce();
-      expect(vi.getTimerCount()).toBe(0);
-
-      const onFire = vi.fn();
-      const delay = cancelableDelay(50, "done", onFire);
-      const completion = delay.promise;
-      await vi.advanceTimersByTimeAsync(50);
-      await expect(completion).resolves.toBe("done");
-      delay.cancel();
-      expect(onFire).toHaveBeenCalledOnce();
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-});
-
-describe("PID generation and unrelated sentinel", () => {
-  const expected = {
-    pid: 4242,
-    parentPid: 2121,
-    creationIdentity: "638000000000000000",
-    executablePath: "C:\\Program Files\\nodejs\\node.exe",
-  };
-  const childState = {
-    pid: 4242,
-    exitCode: null,
-    signalCode: null,
-    closed: false,
-  };
-  const base = {
-    childState,
-    expected,
-    observed: expected,
-    occurrenceId: "occurrence",
-    ipcOccurrenceId: "occurrence",
-  };
-
-  it("allows only the original spawn generation", () => {
-    expect(evaluateHarnessTerminationIdentityForTests(base)).toBe(true);
-    for (const observed of [
-      { ...expected, creationIdentity: "638000000000000001" },
-      { ...expected, executablePath: "C:\\Windows\\System32\\cmd.exe" },
-      { ...expected, parentPid: 3131 },
-    ]) {
-      const terminate = vi.fn();
-      expect(
-        invokeTerminationOnlyForExactIdentityForTests(
-          { ...base, observed },
-          terminate
-        )
-      ).toBe(false);
-      expect(terminate).not.toHaveBeenCalled();
-    }
-    expect(
-      evaluateHarnessTerminationIdentityForTests({
-        ...base,
-        childState: { ...childState, closed: true },
-      })
-    ).toBe(false);
-  });
-
-  it("does not terminate an unrelated live sentinel on PID-reuse rejection", async () => {
-    const sentinel = spawn(
-      process.execPath,
-      ["--input-type=module", "-e", "setInterval(()=>{},1000)"],
-      { stdio: "ignore", windowsHide: true }
-    );
-    try {
-      const terminate = vi.fn(() => sentinel.kill());
-      expect(
-        invokeTerminationOnlyForExactIdentityForTests(
-          {
-            ...base,
-            observed: { ...expected, creationIdentity: "reused" },
-          },
-          terminate
-        )
-      ).toBe(false);
-      expect(terminate).not.toHaveBeenCalled();
-      expect(testProcessAlive(sentinel.pid)).toBe(true);
-    } finally {
-      await stopUnrelatedSentinel(sentinel);
-    }
-  });
-
-  it("never creates kill authority from a modified state file", async () => {
-    const sentinel = spawn(
-      process.execPath,
-      ["--input-type=module", "-e", "setInterval(()=>{},1000)"],
-      { stdio: "ignore", windowsHide: true }
-    );
-    const stateRoot = await mkdtemp(join(tmpdir(), "actustube-state-authority-"));
-    const statePath = join(stateRoot, "lifecycle-state.json");
-    const ipcCapabilitySha256 = "a".repeat(64);
-    const ownership = {
-      occurrenceId: "owned-occurrence",
-      parentPid: 2121,
-      harnessPid: 4242,
-      ipcCapabilitySha256,
-    };
-    try {
-      await writeFile(
-        statePath,
-        JSON.stringify({ pid: sentinel.pid, role: "fault-worker" }),
-        { flag: "wx" }
-      );
-      const modifiedState = JSON.parse(await readFile(statePath, "utf8"));
-      const baseEntry = {
-        pid: modifiedState.pid,
-        parentPid: ownership.harnessPid,
-        creationIdentity: "638000000000000000",
-        executablePath: "C:\\Program Files\\nodejs\\node.exe",
-        role: "fault-worker",
-        occurrenceId: ownership.occurrenceId,
-        ipcCapabilitySha256,
-      };
-      expect(
-        evaluateOwnershipRegistrationForTests(
-          { ...baseEntry, authority: "state-file" },
-          ownership
-        )
-      ).toBe(false);
-      expect(
-        evaluateOwnershipRegistrationForTests(
-          { ...baseEntry, authority: "unauthenticated" },
-          ownership
-        )
-      ).toBe(false);
-      expect(
-        evaluateOwnershipRegistrationForTests(
-          { ...baseEntry, authority: "authenticated-ipc", occurrenceId: "wrong" },
-          ownership
-        )
-      ).toBe(false);
-      expect(
-        evaluateOwnershipRegistrationForTests(
-          {
-            ...baseEntry,
-            authority: "authenticated-ipc",
-            ipcCapabilitySha256: "b".repeat(64),
-          },
-          ownership
-        )
-      ).toBe(false);
-      expect(
-        evaluateOwnershipRegistrationForTests(
-          { ...baseEntry, authority: "authenticated-ipc", parentPid: 3131 },
-          ownership
-        )
-      ).toBe(false);
-      expect(
-        evaluateOwnershipRegistrationForTests(
-          { ...baseEntry, authority: "authenticated-ipc" },
-          ownership
-        )
-      ).toBe(true);
-      expect(testProcessAlive(sentinel.pid)).toBe(true);
-    } finally {
-      await unlink(statePath);
-      await rmdir(stateRoot);
-      await stopUnrelatedSentinel(sentinel);
-    }
-  });
-});
-
-describe("PostgreSQL 18 production preflight integration", () => {
-  beforeAll(async () => {
-    await getSemanticPostgresResult();
-  }, 150_000);
-
-  it.each([
-    "DATABASE_URL",
-    "DIRECT_DATABASE_URL",
-    "PGHOST",
-    "PGPORT",
-    "PGUSER",
-    "PGPASSWORD",
-    "PGDATABASE",
-    "PGSERVICE",
-    "PGSERVICEFILE",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "NODE_OPTIONS",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "NPM_TOKEN",
-    "SERVICE_PASSWORD",
-    "CLIENT_SECRET",
-    "AUTHORIZATION",
-  ])("excludes %s from the actual lifecycle child environment", (key) => {
-    const environment = createPostgresHarnessEnvironment({
-      ...process.env,
-      [key]: "parent-sensitive-sentinel",
+  it("requires the deadline child to be alive at the parent deadline", async () => {
+    const result = await runBenignChildLifecycleProbeForTests("deadline", {
+      deadlineMilliseconds: 100,
     });
-    expect(
-      Object.keys(environment).some(
-        (candidate) => candidate.toUpperCase() === key.toUpperCase()
-      )
-    ).toBe(false);
-    expect(semanticPostgresResult.environmentIsolation).toEqual({
-      lifecycle: true,
-      cleanupChild: true,
-    });
-  });
-
-  it("runs the production identity and catalog queries in two fresh read-only snapshots", () => {
-    const stable = semanticPostgresResult.integration.stable;
-    expect(stable.versionNumber).toBe("180004");
-    expect(Math.trunc(Number(stable.versionNumber) / 10_000)).toBe(18);
-    expect(stable.report).toMatchObject({
-      exitCode: 0,
-      overallStatus: "pass",
-      initialState: "empty_migration_table",
-      connectionAuthority: "match",
-      directPooledIdentity: "match",
-      databaseRoleIdentity: "match",
-      extensionInventory: "match",
-      migrationCatalog: "pass",
-      readOnlyInvariant: "pass",
-      beforeAfterComparison: "match",
-      cleanup: "pass",
-    });
-    for (const count of Object.values(stable.queryCounts)) expect(count).toBe(4);
-    expect(stable.beginCount).toBe(4);
-    expect(stable.rollbackCount).toBe(4);
-  });
-
-  it("detects committed third-session drift in the fresh after snapshots", () => {
-    const drift = semanticPostgresResult.integration.drift;
-    expect(drift.versionNumber).toBe("180004");
-    expect(Math.trunc(Number(drift.versionNumber) / 10_000)).toBe(18);
-    expect(drift).toMatchObject({
-      thirdSessionWrites: 1,
-      exitCode: 1,
-      overallStatus: "fail",
-      beforeAfterComparison: "fail",
-      failure: {
-        checkId: "READ_ONLY_INVARIANT_MISMATCH",
-        status: "fail",
+    expect(result).toMatchObject({
+      accepted: true,
+      messageContract: true,
+      phaseContract: true,
+      terminalContract: true,
+      deadlineAlive: true,
+      authenticatedPhases: ["created", "deadline_pending"],
+      exitObservation: {
+        count: 1,
+        code: null,
+        signal: "SIGTERM",
+        timestampMilliseconds: expect.any(Number),
       },
-      cleanup: "pass",
+      closeObservation: {
+        count: 1,
+        code: null,
+        signal: "SIGTERM",
+        timestampMilliseconds: expect.any(Number),
+      },
+    });
+  });
+
+  it("accepts the exact nonzero code and exact signal only", async () => {
+    const nonzero = await runBenignChildLifecycleProbeForTests("correct-nonzero");
+    expect(nonzero).toMatchObject({
+      accepted: true,
+      exitObservation: {
+        count: 1,
+        code: 70,
+        signal: null,
+        timestampMilliseconds: expect.any(Number),
+      },
+      closeObservation: {
+        count: 1,
+        code: 70,
+        signal: null,
+        timestampMilliseconds: expect.any(Number),
+      },
+    });
+    const signaled = await runBenignChildLifecycleProbeForTests("correct-signal");
+    expect(signaled).toMatchObject({
+      accepted: true,
+      exitObservation: {
+        count: 1,
+        code: null,
+        signal: "SIGTERM",
+        timestampMilliseconds: expect.any(Number),
+      },
+      closeObservation: {
+        count: 1,
+        code: null,
+        signal: "SIGTERM",
+        timestampMilliseconds: expect.any(Number),
+      },
     });
   });
 });
@@ -1844,20 +1515,6 @@ describe("staging extension inventory", () => {
 });
 
 describe("staging database preflight safety gate", () => {
-  it("allocates and releases a numeric IPv4 port without DNS", async () => {
-    const dns = process.getBuiltinModule("dns");
-    if (!dns) throw new Error("PREFLIGHT_SEMANTIC_DNS_MODULE_UNAVAILABLE");
-    const lookup = vi.spyOn(dns, "lookup");
-    try {
-      const port = await allocatePostgresHarnessPort();
-      expect(port).toBeGreaterThan(0);
-      expect(port).toBeLessThanOrEqual(65535);
-      expect(lookup).not.toHaveBeenCalled();
-    } finally {
-      lookup.mockRestore();
-    }
-  });
-
   it("passes a pristine database without a migration schema", async () => {
     const fixture = createAdapter();
     const report = await runPreflight(fixture);
@@ -2367,42 +2024,16 @@ describe("empty migration and application state", () => {
     expect(report.exitCode).toBe(0);
   });
 
-  it("keeps every dependency evidence row in the actual production classification SQL", async () => {
+  it("binds the external fixture gate to the production classification SQL", async () => {
     expect(PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects).toContain(
       PREFLIGHT_EXTENSION_CLASSIFICATION_SQL_FOR_TESTS
     );
-    const result = await semanticExtensionResult(false, false);
-    expect(result).toMatchObject({
-      evidence_count: 1,
-      complete_dependency_count: 1,
-    });
-  });
-
-  it("marks dependency evidence outside both managed and residual sets as unclassified", async () => {
-    const result = await semanticExtensionResult(false, false);
-    expect(result).toMatchObject({
-      classification_count: 0,
-      unclassified_count: 1,
-      ambiguous_count: 0,
-    });
-  });
-
-  it("accepts dependency evidence with exactly one SQL classification", async () => {
-    const result = await semanticExtensionResult(true, false);
-    expect(result).toMatchObject({
-      classification_count: 1,
-      unclassified_count: 0,
-      ambiguous_count: 0,
-    });
-  });
-
-  it("marks dependency evidence in both managed and residual sets as ambiguous", async () => {
-    const result = await semanticExtensionResult(true, true);
-    expect(result).toMatchObject({
-      classification_count: 2,
-      unclassified_count: 0,
-      ambiguous_count: 1,
-    });
+    const source = await readFile(postgresHarnessModule, "utf8");
+    expect(source).toContain("PREFLIGHT_EXTENSION_CLASSIFICATION_SQL_FOR_TESTS");
+    expect(source).toContain("unclassified_count");
+    expect(source).toContain("ambiguous_count");
+    expect(source).toContain("classification_count");
+    expect(source).toContain("complete_dependency_count");
   });
 
   it.each([

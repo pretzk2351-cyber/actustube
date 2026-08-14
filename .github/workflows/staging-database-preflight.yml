@@ -1,0 +1,74 @@
+name: Staging database preflight fixture
+
+on:
+  push:
+    branches:
+      - fix/staging-db-preflight-20260730
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  external-postgresql-fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        # Disposable CI fixture only. These values are not staging or Production credentials.
+        image: postgres:18.6-bookworm@sha256:7d2695c3aa88e792e8b3b233e7e4adb296a20412c6c0ca361e3edaaacfada108
+        env:
+          POSTGRES_DB: actustube_ci_fixture
+          POSTGRES_USER: actustube_ci_fixture
+          POSTGRES_PASSWORD: ci_fixture_only_not_a_secret
+        ports:
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U actustube_ci_fixture -d actustube_ci_fixture"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: package.json
+          package-manager-cache: false
+          check-latest: false
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Check connection-only verifier syntax
+        run: node --check scripts/test-staging-database-preflight-postgres.mjs
+
+      - name: Verify connection boundary and URL rejection
+        run: npm test -- tests/staging-database-preflight.test.ts -t "connection-only external fixture boundary"
+
+      - name: Verify parent-observed benign child oracle
+        run: npm test -- tests/staging-database-preflight.test.ts -t "benign child parent-observed P3 oracle"
+
+      - name: Run external disposable PostgreSQL verifier
+        env:
+          ACTUSTUBE_STAGING_HARNESS_DATABASE_URL: postgresql://actustube_ci_fixture:ci_fixture_only_not_a_secret@127.0.0.1:${{ job.services.postgres.ports[5432] }}/actustube_ci_fixture
+          ACTUSTUBE_STAGING_HARNESS_EXPECTED_DATABASE: actustube_ci_fixture
+          ACTUSTUBE_STAGING_HARNESS_EXPECTED_ROLE: actustube_ci_fixture
+          ACTUSTUBE_STAGING_HARNESS_EXPECTED_MAJOR: "18"
+          ACTUSTUBE_STAGING_HARNESS_EXPECTED_MIGRATION_MAX: "6"
+        run: node scripts/test-staging-database-preflight-postgres.mjs
+
+      - name: Type-check
+        run: npm run typecheck -- --pretty false
+
+      - name: Run full Vitest suite
+        run: npm test
+
+      - name: Run full ESLint suite
+        run: npm run lint -- --no-cache
