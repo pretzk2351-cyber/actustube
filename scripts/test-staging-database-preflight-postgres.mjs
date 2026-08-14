@@ -1,11 +1,9 @@
-import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { migrate } from "drizzle-orm/node-postgres/migrator";
 import pgPackage from "pg";
 
 import {
@@ -39,8 +37,45 @@ const EXPECTED_MIGRATION_MAX = 6;
 const EXPECTED_MIGRATION_COUNT = EXPECTED_MIGRATION_MAX + 1;
 const RUNTIME_ROLE = "actustube_ci_fixture_runtime";
 const RUNTIME_PASSWORD = "ci_runtime_only_not_a_secret";
-const BENIGN_CHILD_SCHEMA_VERSION = 1;
-const BENIGN_CHILD_TIMEOUT_MS = 2_000;
+const USAGE_FIXTURE_ROLES = Object.freeze({
+  explicitRuntime: "actustube_ci_usage_explicit",
+  runtimeGroup: "actustube_ci_usage_group",
+  membershipRuntime: "actustube_ci_usage_member",
+  deniedRuntime: "actustube_ci_usage_denied",
+  publicProbe: "actustube_ci_usage_public_probe",
+});
+const LEGACY_USAGE_SIGNATURE =
+  "public.reserve_usage_limits(uuid,integer,public.usage_metric,timestamp with time zone)";
+const VERSIONED_USAGE_SIGNATURES = Object.freeze([
+  "public.usage_period_boundaries_v1(timestamp with time zone)",
+  "public.resolve_effective_usage_plan_v1(uuid,timestamp with time zone)",
+  "public.reserve_usage_limits_v2(uuid,integer,public.usage_metric,timestamp with time zone)",
+  "public.get_usage_status_v1(uuid,integer,timestamp with time zone)",
+]);
+const FIXTURE_EXTENSION_CONTRACT = Object.freeze([
+  Object.freeze({ name: "plpgsql", schema: "pg_catalog", version: "1.0" }),
+]);
+const INDEPENDENT_EXTENSION_INVENTORY_SQL = `
+  SELECT
+    extension.extname AS name,
+    namespace.nspname AS schema,
+    extension.extversion AS version
+  FROM pg_catalog.pg_extension AS extension
+  INNER JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = extension.extnamespace
+  ORDER BY extension.extname, namespace.nspname, extension.extversion
+`;
+const HARNESS_DEADLINE_LIMITS = Object.freeze({
+  totalMilliseconds: 300_000,
+  connectMilliseconds: 10_000,
+  queryMilliseconds: 30_000,
+  statementMilliseconds: 20_000,
+  lockMilliseconds: 5_000,
+  idleTransactionMilliseconds: 20_000,
+  closeMilliseconds: 5_000,
+  phaseMilliseconds: 120_000,
+  migrationMilliseconds: 180_000,
+});
 
 class HarnessIssue extends Error {
   constructor(code) {
@@ -159,7 +194,202 @@ export function validateExternalFixtureConfigurationForTests(environment) {
   });
 }
 
-function createPgClientFactory() {
+function normalizeDeadlineLimits(overrides = {}) {
+  const limits = {};
+  for (const [key, maximum] of Object.entries(HARNESS_DEADLINE_LIMITS)) {
+    const value = overrides[key] ?? maximum;
+    requireHarness(
+      Number.isSafeInteger(value) && value >= 1 && value <= maximum,
+      "EXTERNAL_FIXTURE_DEADLINE_CONFIGURATION_INVALID"
+    );
+    limits[key] = value;
+  }
+  return Object.freeze(limits);
+}
+
+function createDeadlineContext(overrides) {
+  const limits = normalizeDeadlineLimits(overrides);
+  const startedAt = performance.now();
+  return {
+    limits,
+    absoluteDeadline: startedAt + limits.totalMilliseconds,
+    timedOut: false,
+    activeClients: new Set(),
+    ownedClients: new Set(),
+    operationStarts: {
+      connect: 0,
+      query: 0,
+      close: 0,
+      phase: 0,
+      migration: 0,
+    },
+  };
+}
+
+function remainingTotalMilliseconds(context) {
+  return Math.floor(context.absoluteDeadline - performance.now());
+}
+
+function destroyOwnedClient(ownedClient) {
+  if (ownedClient.destroyed) return false;
+  ownedClient.destroyed = true;
+  ownedClient.usable = false;
+  const stream = ownedClient.rawClient?.connection?.stream;
+  requireHarness(
+    stream && typeof stream.destroy === "function",
+    "EXTERNAL_FIXTURE_OWNED_CONNECTION_DESTROY_UNAVAILABLE"
+  );
+  ownedClient.destroyCount += 1;
+  try {
+    stream.destroy();
+  } catch {
+    // The owned socket is already marked unusable. Public output remains fixed.
+  }
+  return true;
+}
+
+function destroyActiveOwnedClients(context) {
+  for (const ownedClient of [...context.activeClients]) {
+    destroyOwnedClient(ownedClient);
+  }
+  context.activeClients.clear();
+}
+
+async function runBoundedOperation(
+  context,
+  { category, maximumMilliseconds, ownedClient = null },
+  operation
+) {
+  const remaining = remainingTotalMilliseconds(context);
+  if (context.timedOut || remaining <= 0 || ownedClient?.destroyed) {
+    context.timedOut = true;
+    destroyActiveOwnedClients(context);
+    throw new HarnessIssue("EXTERNAL_FIXTURE_OPERATION_TIMEOUT");
+  }
+  const timeoutMilliseconds = Math.max(
+    1,
+    Math.min(maximumMilliseconds, remaining)
+  );
+  context.operationStarts[category] += 1;
+  const operationPromise = Promise.resolve().then(operation);
+  operationPromise.catch(() => undefined);
+
+  return await new Promise((resolveOperation, rejectOperation) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      context.timedOut = true;
+      try {
+        destroyActiveOwnedClients(context);
+      } catch {
+        rejectOperation(
+          new HarnessIssue("EXTERNAL_FIXTURE_OWNED_CONNECTION_DESTROY_FAILED")
+        );
+        return;
+      }
+      rejectOperation(new HarnessIssue("EXTERNAL_FIXTURE_OPERATION_TIMEOUT"));
+    }, timeoutMilliseconds);
+
+    operationPromise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolveOperation(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        rejectOperation(error);
+      }
+    );
+  });
+}
+
+function createOwnedClient(context, rawClient) {
+  requireHarness(
+    rawClient &&
+      typeof rawClient.connect === "function" &&
+      typeof rawClient.query === "function" &&
+      typeof rawClient.end === "function",
+    "EXTERNAL_FIXTURE_CONNECTION_FACTORY_INVALID"
+  );
+  const ownedClient = {
+    rawClient,
+    destroyed: false,
+    closed: false,
+    usable: true,
+    destroyCount: 0,
+    proxy: null,
+  };
+  ownedClient.proxy = new Proxy(rawClient, {
+    get(target, property, receiver) {
+      if (property === "query") {
+        return (...argumentsList) => queryOwnedClient(context, ownedClient, ...argumentsList);
+      }
+      if (property === "end") {
+        return () => closeOwnedClient(context, ownedClient);
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  context.activeClients.add(ownedClient);
+  context.ownedClients.add(ownedClient);
+  return ownedClient;
+}
+
+async function queryOwnedClient(context, ownedClient, ...argumentsList) {
+  requireHarness(
+    ownedClient.usable && !ownedClient.destroyed && !ownedClient.closed,
+    context.timedOut
+      ? "EXTERNAL_FIXTURE_OPERATION_TIMEOUT"
+      : "EXTERNAL_FIXTURE_CONNECTION_UNUSABLE"
+  );
+  return await runBoundedOperation(
+    context,
+    {
+      category: "query",
+      maximumMilliseconds: context.limits.queryMilliseconds,
+      ownedClient,
+    },
+    () => ownedClient.rawClient.query(...argumentsList)
+  );
+}
+
+async function closeOwnedClient(context, ownedClient) {
+  if (ownedClient.closed || ownedClient.destroyed) {
+    context.activeClients.delete(ownedClient);
+    return;
+  }
+  try {
+    await runBoundedOperation(
+      context,
+      {
+        category: "close",
+        maximumMilliseconds: context.limits.closeMilliseconds,
+        ownedClient,
+      },
+      () => ownedClient.rawClient.end()
+    );
+    ownedClient.closed = true;
+    ownedClient.usable = false;
+  } finally {
+    context.activeClients.delete(ownedClient);
+  }
+}
+
+async function runBoundedPhase(context, category, maximumMilliseconds, operation) {
+  return await runBoundedOperation(
+    context,
+    { category, maximumMilliseconds },
+    operation
+  );
+}
+
+function createPgClientFactory(deadlineLimits = HARNESS_DEADLINE_LIMITS) {
   return ({ host, port, database, role, password }) =>
     new Client({
       host,
@@ -167,30 +397,51 @@ function createPgClientFactory() {
       database,
       user: role,
       password,
-      connectionTimeoutMillis: 10_000,
-      statement_timeout: 20_000,
+      connectionTimeoutMillis: deadlineLimits.connectMilliseconds,
+      query_timeout: deadlineLimits.queryMilliseconds,
+      statement_timeout: deadlineLimits.statementMilliseconds,
+      lock_timeout: deadlineLimits.lockMilliseconds,
+      idle_in_transaction_session_timeout:
+        deadlineLimits.idleTransactionMilliseconds,
     });
 }
 
-async function openClient(clientFactory, credentials) {
-  const client = await clientFactory(credentials);
+async function openClient(context, clientFactory, credentials) {
+  const client = clientFactory(credentials);
   requireHarness(
-    client &&
-      typeof client.connect === "function" &&
-      typeof client.query === "function" &&
-      typeof client.end === "function",
+    !client || typeof client.then !== "function",
     "EXTERNAL_FIXTURE_CONNECTION_FACTORY_INVALID"
   );
-  await client.connect();
-  return client;
+  const ownedClient = createOwnedClient(context, client);
+  try {
+    await runBoundedOperation(
+      context,
+      {
+        category: "connect",
+        maximumMilliseconds: context.limits.connectMilliseconds,
+        ownedClient,
+      },
+      () => ownedClient.rawClient.connect()
+    );
+    return ownedClient;
+  } catch (error) {
+    if (!ownedClient.destroyed) {
+      try {
+        await closeOwnedClient(context, ownedClient);
+      } catch {
+        if (!ownedClient.destroyed) destroyOwnedClient(ownedClient);
+      }
+    }
+    throw error;
+  }
 }
 
-async function withClient(clientFactory, credentials, operation) {
-  const client = await openClient(clientFactory, credentials);
+async function withClient(context, clientFactory, credentials, operation) {
+  const ownedClient = await openClient(context, clientFactory, credentials);
   try {
-    return await operation(client);
+    return await operation(ownedClient.proxy, ownedClient);
   } finally {
-    await client.end();
+    await closeOwnedClient(context, ownedClient);
   }
 }
 
@@ -205,16 +456,20 @@ function fixtureCredentials(configuration, overrides = {}) {
   };
 }
 
-function createAdapter(clientFactory, credentialsForKind) {
+function createAdapter(context, clientFactory, credentialsForKind) {
   return {
     async connect(kind) {
-      const client = await openClient(clientFactory, credentialsForKind(kind));
+      const ownedClient = await openClient(
+        context,
+        clientFactory,
+        credentialsForKind(kind)
+      );
       return {
         query(statement, parameters = []) {
-          return client.query(statement, parameters);
+          return ownedClient.proxy.query(statement, parameters);
         },
         close() {
-          return client.end();
+          return closeOwnedClient(context, ownedClient);
         },
       };
     },
@@ -265,9 +520,48 @@ async function createEmptyMigrationLedger(client) {
   `);
 }
 
-async function expectedExtensionInventory(client) {
-  const result = await client.query(PREFLIGHT_SQL_FOR_TESTS.extensionInventory);
-  return JSON.stringify({ schemaVersion: 1, extensions: result.rows });
+function exactOwnKeys(value, expected) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) ===
+      JSON.stringify([...expected].sort())
+  );
+}
+
+function validateIndependentExtensionInventory(rows) {
+  requireHarness(
+    Array.isArray(rows) && rows.length === FIXTURE_EXTENSION_CONTRACT.length,
+    "EXTERNAL_FIXTURE_EXTENSION_INVENTORY_MISMATCH"
+  );
+  for (const [index, row] of rows.entries()) {
+    const expected = FIXTURE_EXTENSION_CONTRACT[index];
+    requireHarness(
+      exactOwnKeys(row, ["name", "schema", "version"]) &&
+        typeof row.name === "string" &&
+        typeof row.schema === "string" &&
+        typeof row.version === "string" &&
+        row.name === expected.name &&
+        row.schema === expected.schema &&
+        row.version === expected.version,
+      "EXTERNAL_FIXTURE_EXTENSION_INVENTORY_MISMATCH"
+    );
+  }
+  return true;
+}
+
+function fixedExpectedExtensionInventory() {
+  return JSON.stringify({
+    schemaVersion: 1,
+    extensions: FIXTURE_EXTENSION_CONTRACT.map((entry) => ({ ...entry })),
+  });
+}
+
+async function verifyIndependentExtensionInventory(client) {
+  const result = await client.query(INDEPENDENT_EXTENSION_INVENTORY_SQL);
+  validateIndependentExtensionInventory(result.rows);
+  return fixedExpectedExtensionInventory();
 }
 
 function preflightEnvironment(configuration, extensions) {
@@ -282,35 +576,44 @@ function preflightEnvironment(configuration, extensions) {
 }
 
 async function runStablePreflight(
+  context,
   configuration,
   clientFactory,
   extensions,
   betweenSnapshotTransactions
 ) {
   const statements = [];
-  const adapter = createAdapter(clientFactory, () =>
+  const adapter = createAdapter(context, clientFactory, () =>
     fixtureCredentials(configuration)
   );
-  const report = await verifyStagingDatabasePreflight({
-    environment: preflightEnvironment(configuration, extensions),
-    repositoryRoot,
-    adapter,
-    allowLoopback: true,
-    onQuery(statement) {
-      assertReadOnlySql(statement);
-      statements.push(statement);
-    },
-    betweenSnapshotTransactions,
-  });
+  const report = await runBoundedPhase(
+    context,
+    "phase",
+    context.limits.phaseMilliseconds,
+    () =>
+      verifyStagingDatabasePreflight({
+        environment: preflightEnvironment(configuration, extensions),
+        repositoryRoot,
+        adapter,
+        allowLoopback: true,
+        onQuery(statement) {
+          assertReadOnlySql(statement);
+          statements.push(statement);
+        },
+        betweenSnapshotTransactions,
+      })
+  );
   return { report, statements };
 }
 
 async function queryExtensionClassification(
+  context,
   clientFactory,
   configuration,
   { managed, residual }
 ) {
   return withClient(
+    context,
     clientFactory,
     fixtureCredentials(configuration),
     async (client) => {
@@ -356,7 +659,11 @@ async function queryExtensionClassification(
   );
 }
 
-async function verifyExtensionClassificationMatrix(clientFactory, configuration) {
+async function verifyExtensionClassificationMatrix(
+  context,
+  clientFactory,
+  configuration
+) {
   const cases = [
     { managed: true, residual: false, expected: [1, 0, 0, 1, 1] },
     { managed: false, residual: true, expected: [1, 0, 0, 1, 1] },
@@ -365,6 +672,7 @@ async function verifyExtensionClassificationMatrix(clientFactory, configuration)
   ];
   for (const entry of cases) {
     const row = await queryExtensionClassification(
+      context,
       clientFactory,
       configuration,
       entry
@@ -400,7 +708,177 @@ async function assertMigrationLedger(client, expectedCount) {
   );
 }
 
+function databaseErrorCode(error) {
+  return (
+    error?.code ??
+    (error?.cause && typeof error.cause === "object"
+      ? error.cause.code
+      : undefined)
+  );
+}
+
+async function expectDatabaseFailure(operation, expectedCode) {
+  let failure;
+  try {
+    await operation();
+  } catch (error) {
+    failure = error;
+  }
+  requireHarness(Boolean(failure), "EXTERNAL_FIXTURE_EXPECTED_FAILURE_MISSING");
+  requireHarness(
+    databaseErrorCode(failure) === expectedCode,
+    "EXTERNAL_FIXTURE_EXPECTED_FAILURE_MISMATCH"
+  );
+}
+
+function migrationConfiguration() {
+  return {
+    migrationsFolder: join(repositoryRoot, "drizzle"),
+    migrationsSchema: "drizzle",
+    migrationsTable: "__drizzle_migrations",
+  };
+}
+
+async function applyMigrationCount(context, client, expectedCount) {
+  const configuration = migrationConfiguration();
+  const migrations = readMigrationFiles(configuration);
+  requireHarness(
+    migrations.length === EXPECTED_MIGRATION_COUNT &&
+      Number.isSafeInteger(expectedCount) &&
+      expectedCount >= 1 &&
+      expectedCount <= migrations.length,
+    "EXTERNAL_FIXTURE_MIGRATION_CONTRACT_MISMATCH"
+  );
+  const database = drizzle(client);
+  await runBoundedPhase(
+    context,
+    "migration",
+    context.limits.migrationMilliseconds,
+    () =>
+      database.dialect.migrate(
+        migrations.slice(0, expectedCount),
+        database.session,
+        configuration
+      )
+  );
+}
+
+async function configureUsageMigrationBaseline(client) {
+  const roles = USAGE_FIXTURE_ROLES;
+  await client.query(`
+    CREATE ROLE ${quoteIdentifier(roles.explicitRuntime)} NOLOGIN;
+    CREATE ROLE ${quoteIdentifier(roles.runtimeGroup)} NOLOGIN;
+    CREATE ROLE ${quoteIdentifier(roles.membershipRuntime)} NOLOGIN;
+    CREATE ROLE ${quoteIdentifier(roles.deniedRuntime)} NOLOGIN;
+    CREATE ROLE ${quoteIdentifier(roles.publicProbe)} NOLOGIN;
+    GRANT ${quoteIdentifier(roles.runtimeGroup)}
+      TO ${quoteIdentifier(roles.membershipRuntime)};
+    GRANT USAGE ON SCHEMA public TO
+      ${quoteIdentifier(roles.explicitRuntime)},
+      ${quoteIdentifier(roles.runtimeGroup)},
+      ${quoteIdentifier(roles.deniedRuntime)},
+      ${quoteIdentifier(roles.publicProbe)};
+    REVOKE ALL PRIVILEGES ON FUNCTION ${LEGACY_USAGE_SIGNATURE} FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION ${LEGACY_USAGE_SIGNATURE}
+      TO ${quoteIdentifier(roles.explicitRuntime)} WITH GRANT OPTION;
+    GRANT EXECUTE ON FUNCTION ${LEGACY_USAGE_SIGNATURE}
+      TO ${quoteIdentifier(roles.runtimeGroup)};
+  `);
+}
+
+async function verifyPublicAclMigrationFailure(context, client) {
+  await client.query(
+    `GRANT EXECUTE ON FUNCTION ${LEGACY_USAGE_SIGNATURE} TO PUBLIC`
+  );
+  await expectDatabaseFailure(
+    () => applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT),
+    "P0001"
+  );
+  await assertMigrationLedger(client, EXPECTED_MIGRATION_MAX);
+  const result = await client.query(`
+    SELECT
+      pg_catalog.to_regprocedure(
+        'public.reserve_usage_limits_v2(uuid,integer,public.usage_metric,timestamp with time zone)'
+      ) IS NULL AS versioned_function_absent,
+      EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_proc AS procedure
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+          COALESCE(
+            procedure.proacl,
+            pg_catalog.acldefault('f', procedure.proowner)
+          )
+        ) AS acl
+        WHERE procedure.oid = pg_catalog.to_regprocedure($1)
+          AND acl.grantee = 0
+          AND acl.privilege_type = 'EXECUTE'
+      ) AS public_execute_retained
+  `, [LEGACY_USAGE_SIGNATURE]);
+  requireHarness(
+    result.rows?.[0]?.versioned_function_absent === true &&
+      result.rows?.[0]?.public_execute_retained === true,
+    "EXTERNAL_FIXTURE_PUBLIC_ACL_FAILURE_NOT_ATOMIC"
+  );
+  await client.query(
+    `REVOKE ALL PRIVILEGES ON FUNCTION ${LEGACY_USAGE_SIGNATURE} FROM PUBLIC`
+  );
+}
+
+async function configureRuntimeAcl(client, configuration) {
+  await client.query(`
+    REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM
+      ${quoteIdentifier(USAGE_FIXTURE_ROLES.explicitRuntime)},
+      ${quoteIdentifier(USAGE_FIXTURE_ROLES.runtimeGroup)},
+      ${quoteIdentifier(USAGE_FIXTURE_ROLES.deniedRuntime)},
+      ${quoteIdentifier(USAGE_FIXTURE_ROLES.publicProbe)};
+    REVOKE USAGE ON SCHEMA public FROM
+      ${quoteIdentifier(USAGE_FIXTURE_ROLES.explicitRuntime)},
+      ${quoteIdentifier(USAGE_FIXTURE_ROLES.runtimeGroup)},
+      ${quoteIdentifier(USAGE_FIXTURE_ROLES.deniedRuntime)},
+      ${quoteIdentifier(USAGE_FIXTURE_ROLES.publicProbe)};
+    CREATE ROLE ${quoteIdentifier(RUNTIME_ROLE)}
+      LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+      PASSWORD '${RUNTIME_PASSWORD}';
+    REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+    REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
+    REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;
+    ALTER ROLE ${quoteIdentifier(RUNTIME_ROLE)}
+      SET search_path = public, pg_temp;
+    GRANT CONNECT ON DATABASE ${quoteIdentifier(configuration.database)}
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+    GRANT USAGE ON SCHEMA public, drizzle
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+    GRANT SELECT ON TABLE drizzle.__drizzle_migrations
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+    GRANT SELECT, INSERT, UPDATE ON TABLE
+      public.users,
+      public.oauth_accounts,
+      public.user_usage_buckets,
+      public.analysis_runs,
+      public.improvement_actions
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+    GRANT SELECT ON TABLE
+      public.plans,
+      public.user_plan_assignments
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+    GRANT SELECT, INSERT, DELETE ON TABLE
+      public.usage_reservation_leases
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+    GRANT USAGE ON TYPE
+      public.user_status,
+      public.plan_assignment_status,
+      public.plan_assignment_source,
+      public.usage_metric,
+      public.usage_period_kind,
+      public.improvement_action_status
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+  `);
+}
+
 async function applyMigrationsAndRuntimeAcl(
+  context,
   clientFactory,
   configuration,
   specification
@@ -410,67 +888,726 @@ async function applyMigrationsAndRuntimeAcl(
       specification.migrations.at(-1)?.tag.startsWith("0006_"),
     "EXTERNAL_FIXTURE_MIGRATION_CONTRACT_MISMATCH"
   );
+  let legacyAclHash;
   await withClient(
+    context,
     clientFactory,
     fixtureCredentials(configuration),
     async (client) => {
       await client.query(
         "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
       );
-      await migrate(drizzle(client), {
-        migrationsFolder: join(repositoryRoot, "drizzle"),
-      });
+      await applyMigrationCount(context, client, EXPECTED_MIGRATION_MAX);
+      await assertMigrationLedger(client, EXPECTED_MIGRATION_MAX);
+      await verifyOldMigrationCompatibility(context, client);
+      await configureUsageMigrationBaseline(client);
+      await verifyPublicAclMigrationFailure(context, client);
+      legacyAclHash = (
+        await client.query(
+          `SELECT pg_catalog.md5(proacl::text) AS acl_hash
+           FROM pg_catalog.pg_proc
+           WHERE oid = pg_catalog.to_regprocedure($1)`,
+          [LEGACY_USAGE_SIGNATURE]
+        )
+      ).rows?.[0]?.acl_hash;
+      requireHarness(
+        typeof legacyAclHash === "string",
+        "EXTERNAL_FIXTURE_LEGACY_ACL_UNAVAILABLE"
+      );
+      await applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT);
       await assertMigrationLedger(client, EXPECTED_MIGRATION_COUNT);
-      await migrate(drizzle(client), {
-        migrationsFolder: join(repositoryRoot, "drizzle"),
-      });
+      await applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT);
       await assertMigrationLedger(client, EXPECTED_MIGRATION_COUNT);
-      await client.query(`
-        CREATE ROLE ${quoteIdentifier(RUNTIME_ROLE)}
-          LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
-          PASSWORD '${RUNTIME_PASSWORD}';
-        REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-        REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
-        REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;
-        ALTER ROLE ${quoteIdentifier(RUNTIME_ROLE)}
-          SET search_path = public, pg_temp;
-        GRANT CONNECT ON DATABASE ${quoteIdentifier(configuration.database)}
-          TO ${quoteIdentifier(RUNTIME_ROLE)};
-        GRANT USAGE ON SCHEMA public, drizzle
-          TO ${quoteIdentifier(RUNTIME_ROLE)};
-        GRANT SELECT ON TABLE drizzle.__drizzle_migrations
-          TO ${quoteIdentifier(RUNTIME_ROLE)};
-        GRANT SELECT, INSERT, UPDATE ON TABLE
-          public.users,
-          public.oauth_accounts,
-          public.user_usage_buckets,
-          public.analysis_runs,
-          public.improvement_actions
-          TO ${quoteIdentifier(RUNTIME_ROLE)};
-        GRANT SELECT ON TABLE
-          public.plans,
-          public.user_plan_assignments
-          TO ${quoteIdentifier(RUNTIME_ROLE)};
-        GRANT SELECT, INSERT, DELETE ON TABLE
-          public.usage_reservation_leases
-          TO ${quoteIdentifier(RUNTIME_ROLE)};
-        GRANT USAGE ON TYPE
-          public.user_status,
-          public.plan_assignment_status,
-          public.plan_assignment_source,
-          public.usage_metric,
-          public.usage_period_kind,
-          public.improvement_action_status
-          TO ${quoteIdentifier(RUNTIME_ROLE)};
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public
-          TO ${quoteIdentifier(RUNTIME_ROLE)};
-      `);
+    }
+  );
+  await verifyUsageAclInheritance(
+    context,
+    clientFactory,
+    configuration,
+    legacyAclHash
+  );
+  await verifyPlanResolution(context, clientFactory, configuration);
+  await verifyReservationLifecycle(context, clientFactory, configuration);
+  await withClient(
+    context,
+    clientFactory,
+    fixtureCredentials(configuration),
+    (client) => configureRuntimeAcl(client, configuration)
+  );
+}
+
+function usageSignatureArraySql() {
+  return VERSIONED_USAGE_SIGNATURES.map(
+    (signature) => `'${signature.replaceAll("'", "''")}'`
+  ).join(", ");
+}
+
+async function catalogBoolean(client, statement, parameters = []) {
+  const result = await client.query(statement, parameters);
+  const value = result.rows?.[0]
+    ? Object.values(result.rows[0])[0]
+    : undefined;
+  requireHarness(value === true, "EXTERNAL_FIXTURE_USAGE_CONTRACT_MISMATCH");
+  return true;
+}
+
+function usageUserStateQuery() {
+  return `
+    SELECT json_build_object(
+      'assignments', (SELECT COUNT(*) FROM public.user_plan_assignments WHERE user_id = $1),
+      'buckets', (SELECT COUNT(*) FROM public.user_usage_buckets WHERE user_id = $1),
+      'leases', (SELECT COUNT(*) FROM public.usage_reservation_leases WHERE user_id = $1),
+      'analysis', (SELECT COUNT(*) FROM public.analysis_runs WHERE user_id = $1),
+      'ai', (
+        SELECT COUNT(*) FROM public.analysis_runs
+        WHERE user_id = $1 AND ai_consult_snapshot IS NOT NULL
+      ),
+      'improvements', (SELECT COUNT(*) FROM public.improvement_actions WHERE user_id = $1)
+    ) AS state
+  `;
+}
+
+async function verifyOldMigrationCompatibility(context, client) {
+  const userId = "50000000-0000-4000-8000-000000000001";
+  await client.query("BEGIN");
+  try {
+    await client.query(
+      `INSERT INTO public.users (id, status, session_version)
+       VALUES ($1, 'active', 1)`,
+      [userId]
+    );
+    const before = (await client.query(usageUserStateQuery(), [userId])).rows[0]
+      ?.state;
+    await catalogBoolean(
+      client,
+      `SELECT pg_catalog.to_regprocedure(
+         'public.reserve_usage_limits_v2(uuid,integer,public.usage_metric,timestamp with time zone)'
+       ) IS NULL
+       AND pg_catalog.to_regprocedure(
+         'public.get_usage_status_v1(uuid,integer,timestamp with time zone)'
+       ) IS NULL AS compatible`
+    );
+    await client.query("SAVEPOINT versioned_function_absence");
+    await expectDatabaseFailure(
+      () =>
+        client.query(
+          `SELECT * FROM public.reserve_usage_limits_v2(
+            $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+            statement_timestamp()
+          )`,
+          [userId]
+        ),
+      "42883"
+    );
+    await client.query("ROLLBACK TO SAVEPOINT versioned_function_absence");
+    await client.query("RELEASE SAVEPOINT versioned_function_absence");
+    const after = (await client.query(usageUserStateQuery(), [userId])).rows[0]
+      ?.state;
+    requireHarness(
+      JSON.stringify(after) === JSON.stringify(before),
+      "EXTERNAL_FIXTURE_OLD_MIGRATION_STATE_CHANGED"
+    );
+  } finally {
+    if (!context.timedOut) await client.query("ROLLBACK");
+  }
+}
+
+async function queryAsUsageRole(
+  context,
+  clientFactory,
+  configuration,
+  executionRole,
+  statement,
+  parameters = [],
+  { commit = false } = {}
+) {
+  return await withClient(
+    context,
+    clientFactory,
+    fixtureCredentials(configuration),
+    async (client) => {
+      await client.query("BEGIN");
+      try {
+        await client.query(
+          `SET LOCAL ROLE ${quoteIdentifier(executionRole)}`
+        );
+        const result = await client.query(statement, parameters);
+        await client.query(commit ? "COMMIT" : "ROLLBACK");
+        return result;
+      } catch (error) {
+        if (!context.timedOut) await client.query("ROLLBACK");
+        throw error;
+      }
     }
   );
 }
 
-async function verifyTransactionRollback(clientFactory, configuration) {
+async function verifyUsageAclInheritance(
+  context,
+  clientFactory,
+  configuration,
+  legacyAclHash
+) {
   await withClient(
+    context,
+    clientFactory,
+    fixtureCredentials(configuration),
+    async (client) => {
+      const targets = usageSignatureArraySql();
+      await catalogBoolean(
+        client,
+        `WITH legacy AS (
+           SELECT proowner FROM pg_catalog.pg_proc
+           WHERE oid = pg_catalog.to_regprocedure($1)
+         )
+         SELECT COUNT(*) = ${VERSIONED_USAGE_SIGNATURES.length}
+           AND bool_and(target.proowner = legacy.proowner) AS matches
+         FROM unnest(ARRAY[${targets}]::text[]) AS signature
+         CROSS JOIN legacy
+         INNER JOIN pg_catalog.pg_proc AS target
+           ON target.oid = pg_catalog.to_regprocedure(signature)`,
+        [LEGACY_USAGE_SIGNATURE]
+      );
+      await catalogBoolean(
+        client,
+        `SELECT pg_catalog.md5(proacl::text) = $2 AS preserved
+         FROM pg_catalog.pg_proc
+         WHERE oid = pg_catalog.to_regprocedure($1)`,
+        [LEGACY_USAGE_SIGNATURE, legacyAclHash]
+      );
+      await catalogBoolean(
+        client,
+        `SELECT bool_and(
+           NOT EXISTS (
+             SELECT acl.grantee, acl.privilege_type, acl.is_grantable
+             FROM pg_catalog.pg_proc AS target
+             CROSS JOIN LATERAL pg_catalog.aclexplode(
+               COALESCE(target.proacl, pg_catalog.acldefault('f', target.proowner))
+             ) AS acl
+             WHERE target.oid = pg_catalog.to_regprocedure(signature)
+               AND acl.grantee <> target.proowner
+             EXCEPT
+             SELECT acl.grantee, acl.privilege_type, acl.is_grantable
+             FROM pg_catalog.pg_proc AS legacy
+             CROSS JOIN LATERAL pg_catalog.aclexplode(
+               COALESCE(legacy.proacl, pg_catalog.acldefault('f', legacy.proowner))
+             ) AS acl
+             WHERE legacy.oid = pg_catalog.to_regprocedure($1)
+               AND acl.grantee <> legacy.proowner
+           )
+           AND NOT EXISTS (
+             SELECT acl.grantee, acl.privilege_type, acl.is_grantable
+             FROM pg_catalog.pg_proc AS legacy
+             CROSS JOIN LATERAL pg_catalog.aclexplode(
+               COALESCE(legacy.proacl, pg_catalog.acldefault('f', legacy.proowner))
+             ) AS acl
+             WHERE legacy.oid = pg_catalog.to_regprocedure($1)
+               AND acl.grantee <> legacy.proowner
+             EXCEPT
+             SELECT acl.grantee, acl.privilege_type, acl.is_grantable
+             FROM pg_catalog.pg_proc AS target
+             CROSS JOIN LATERAL pg_catalog.aclexplode(
+               COALESCE(target.proacl, pg_catalog.acldefault('f', target.proowner))
+             ) AS acl
+             WHERE target.oid = pg_catalog.to_regprocedure(signature)
+               AND acl.grantee <> target.proowner
+           )
+         ) AS equal
+         FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
+        [LEGACY_USAGE_SIGNATURE]
+      );
+      await catalogBoolean(
+        client,
+        `SELECT bool_and(
+           pg_catalog.has_function_privilege(
+             $1, pg_catalog.to_regprocedure(signature), 'EXECUTE'
+           )
+         ) AS allowed
+         FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
+        [USAGE_FIXTURE_ROLES.explicitRuntime]
+      );
+      await catalogBoolean(
+        client,
+        `SELECT bool_and(
+           pg_catalog.has_function_privilege(
+             $1, pg_catalog.to_regprocedure(signature), 'EXECUTE'
+           )
+         ) AS allowed
+         FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
+        [USAGE_FIXTURE_ROLES.membershipRuntime]
+      );
+      for (const deniedRole of [
+        USAGE_FIXTURE_ROLES.deniedRuntime,
+        USAGE_FIXTURE_ROLES.publicProbe,
+      ]) {
+        await catalogBoolean(
+          client,
+          `SELECT bool_and(
+             NOT pg_catalog.has_function_privilege(
+               $1, pg_catalog.to_regprocedure(signature), 'EXECUTE'
+             )
+           ) AS denied
+           FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
+          [deniedRole]
+        );
+      }
+      await catalogBoolean(
+        client,
+        `WITH legacy AS (
+           SELECT prosecdef FROM pg_catalog.pg_proc
+           WHERE oid = pg_catalog.to_regprocedure($1)
+         )
+         SELECT bool_and(target.prosecdef = legacy.prosecdef) AS matches
+         FROM unnest(ARRAY[${targets}]::text[]) AS signature
+         CROSS JOIN legacy
+         INNER JOIN pg_catalog.pg_proc AS target
+           ON target.oid = pg_catalog.to_regprocedure(signature)`,
+        [LEGACY_USAGE_SIGNATURE]
+      );
+      await catalogBoolean(
+        client,
+        `SELECT bool_and(
+           procedure.proconfig IS NOT DISTINCT FROM
+             ARRAY['search_path=public, pg_temp']::text[]
+         ) AS fixed
+         FROM unnest(ARRAY[${targets}, '${LEGACY_USAGE_SIGNATURE}']::text[])
+           AS signature
+         INNER JOIN pg_catalog.pg_proc AS procedure
+           ON procedure.oid = pg_catalog.to_regprocedure(signature)`
+      );
+    }
+  );
+
+  const nonExistingUser = "10000000-0000-4000-8000-000000000001";
+  for (const executionRole of [
+    USAGE_FIXTURE_ROLES.explicitRuntime,
+    USAGE_FIXTURE_ROLES.membershipRuntime,
+  ]) {
+    const result = await queryAsUsageRole(
+      context,
+      clientFactory,
+      configuration,
+      executionRole,
+      `SELECT allowed FROM public.reserve_usage_limits_v2(
+         $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+         statement_timestamp()
+       )`,
+      [nonExistingUser]
+    );
+    requireHarness(
+      result.rows?.[0]?.allowed === false,
+      "EXTERNAL_FIXTURE_USAGE_RUNTIME_EXECUTION_MISMATCH"
+    );
+  }
+  for (const deniedRole of [
+    USAGE_FIXTURE_ROLES.deniedRuntime,
+    USAGE_FIXTURE_ROLES.publicProbe,
+  ]) {
+    await expectDatabaseFailure(
+      () =>
+        queryAsUsageRole(
+          context,
+          clientFactory,
+          configuration,
+          deniedRole,
+          `SELECT * FROM public.reserve_usage_limits_v2(
+             $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+             statement_timestamp()
+           )`,
+          [nonExistingUser]
+        ),
+      "42501"
+    );
+  }
+}
+
+async function withRollback(context, clientFactory, configuration, operation) {
+  return await withClient(
+    context,
+    clientFactory,
+    fixtureCredentials(configuration),
+    async (client) => {
+      await client.query("BEGIN");
+      try {
+        return await operation(client);
+      } finally {
+        if (!context.timedOut) await client.query("ROLLBACK");
+      }
+    }
+  );
+}
+
+async function insertUsageUser(client, userId) {
+  await client.query(
+    `INSERT INTO public.users (id, status, session_version)
+     VALUES ($1, 'active', 1)`,
+    [userId]
+  );
+}
+
+async function expectPlanFailureInTransaction(client, userId) {
+  const before = (await client.query(usageUserStateQuery(), [userId])).rows[0]
+    ?.state;
+  for (const invocation of [
+    `SELECT * FROM public.get_usage_status_v1(
+      $1::uuid, 1, '2026-09-01T12:00:00Z'::timestamptz
+    )`,
+    `SELECT * FROM public.reserve_usage_limits_v2(
+      $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+      '2026-09-01T12:00:00Z'::timestamptz
+    )`,
+  ]) {
+    await client.query("SAVEPOINT expected_plan_failure");
+    await expectDatabaseFailure(
+      () => client.query(invocation, [userId]),
+      "P0001"
+    );
+    await client.query("ROLLBACK TO SAVEPOINT expected_plan_failure");
+    await client.query("RELEASE SAVEPOINT expected_plan_failure");
+  }
+  const after = (await client.query(usageUserStateQuery(), [userId])).rows[0]
+    ?.state;
+  requireHarness(
+    JSON.stringify(after) === JSON.stringify(before),
+    "EXTERNAL_FIXTURE_PLAN_FAILURE_CHANGED_STATE"
+  );
+}
+
+async function verifyPlanResolution(context, clientFactory, configuration) {
+  await withRollback(context, clientFactory, configuration, async (client) => {
+    const userId = "20000000-0000-4000-8000-000000000001";
+    await insertUsageUser(client, userId);
+    const status = await client.query(
+      `SELECT available, canonical_plan_key, plan_from_assignment,
+              analysis_daily_remaining, ai_monthly_remaining
+       FROM public.get_usage_status_v1(
+         $1::uuid, 1, '2026-09-01T12:00:00Z'::timestamptz
+       )`,
+      [userId]
+    );
+    requireHarness(
+      JSON.stringify(status.rows?.[0]) ===
+        JSON.stringify({
+          available: true,
+          canonical_plan_key: "free",
+          plan_from_assignment: false,
+          analysis_daily_remaining: 2,
+          ai_monthly_remaining: 3,
+        }),
+      "EXTERNAL_FIXTURE_FREE_PLAN_FALLBACK_MISMATCH"
+    );
+    const reservation = await client.query(
+      `SELECT allowed, canonical_plan_key, plan_from_assignment
+       FROM public.reserve_usage_limits_v2(
+         $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+         '2026-09-01T12:00:00Z'::timestamptz
+       )`,
+      [userId]
+    );
+    requireHarness(
+      reservation.rows?.[0]?.allowed === true &&
+        reservation.rows?.[0]?.canonical_plan_key === "free" &&
+        reservation.rows?.[0]?.plan_from_assignment === false,
+      "EXTERNAL_FIXTURE_FREE_PLAN_RESERVATION_MISMATCH"
+    );
+  });
+
+  await withRollback(context, clientFactory, configuration, async (client) => {
+    const userId = "20000000-0000-4000-8000-000000000002";
+    await insertUsageUser(client, userId);
+    await client.query(
+      `INSERT INTO public.user_plan_assignments (
+         user_id, plan_code, status, source, starts_at, ends_at
+       ) VALUES
+         ($1, 'free', 'inactive', 'system', '2026-01-01T00:00:00Z', NULL),
+         ($1, 'free', 'expired', 'system', '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z')`,
+      [userId]
+    );
+    const status = await client.query(
+      `SELECT available, canonical_plan_key, plan_from_assignment
+       FROM public.get_usage_status_v1(
+         $1::uuid, 1, '2026-09-01T12:00:00Z'::timestamptz
+       )`,
+      [userId]
+    );
+    requireHarness(
+      JSON.stringify(status.rows?.[0]) ===
+        JSON.stringify({
+          available: true,
+          canonical_plan_key: "free",
+          plan_from_assignment: false,
+        }),
+      "EXTERNAL_FIXTURE_INACTIVE_PLAN_FALLBACK_MISMATCH"
+    );
+  });
+
+  const failureSetups = [
+    (client, userId) =>
+      client.query(
+        `INSERT INTO public.user_plan_assignments
+          (user_id, plan_code, status, source, starts_at)
+         VALUES ($1, 'free', 'active', 'system', '2026-09-02T00:00:00Z')`,
+        [userId]
+      ),
+    (client, userId) =>
+      client.query(
+        `INSERT INTO public.user_plan_assignments
+          (user_id, plan_code, status, source, starts_at, ends_at)
+         VALUES (
+           $1, 'free', 'active', 'system',
+           '2026-08-01T00:00:00Z', '2026-08-31T00:00:00Z'
+         )`,
+        [userId]
+      ),
+    async (client, userId) => {
+      await client.query(
+        `ALTER TABLE public.user_plan_assignments
+         DROP CONSTRAINT user_plan_assignments_plan_code_plans_code_fk`
+      );
+      await client.query(
+        `INSERT INTO public.user_plan_assignments
+          (user_id, plan_code, status, source, starts_at)
+         VALUES ($1, 'missing', 'active', 'system', '2026-01-01T00:00:00Z')`,
+        [userId]
+      );
+    },
+    async (client, userId) => {
+      await client.query("DROP INDEX public.user_plan_assignments_one_active_per_user");
+      await client.query(
+        `INSERT INTO public.user_plan_assignments
+          (user_id, plan_code, status, source, starts_at)
+         VALUES
+          ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z'),
+          ($1, 'free', 'active', 'manual', '2026-01-02T00:00:00Z')`,
+        [userId]
+      );
+    },
+    (client) => client.query("DELETE FROM public.plans WHERE code = 'free'"),
+    (client) =>
+      client.query(
+        `ALTER TABLE public.plans DROP CONSTRAINT plans_pkey CASCADE;
+         INSERT INTO public.plans (
+           code, name, analysis_daily_limit, analysis_monthly_limit,
+           ai_daily_limit, ai_monthly_limit, regular_video_limit,
+           shorts_video_limit, history_retention_days, active
+         ) VALUES ('free', 'Duplicate', 2, 5, 1, 3, 10, 10, 90, true)`
+      ),
+    (client) =>
+      client.query("UPDATE public.plans SET active = false WHERE code = 'free'"),
+    (client) =>
+      client.query(
+        "UPDATE public.plans SET analysis_daily_limit = 3 WHERE code = 'free'"
+      ),
+    (client) =>
+      client.query(
+        `ALTER TABLE public.plans DROP CONSTRAINT plans_limits_nonnegative;
+         UPDATE public.plans SET ai_monthly_limit = -1 WHERE code = 'free'`
+      ),
+  ];
+  for (const [index, setup] of failureSetups.entries()) {
+    await withRollback(context, clientFactory, configuration, async (client) => {
+      const userId = `30000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+      await insertUsageUser(client, userId);
+      await setup(client, userId);
+      await expectPlanFailureInTransaction(client, userId);
+    });
+  }
+}
+
+async function executeFixtureQuery(
+  context,
+  clientFactory,
+  configuration,
+  statement,
+  parameters = []
+) {
+  return await withClient(
+    context,
+    clientFactory,
+    fixtureCredentials(configuration),
+    (client) => client.query(statement, parameters)
+  );
+}
+
+async function fixtureScalar(
+  context,
+  clientFactory,
+  configuration,
+  statement,
+  parameters = []
+) {
+  const result = await executeFixtureQuery(
+    context,
+    clientFactory,
+    configuration,
+    statement,
+    parameters
+  );
+  return result.rows?.[0] ? Object.values(result.rows[0])[0] : undefined;
+}
+
+async function verifyReservationLifecycle(context, clientFactory, configuration) {
+  const concurrentUser = "40000000-0000-4000-8000-000000000001";
+  await executeFixtureQuery(
+    context,
+    clientFactory,
+    configuration,
+    `INSERT INTO public.users (id, status, session_version)
+     VALUES ($1, 'active', 1);
+     INSERT INTO public.user_plan_assignments (
+       user_id, plan_code, status, source, starts_at
+     ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
+    [concurrentUser]
+  );
+  const concurrent = await Promise.all(
+    Array.from({ length: 10 }, () =>
+      queryAsUsageRole(
+        context,
+        clientFactory,
+        configuration,
+        USAGE_FIXTURE_ROLES.explicitRuntime,
+        `SELECT allowed FROM public.reserve_usage_limits_v2(
+           $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+           '2026-09-01T12:00:00Z'::timestamptz
+         )`,
+        [concurrentUser],
+        { commit: true }
+      )
+    )
+  );
+  requireHarness(
+    concurrent.filter((result) => result.rows?.[0]?.allowed === true).length === 2,
+    "EXTERNAL_FIXTURE_CONCURRENT_RESERVATION_MISMATCH"
+  );
+  requireHarness(
+    Number(
+      await fixtureScalar(
+        context,
+        clientFactory,
+        configuration,
+        `SELECT MAX(used_count) FROM public.user_usage_buckets
+         WHERE user_id = $1 AND metric = 'channel_analysis'`,
+        [concurrentUser]
+      )
+    ) === 2,
+    "EXTERNAL_FIXTURE_USAGE_BUCKET_LIMIT_MISMATCH"
+  );
+  await executeFixtureQuery(
+    context,
+    clientFactory,
+    configuration,
+    "DELETE FROM public.users WHERE id = $1::uuid",
+    [concurrentUser]
+  );
+
+  const releaseUser = "40000000-0000-4000-8000-000000000002";
+  await executeFixtureQuery(
+    context,
+    clientFactory,
+    configuration,
+    `INSERT INTO public.users (id, status, session_version)
+     VALUES ($1, 'active', 1);
+     INSERT INTO public.user_plan_assignments (
+       user_id, plan_code, status, source, starts_at
+     ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
+    [releaseUser]
+  );
+  const released = await executeFixtureQuery(
+    context,
+    clientFactory,
+    configuration,
+    `SELECT reservation_id FROM public.reserve_usage_limits_v2(
+       $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+       '2026-09-01T12:00:00Z'::timestamptz
+     )`,
+    [releaseUser]
+  );
+  const reservationId = released.rows?.[0]?.reservation_id;
+  requireHarness(
+    (await fixtureScalar(
+      context,
+      clientFactory,
+      configuration,
+      "SELECT released FROM public.release_usage_limits($1::uuid, $2::uuid)",
+      [reservationId, releaseUser]
+    )) === true &&
+      (await fixtureScalar(
+        context,
+        clientFactory,
+        configuration,
+        "SELECT released FROM public.release_usage_limits($1::uuid, $2::uuid)",
+        [reservationId, releaseUser]
+      )) === false,
+    "EXTERNAL_FIXTURE_ONE_TIME_RELEASE_MISMATCH"
+  );
+  const finalized = await executeFixtureQuery(
+    context,
+    clientFactory,
+    configuration,
+    `SELECT reservation_id FROM public.reserve_usage_limits_v2(
+       $1::uuid, 1, 'ai_consult'::public.usage_metric,
+       '2026-09-01T12:00:00Z'::timestamptz
+     )`,
+    [releaseUser]
+  );
+  requireHarness(
+    (await fixtureScalar(
+      context,
+      clientFactory,
+      configuration,
+      "SELECT public.finalize_usage_reservation($1::uuid, $2::uuid)",
+      [finalized.rows?.[0]?.reservation_id, releaseUser]
+    )) === true,
+    "EXTERNAL_FIXTURE_FINALIZATION_MISMATCH"
+  );
+
+  const staleUser = "40000000-0000-4000-8000-000000000003";
+  await executeFixtureQuery(
+    context,
+    clientFactory,
+    configuration,
+    `INSERT INTO public.users (id, status, session_version)
+     VALUES ($1, 'active', 1);
+     INSERT INTO public.user_plan_assignments (
+       user_id, plan_code, status, source, starts_at
+     ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z');
+     SELECT reservation_id FROM public.reserve_usage_limits_v2(
+       $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+       '2026-09-01T12:00:00Z'::timestamptz
+     )`,
+    [staleUser]
+  );
+  const recoveries = await Promise.all(
+    Array.from({ length: 2 }, () =>
+      executeFixtureQuery(
+        context,
+        clientFactory,
+        configuration,
+        `SELECT public.recover_stale_usage_reservations(
+           '2026-09-01T12:15:00Z'::timestamptz, 10
+         ) AS recovered`
+      )
+    )
+  );
+  requireHarness(
+    recoveries.reduce(
+      (total, result) => total + Number(result.rows?.[0]?.recovered),
+      0
+    ) === 1,
+    "EXTERNAL_FIXTURE_STALE_RECOVERY_MISMATCH"
+  );
+  await executeFixtureQuery(
+    context,
+    clientFactory,
+    configuration,
+    "DELETE FROM public.users WHERE id = ANY($1::uuid[])",
+    [[releaseUser, staleUser]]
+  );
+}
+
+async function verifyTransactionRollback(context, clientFactory, configuration) {
+  await withClient(
+    context,
     clientFactory,
     fixtureCredentials(configuration),
     async (client) => {
@@ -481,7 +1618,7 @@ async function verifyTransactionRollback(clientFactory, configuration) {
         );
         throw new HarnessIssue("EXTERNAL_FIXTURE_INTENTIONAL_TRANSACTION_FAILURE");
       } catch (error) {
-        await client.query("ROLLBACK");
+        if (!context.timedOut) await client.query("ROLLBACK");
         requireHarness(
           error instanceof HarnessIssue &&
             error.code === "EXTERNAL_FIXTURE_INTENTIONAL_TRANSACTION_FAILURE",
@@ -523,11 +1660,11 @@ function postflightEnvironment(configuration) {
   };
 }
 
-async function runPostflight(clientFactory, configuration) {
+async function runPostflight(context, clientFactory, configuration) {
   const { environment, secretParts } = postflightEnvironment(configuration);
   const output = [];
   const statements = [];
-  const adapter = createAdapter(clientFactory, (kind) =>
+  const adapter = createAdapter(context, clientFactory, (kind) =>
     kind === "direct"
       ? fixtureCredentials(configuration)
       : fixtureCredentials(configuration, {
@@ -535,19 +1672,25 @@ async function runPostflight(clientFactory, configuration) {
           password: RUNTIME_PASSWORD,
         })
   );
-  const report = await executeStagingDatabasePostflight({
-    environment,
-    repositoryRoot,
-    adapter,
-    allowLoopback: true,
-    onQuery(statement) {
-      assertReadOnlySql(statement);
-      statements.push(statement);
-    },
-    stdout(line) {
-      output.push(line);
-    },
-  });
+  const report = await runBoundedPhase(
+    context,
+    "phase",
+    context.limits.phaseMilliseconds,
+    () =>
+      executeStagingDatabasePostflight({
+        environment,
+        repositoryRoot,
+        adapter,
+        allowLoopback: true,
+        onQuery(statement) {
+          assertReadOnlySql(statement);
+          statements.push(statement);
+        },
+        stdout(line) {
+          output.push(line);
+        },
+      })
+  );
   const serialized = output.join("\n");
   requireHarness(
     secretParts.every((part) => !serialized.includes(part)),
@@ -566,7 +1709,10 @@ function publicSuccessResult() {
     stablePreflight: true,
     snapshotDriftRejected: true,
     extensionClassification: true,
+    independentExtensionInventory: true,
     migrationOrderAndReplay: true,
+    usageMigrationSemantics: true,
+    deadlineBounded: true,
     transactionRollback: true,
     postflight: true,
     postflightDriftRejected: true,
@@ -579,13 +1725,36 @@ export function externalFixtureSuccessResultForTests() {
   return publicSuccessResult();
 }
 
-export async function runConnectionOnlyHarness({
-  environment = process.env,
-  clientFactory = createPgClientFactory(),
-} = {}) {
+export const EXTERNAL_FIXTURE_EXTENSION_CONTRACT_FOR_TESTS =
+  FIXTURE_EXTENSION_CONTRACT;
+export const INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS =
+  INDEPENDENT_EXTENSION_INVENTORY_SQL;
+export const HARNESS_DEADLINE_LIMITS_FOR_TESTS = HARNESS_DEADLINE_LIMITS;
+
+export function validateIndependentExtensionInventoryForTests(rows) {
+  validateIndependentExtensionInventory(rows);
+  return Object.freeze({ match: true });
+}
+
+/**
+ * @param {{
+ *   environment?: NodeJS.ProcessEnv,
+ *   clientFactory?: ((credentials: object) => object),
+ *   deadlineLimits?: object,
+ * }} [options]
+ */
+export async function runConnectionOnlyHarness(options = {}) {
+  const {
+    environment = process.env,
+    clientFactory,
+    deadlineLimits,
+  } = options;
+  const context = createDeadlineContext(deadlineLimits);
   const configuration = validateExternalFixtureConfiguration(environment);
+  const resolvedClientFactory =
+    clientFactory ?? createPgClientFactory(context.limits);
   requireHarness(
-    typeof clientFactory === "function",
+    typeof resolvedClientFactory === "function",
     "EXTERNAL_FIXTURE_CONNECTION_FACTORY_INVALID"
   );
   const specification = await loadRepositorySpecification(repositoryRoot);
@@ -595,18 +1764,20 @@ export async function runConnectionOnlyHarness({
   );
 
   const extensions = await withClient(
-    clientFactory,
+    context,
+    resolvedClientFactory,
     fixtureCredentials(configuration),
     async (client) => {
       await assertFixtureIdentity(client, configuration);
       await createEmptyMigrationLedger(client);
-      return expectedExtensionInventory(client);
+      return await verifyIndependentExtensionInventory(client);
     }
   );
 
   const stable = await runStablePreflight(
+    context,
     configuration,
-    clientFactory,
+    resolvedClientFactory,
     extensions
   );
   requireHarness(
@@ -649,12 +1820,14 @@ export async function runConnectionOnlyHarness({
 
   let driftWrites = 0;
   const drift = await runStablePreflight(
+    context,
     configuration,
-    clientFactory,
+    resolvedClientFactory,
     extensions,
     async () => {
       await withClient(
-        clientFactory,
+        context,
+        resolvedClientFactory,
         fixtureCredentials(configuration),
         async (client) => {
           await client.query(
@@ -674,20 +1847,30 @@ export async function runConnectionOnlyHarness({
     "EXTERNAL_FIXTURE_SNAPSHOT_DRIFT_NOT_REJECTED"
   );
   await withClient(
-    clientFactory,
+    context,
+    resolvedClientFactory,
     fixtureCredentials(configuration),
     (client) => client.query("DROP TABLE public.external_fixture_snapshot_drift")
   );
 
-  await verifyExtensionClassificationMatrix(clientFactory, configuration);
+  await verifyExtensionClassificationMatrix(
+    context,
+    resolvedClientFactory,
+    configuration
+  );
   await applyMigrationsAndRuntimeAcl(
-    clientFactory,
+    context,
+    resolvedClientFactory,
     configuration,
     specification
   );
-  await verifyTransactionRollback(clientFactory, configuration);
+  await verifyTransactionRollback(context, resolvedClientFactory, configuration);
 
-  const postflight = await runPostflight(clientFactory, configuration);
+  const postflight = await runPostflight(
+    context,
+    resolvedClientFactory,
+    configuration
+  );
   requireHarness(
     postflight.report.exitCode === 0 &&
       postflight.report.sameLogicalDatabase === "pass" &&
@@ -701,19 +1884,25 @@ export async function runConnectionOnlyHarness({
   );
 
   await withClient(
-    clientFactory,
+    context,
+    resolvedClientFactory,
     fixtureCredentials(configuration),
     (client) =>
       client.query("CREATE TABLE public.external_fixture_postflight_drift (id integer)")
   );
-  const postflightDrift = await runPostflight(clientFactory, configuration);
+  const postflightDrift = await runPostflight(
+    context,
+    resolvedClientFactory,
+    configuration
+  );
   requireHarness(
     postflightDrift.report.exitCode === 1 &&
       postflightDrift.report.failure?.checkId === "TABLE_SET_MISMATCH",
     "EXTERNAL_FIXTURE_POSTFLIGHT_DRIFT_NOT_REJECTED"
   );
   await withClient(
-    clientFactory,
+    context,
+    resolvedClientFactory,
     fixtureCredentials(configuration),
     (client) => client.query("DROP TABLE public.external_fixture_postflight_drift")
   );
@@ -721,294 +1910,109 @@ export async function runConnectionOnlyHarness({
   return publicSuccessResult();
 }
 
-const BENIGN_CHILD_SOURCE = String.raw`
-const SCHEMA = 1;
-let initialized = false;
-let sequence = 0;
-let binding;
-let lastMessage;
-const exactMessage = (phase) => ({
-  schemaVersion: SCHEMA,
-  occurrenceId: binding.occurrenceId,
-  capabilityToken: binding.capabilityToken,
-  sequence: ++sequence,
-  phase,
-});
-const send = (phase) => new Promise((resolveSend) => {
-  lastMessage = exactMessage(phase);
-  process.send(lastMessage, resolveSend);
-});
-const sendRaw = (message) => new Promise((resolveSend) => {
-  process.send(message, resolveSend);
-});
-process.once('message', async (message) => {
-  if (initialized || !message || message.schemaVersion !== SCHEMA) process.exit(79);
-  initialized = true;
-  binding = message;
-  const mode = binding.mode;
-  if (mode === 'pre-phase-failure') process.exit(73);
-  await send('created');
-  if (mode === 'duplicate-phase') {
-    await sendRaw(lastMessage);
-    process.exit(70);
-  }
-  if (mode === 'malformed-phase') {
-    await sendRaw({ phase: 'running' });
-    process.exit(70);
-  }
-  if (mode === 'replayed-phase') {
-    await send('running');
-    await sendRaw({ ...lastMessage, sequence: 1 });
-    process.exit(70);
-  }
-  if (mode === 'correct-signal' || mode === 'wrong-signal') {
-    await send('signal_ready');
-    setInterval(() => undefined, 1000);
-    return;
-  }
-  if (mode === 'deadline') {
-    await send('deadline_pending');
-    setInterval(() => undefined, 1000);
-    return;
-  }
-  if (mode === 'normal-before-deadline') {
-    await send('deadline_pending');
-    process.exit(0);
-  }
-  await send('running');
-  if (mode === 'unexpected-normal-after-phase') process.exit(0);
-  if (mode === 'forged-terminal-reason') {
-    await sendRaw({ ...exactMessage('terminal'), reason: 'claimed' });
-    process.exit(71);
-  }
-  await send('terminal');
-  if (mode === 'wrong-nonzero') process.exit(71);
-  if (mode === 'exit-zero') process.exit(0);
-  process.exit(70);
-});
-`;
+const DEADLINE_PROBE_SCENARIOS = new Set([
+  "connect-hang",
+  "raw-query-hang",
+  "transaction-hang",
+  "migration-hang",
+  "preflight-hang",
+  "postflight-hang",
+  "independent-inventory-hang",
+  "cleanup-query-hang",
+  "end-hang",
+  "total-deadline-exhausted",
+  "operation-start-expired",
+]);
 
-const BENIGN_CONTRACTS = Object.freeze({
-  "correct-nonzero": {
-    phases: ["created", "running", "terminal"],
-    exitCode: 70,
-  },
-  "wrong-nonzero": {
-    phases: ["created", "running", "terminal"],
-    exitCode: 70,
-  },
-  "exit-zero": {
-    phases: ["created", "running", "terminal"],
-    exitCode: 70,
-  },
-  "correct-signal": {
-    phases: ["created", "signal_ready"],
-    signal: "SIGTERM",
-  },
-  "wrong-signal": {
-    phases: ["created", "signal_ready"],
-    signal: "SIGTERM",
-  },
-  deadline: {
-    phases: ["created", "deadline_pending"],
-    signal: "SIGTERM",
-    deadline: true,
-  },
-  "normal-before-deadline": {
-    phases: ["created", "deadline_pending"],
-    signal: "SIGTERM",
-    deadline: true,
-  },
-  "pre-phase-failure": {
-    phases: ["created"],
-    exitCode: 70,
-  },
-  "unexpected-normal-after-phase": {
-    phases: ["created", "running", "terminal"],
-    exitCode: 70,
-  },
-  "forged-terminal-reason": {
-    phases: ["created", "running", "terminal"],
-    exitCode: 70,
-  },
-  "duplicate-phase": {
-    phases: ["created", "running", "terminal"],
-    exitCode: 70,
-  },
-  "malformed-phase": {
-    phases: ["created", "running", "terminal"],
-    exitCode: 70,
-  },
-  "replayed-phase": {
-    phases: ["created", "running", "terminal"],
-    exitCode: 70,
-  },
-});
-
-function exactOwnKeys(value, expected) {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    JSON.stringify(Object.keys(value).sort()) ===
-      JSON.stringify([...expected].sort())
-  );
+function neverSettlingOperation() {
+  return new Promise(() => undefined);
 }
 
-export async function runBenignChildLifecycleProbeForTests(
-  mode,
-  { deadlineMilliseconds = 150 } = {}
-) {
-  const contract = BENIGN_CONTRACTS[mode];
-  requireHarness(Boolean(contract), "BENIGN_CHILD_MODE_INVALID");
+export async function runHarnessDeadlineProbeForTests({
+  scenario,
+  client,
+  deadlineLimits,
+}) {
   requireHarness(
-    Number.isSafeInteger(deadlineMilliseconds) &&
-      deadlineMilliseconds >= 50 &&
-      deadlineMilliseconds <= 1_000,
-    "BENIGN_CHILD_DEADLINE_INVALID"
+    DEADLINE_PROBE_SCENARIOS.has(scenario),
+    "EXTERNAL_FIXTURE_DEADLINE_PROBE_INVALID"
   );
-  const occurrenceId = randomUUID();
-  const capabilityToken = randomUUID();
-  const child = spawn(
-    process.execPath,
-    ["--input-type=module", "-e", BENIGN_CHILD_SOURCE],
-    {
-      env: {},
-      shell: false,
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
-      windowsHide: true,
-    }
-  );
-
-  return new Promise((resolveProbe, rejectProbe) => {
-    const messages = [];
-    const exitEvents = [];
-    const closeEvents = [];
-    const errorEvents = [];
-    let deadlineAlive = false;
-    let settled = false;
-    let deadlineTimer;
-
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(hardTimer);
-      if (deadlineTimer) clearTimeout(deadlineTimer);
-      const authenticatedMessages = messages.filter(
-        (message, index) =>
-          exactOwnKeys(message, [
-            "schemaVersion",
-            "occurrenceId",
-            "capabilityToken",
-            "sequence",
-            "phase",
-          ]) &&
-          message.schemaVersion === BENIGN_CHILD_SCHEMA_VERSION &&
-          message.occurrenceId === occurrenceId &&
-          message.capabilityToken === capabilityToken &&
-          message.sequence === index + 1 &&
-          typeof message.phase === "string"
+  const context = createDeadlineContext(deadlineLimits);
+  if (scenario === "operation-start-expired") {
+    context.absoluteDeadline = performance.now() - 1;
+  }
+  const startedAt = performance.now();
+  let failureMarker = null;
+  try {
+    const ownedClient = await openClient(context, () => client, {});
+    if (scenario === "total-deadline-exhausted") {
+      context.absoluteDeadline = performance.now() - 1;
+      await ownedClient.proxy.query("SELECT fixed_deadline_probe");
+    } else if (scenario === "raw-query-hang") {
+      await ownedClient.proxy.query("SELECT fixed_deadline_probe");
+    } else if (scenario === "transaction-hang") {
+      await ownedClient.proxy.query("BEGIN");
+    } else if (scenario === "independent-inventory-hang") {
+      await ownedClient.proxy.query(INDEPENDENT_EXTENSION_INVENTORY_SQL);
+    } else if (scenario === "cleanup-query-hang") {
+      await ownedClient.proxy.query("ROLLBACK");
+    } else if (scenario === "end-hang") {
+      await closeOwnedClient(context, ownedClient);
+    } else if (
+      scenario === "migration-hang" ||
+      scenario === "preflight-hang" ||
+      scenario === "postflight-hang"
+    ) {
+      await runBoundedPhase(
+        context,
+        scenario === "migration-hang" ? "migration" : "phase",
+        scenario === "migration-hang"
+          ? context.limits.migrationMilliseconds
+          : context.limits.phaseMilliseconds,
+        neverSettlingOperation
       );
-      const messageContract =
-        messages.length > 0 && authenticatedMessages.length === messages.length;
-      const authenticatedPhases = authenticatedMessages.map(
-        (message) => message.phase
-      );
-      const phaseContract =
-        messageContract &&
-        JSON.stringify(authenticatedPhases) === JSON.stringify(contract.phases);
-      const exit = exitEvents[0];
-      const close = closeEvents[0];
-      const processError = errorEvents[0];
-      const terminalContract =
-        exitEvents.length === 1 &&
-        closeEvents.length === 1 &&
-        exit?.code === close?.code &&
-        exit?.signal === close?.signal &&
-        (contract.exitCode !== undefined
-          ? exit?.code === contract.exitCode && exit?.signal === null
-          : exit?.code === null && exit?.signal === contract.signal);
-      const deadlineContract = contract.deadline ? deadlineAlive : true;
-      resolveProbe({
-        schemaVersion: BENIGN_CHILD_SCHEMA_VERSION,
-        mode,
-        accepted:
-          messageContract &&
-          phaseContract &&
-          terminalContract &&
-          deadlineContract &&
-          errorEvents.length === 0,
-        messageContract,
-        phaseContract,
-        terminalContract,
-        authenticatedPhases,
-        deadlineAlive,
-        exitObservation: {
-          count: exitEvents.length,
-          code: exit?.code ?? null,
-          signal: exit?.signal ?? null,
-          timestampMilliseconds: exit?.timestampMilliseconds ?? null,
-        },
-        closeObservation: {
-          count: closeEvents.length,
-          code: close?.code ?? null,
-          signal: close?.signal ?? null,
-          timestampMilliseconds: close?.timestampMilliseconds ?? null,
-        },
-        errorObservation: {
-          count: errorEvents.length,
-          timestampMilliseconds: processError?.timestampMilliseconds ?? null,
-        },
-      });
-    };
-
-    const hardTimer = setTimeout(() => {
-      child.kill("SIGKILL");
-      rejectProbe(new HarnessIssue("BENIGN_CHILD_OBSERVATION_TIMEOUT"));
-    }, BENIGN_CHILD_TIMEOUT_MS);
-
-    child.on("message", (message) => {
-      messages.push(message);
-      if (
-        messages.length === 2 &&
-        message?.phase === "signal_ready" &&
-        (mode === "correct-signal" || mode === "wrong-signal")
-      ) {
-        child.kill(mode === "correct-signal" ? "SIGTERM" : "SIGKILL");
-      }
-    });
-    child.once("error", () => {
-      errorEvents.push({ timestampMilliseconds: performance.now() });
-    });
-    child.on("exit", (code, signal) => {
-      exitEvents.push({
-        code,
-        signal,
-        timestampMilliseconds: performance.now(),
-      });
-    });
-    child.on("close", (code, signal) => {
-      closeEvents.push({
-        code,
-        signal,
-        timestampMilliseconds: performance.now(),
-      });
-      finish();
-    });
-
-    if (contract.deadline) {
-      deadlineTimer = setTimeout(() => {
-        deadlineAlive = exitEvents.length === 0 && closeEvents.length === 0;
-        if (deadlineAlive) child.kill("SIGTERM");
-      }, deadlineMilliseconds);
+    } else if (scenario !== "connect-hang") {
+      throw new HarnessIssue("EXTERNAL_FIXTURE_DEADLINE_PROBE_INVALID");
     }
+  } catch (error) {
+    failureMarker =
+      error instanceof HarnessIssue
+        ? error.code
+        : "EXTERNAL_FIXTURE_VERIFICATION_FAILED";
+  }
 
-    child.send({
-      schemaVersion: BENIGN_CHILD_SCHEMA_VERSION,
-      occurrenceId,
-      capabilityToken,
-      mode,
-    });
+  const operationStartsBeforeBlockedProbe = {
+    ...context.operationStarts,
+  };
+  const ownedClient = [...context.ownedClients][0];
+  if (ownedClient) {
+    try {
+      await ownedClient.proxy.query("SELECT blocked_after_timeout");
+    } catch {
+      // This is an assertion that no raw post-timeout query can start.
+    }
+  }
+  const operationStartsAfterBlockedProbe = { ...context.operationStarts };
+  return Object.freeze({
+    scenario,
+    failureMarker,
+    finiteFailure: typeof failureMarker === "string",
+    elapsedMilliseconds: performance.now() - startedAt,
+    destroyCount: [...context.ownedClients].reduce(
+      (total, entry) => total + entry.destroyCount,
+      0
+    ),
+    activeClientCount: context.activeClients.size,
+    operationStarts: Object.freeze(operationStartsBeforeBlockedProbe),
+    postTimeoutOperationStarts:
+      Object.values(operationStartsAfterBlockedProbe).reduce(
+        (total, value) => total + value,
+        0
+      ) -
+      Object.values(operationStartsBeforeBlockedProbe).reduce(
+        (total, value) => total + value,
+        0
+      ),
   });
 }
 

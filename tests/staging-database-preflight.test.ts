@@ -20,12 +20,20 @@ import {
 } from "../scripts/staging-database-postflight/core.mjs";
 import { assertReadOnlySql } from "../scripts/staging-database-postflight/safety.mjs";
 import {
+  EXTERNAL_FIXTURE_EXTENSION_CONTRACT_FOR_TESTS,
+  HARNESS_DEADLINE_LIMITS_FOR_TESTS,
+  INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS,
   externalFixtureSuccessResultForTests,
   harnessAuthorityBoundaryForTests,
-  runBenignChildLifecycleProbeForTests,
   runConnectionOnlyHarness,
+  runHarnessDeadlineProbeForTests,
   validateExternalFixtureConfigurationForTests,
+  validateIndependentExtensionInventoryForTests,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
+import {
+  benignChildLifecycleCountersForTests,
+  runBenignChildLifecycleProbeForTests,
+} from "../scripts/test-staging-database-fault-lifecycle.mjs";
 import {
   PARENT_ENVIRONMENT_NOTICE,
   createFatalExitLatch,
@@ -918,6 +926,10 @@ const postgresHarnessModule = resolve(
   repositoryRoot,
   "scripts/test-staging-database-preflight-postgres.mjs"
 );
+const faultLifecycleModule = resolve(
+  repositoryRoot,
+  "scripts/test-staging-database-fault-lifecycle.mjs"
+);
 
 function externalFixtureEnvironment(
   overrides: Partial<NodeJS.ProcessEnv> = {}
@@ -932,6 +944,56 @@ function externalFixtureEnvironment(
     ACTUSTUBE_STAGING_HARNESS_EXPECTED_MIGRATION_MAX: "6",
     ...overrides,
   };
+}
+
+function createDeadlineFakeClient({
+  connectHang = false,
+  queryHang = false,
+  endHang = false,
+  lateQueryRejection = false,
+} = {}) {
+  const counters = {
+    connect: 0,
+    query: [] as string[],
+    end: 0,
+    destroy: 0,
+  };
+  const client = {
+    connection: {
+      stream: {
+        destroy() {
+          counters.destroy += 1;
+        },
+      },
+    },
+    connect() {
+      counters.connect += 1;
+      return connectHang
+        ? new Promise(() => undefined)
+        : Promise.resolve(undefined);
+    },
+    query(statement: string) {
+      counters.query.push(statement);
+      if (lateQueryRejection) {
+        return new Promise((_resolve, reject) => {
+          setTimeout(
+            () => reject(new Error("credential-raw-query-late-rejection")),
+            35
+          );
+        });
+      }
+      return queryHang
+        ? new Promise(() => undefined)
+        : Promise.resolve({ rows: [] });
+    },
+    end() {
+      counters.end += 1;
+      return endHang
+        ? new Promise(() => undefined)
+        : Promise.resolve(undefined);
+    },
+  };
+  return { client, counters };
 }
 
 async function runDirectHarnessInvocation(
@@ -988,6 +1050,10 @@ describe("connection-only external fixture boundary", () => {
     for (const forbidden of [
       "embedded-postgres",
       "EmbeddedPostgres",
+      "node:child_process",
+      "test-staging-database-fault-lifecycle",
+      "runBenignChildLifecycleProbeForTests",
+      "spawn(",
       "spawnSync",
       "taskkill",
       "powershell",
@@ -1008,8 +1074,6 @@ describe("connection-only external fixture boundary", () => {
     expect(source).toContain("clientFactory");
 
     const connectionFactory = vi.fn();
-    const processAdapter = vi.fn();
-    const filesystemAdapter = vi.fn();
     await expect(
       runConnectionOnlyHarness({
         environment: externalFixtureEnvironment({
@@ -1017,13 +1081,248 @@ describe("connection-only external fixture boundary", () => {
             "postgresql://actustube_ci_fixture:p@localhost:5432/actustube_ci_fixture",
         }),
         clientFactory: connectionFactory,
-        processAdapter,
-        filesystemAdapter,
-      } as any)
+      })
     ).rejects.toThrow("EXTERNAL_FIXTURE_URL_INVALID");
     expect(connectionFactory).not.toHaveBeenCalled();
-    expect(processAdapter).not.toHaveBeenCalled();
-    expect(filesystemAdapter).not.toHaveBeenCalled();
+
+    const faultSource = await readFile(faultLifecycleModule, "utf8");
+    expect(faultSource).toContain('from "node:child_process"');
+    expect(faultSource).toContain("process.execPath");
+    expect(faultSource).toContain("shell: false");
+    expect(faultSource).toContain('stdio: ["ignore", "ignore", "ignore", "ipc"]');
+    for (const forbidden of [
+      "embedded-postgres",
+      'from "pg"',
+      "drizzle",
+      "postgres",
+      "node:fs",
+      "node:net",
+      "createServer",
+      "process.kill(",
+      "taskkill",
+    ]) {
+      expect(faultSource.toLowerCase()).not.toContain(forbidden.toLowerCase());
+    }
+  });
+
+  it("fixes every harness-owned deadline at or below the authorized maximum", () => {
+    expect(HARNESS_DEADLINE_LIMITS_FOR_TESTS).toMatchObject({
+      totalMilliseconds: 300_000,
+      connectMilliseconds: 10_000,
+      queryMilliseconds: 30_000,
+      statementMilliseconds: 20_000,
+      lockMilliseconds: 5_000,
+      idleTransactionMilliseconds: 20_000,
+      closeMilliseconds: 5_000,
+    });
+    expect(HARNESS_DEADLINE_LIMITS_FOR_TESTS.phaseMilliseconds).toBeLessThanOrEqual(
+      HARNESS_DEADLINE_LIMITS_FOR_TESTS.totalMilliseconds
+    );
+    expect(
+      HARNESS_DEADLINE_LIMITS_FOR_TESTS.migrationMilliseconds
+    ).toBeLessThanOrEqual(HARNESS_DEADLINE_LIMITS_FOR_TESTS.totalMilliseconds);
+  });
+
+  it.each([
+    "connect-hang",
+    "raw-query-hang",
+    "transaction-hang",
+    "migration-hang",
+    "preflight-hang",
+    "postflight-hang",
+    "independent-inventory-hang",
+    "cleanup-query-hang",
+    "end-hang",
+    "total-deadline-exhausted",
+    "operation-start-expired",
+  ] as const)(
+    "bounds the non-settling fake Client case %s and destroys only the owned socket",
+    async (scenario) => {
+      vi.useFakeTimers();
+      try {
+        const fake = createDeadlineFakeClient({
+          connectHang: scenario === "connect-hang",
+          queryHang: [
+            "raw-query-hang",
+            "transaction-hang",
+            "independent-inventory-hang",
+            "cleanup-query-hang",
+          ].includes(scenario),
+          endHang: scenario === "end-hang",
+        });
+        const unrelatedDestroy = vi.fn();
+        const pending = runHarnessDeadlineProbeForTests({
+          scenario,
+          client: fake.client,
+          deadlineLimits: {
+            totalMilliseconds: 100,
+            connectMilliseconds: 20,
+            queryMilliseconds: 20,
+            closeMilliseconds: 20,
+            phaseMilliseconds: 20,
+            migrationMilliseconds: 20,
+          },
+        });
+        await vi.advanceTimersByTimeAsync(120);
+        const result = await pending;
+        expect(result).toMatchObject({
+          scenario,
+          failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
+          finiteFailure: true,
+          destroyCount: 1,
+          activeClientCount: 0,
+          postTimeoutOperationStarts: 0,
+        });
+        expect(fake.counters.destroy).toBe(1);
+        expect(unrelatedDestroy).not.toHaveBeenCalled();
+        expect(fake.counters.query).not.toContain("SELECT blocked_after_timeout");
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it("uses a short real timer for a non-settling query and handles its late rejection", async () => {
+    const fake = createDeadlineFakeClient({ lateQueryRejection: true });
+    const unhandled: unknown[] = [];
+    const listener = (error: unknown) => unhandled.push(error);
+    const beforeListeners = process.listenerCount("unhandledRejection");
+    process.on("unhandledRejection", listener);
+    try {
+      const result = await runHarnessDeadlineProbeForTests({
+        scenario: "raw-query-hang",
+        client: fake.client,
+        deadlineLimits: {
+          totalMilliseconds: 100,
+          connectMilliseconds: 20,
+          queryMilliseconds: 10,
+          closeMilliseconds: 20,
+          phaseMilliseconds: 20,
+          migrationMilliseconds: 20,
+        },
+      });
+      expect(result).toMatchObject({
+        failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
+        finiteFailure: true,
+        destroyCount: 1,
+        activeClientCount: 0,
+        postTimeoutOperationStarts: 0,
+      });
+      expect(result.elapsedMilliseconds).toBeLessThan(1_000);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+      expect(unhandled).toEqual([]);
+      expect(JSON.stringify(result)).not.toMatch(
+        /credential|late-rejection|select fixed_deadline_probe/i
+      );
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
+    expect(process.listenerCount("unhandledRejection")).toBe(beforeListeners);
+  });
+
+  it("uses a fixed independent extension oracle instead of the production query result", async () => {
+    expect(EXTERNAL_FIXTURE_EXTENSION_CONTRACT_FOR_TESTS).toEqual([
+      { name: "plpgsql", schema: "pg_catalog", version: "1.0" },
+    ]);
+    expect(
+      validateIndependentExtensionInventoryForTests([
+        { name: "plpgsql", schema: "pg_catalog", version: "1.0" },
+      ])
+    ).toEqual({ match: true });
+    expect(INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS).toContain(
+      "pg_catalog.pg_extension"
+    );
+    expect(INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS).toContain(
+      "pg_catalog.pg_namespace"
+    );
+    expect(INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS).toContain("ORDER BY");
+    expect(sameSql(
+      INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS,
+      PREFLIGHT_SQL_FOR_TESTS.extensionInventory
+    )).toBe(false);
+    const source = await readFile(postgresHarnessModule, "utf8");
+    expect(source).not.toContain("expectedExtensionInventory(client)");
+    expect(source).toContain("fixedExpectedExtensionInventory()");
+  });
+
+  it.each([
+    ["missing", []],
+    [
+      "extra",
+      [
+        { name: "plpgsql", schema: "pg_catalog", version: "1.0" },
+        { name: "extra", schema: "public", version: "1.0" },
+      ],
+    ],
+    ["name", [{ name: "wrong", schema: "pg_catalog", version: "1.0" }]],
+    ["version", [{ name: "plpgsql", schema: "pg_catalog", version: "2.0" }]],
+    ["schema", [{ name: "plpgsql", schema: "public", version: "1.0" }]],
+    [
+      "unknown key",
+      [
+        {
+          name: "plpgsql",
+          schema: "pg_catalog",
+          version: "1.0",
+          extra: true,
+        },
+      ],
+    ],
+  ])("rejects an independent inventory %s mismatch", (_label, rows) => {
+    expect(() =>
+      validateIndependentExtensionInventoryForTests(rows)
+    ).toThrow("EXTERNAL_FIXTURE_EXTENSION_INVENTORY_MISMATCH");
+  });
+
+  it.each([
+    ["empty inventory / missing row", []],
+    ["name mismatch", [{ name: "wrong", schema: "pg_catalog", version: "1.0" }]],
+    ["version mismatch", [{ name: "plpgsql", schema: "pg_catalog", version: "2.0" }]],
+    ["schema mismatch", [{ name: "plpgsql", schema: "public", version: "1.0" }]],
+  ])("rejects the production extension query %s", async (_label, extensions) => {
+    const state = baseState();
+    state.extensionInventory = extensions;
+    const environment = validEnvironment();
+    environment.ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS = JSON.stringify({
+      schemaVersion: 1,
+      extensions: EXTERNAL_FIXTURE_EXTENSION_CONTRACT_FOR_TESTS,
+    });
+    const report = await runPreflight(
+      createAdapter({ directState: state, pooledState: state }),
+      environment
+    );
+    expect(report.exitCode).toBe(1);
+    expect(report.failure.checkId).toBe("STAGING_EXTENSION_INVENTORY_MISMATCH");
+  });
+
+  it("preserves every migrated usage-contract assertion without a caller-supplied Migration path", async () => {
+    const source = await readFile(postgresHarnessModule, "utf8");
+    for (const required of [
+      "verifyOldMigrationCompatibility",
+      "verifyPublicAclMigrationFailure",
+      "verifyUsageAclInheritance",
+      "verifyPlanResolution",
+      "verifyReservationLifecycle",
+      "EXTERNAL_FIXTURE_PUBLIC_ACL_FAILURE_NOT_ATOMIC",
+      "EXTERNAL_FIXTURE_PLAN_FAILURE_CHANGED_STATE",
+      "EXTERNAL_FIXTURE_CONCURRENT_RESERVATION_MISMATCH",
+      "EXTERNAL_FIXTURE_ONE_TIME_RELEASE_MISMATCH",
+      "EXTERNAL_FIXTURE_FINALIZATION_MISMATCH",
+      "EXTERNAL_FIXTURE_STALE_RECOVERY_MISMATCH",
+      "readMigrationFiles(configuration)",
+      "migrations.slice(0, expectedCount)",
+    ]) {
+      expect(source).toContain(required);
+    }
+    for (const forbidden of [
+      "migrationsFolder =",
+      "migrationPath",
+      "migrationSql",
+      "callerMigration",
+    ]) {
+      expect(source).not.toContain(forbidden);
+    }
   });
 
   it.each(["postgres", "postgresql"])(
@@ -1147,10 +1446,13 @@ describe("connection-only external fixture boundary", () => {
     expect(Object.keys(success).sort()).toEqual(
       [
         "extensionClassification",
+        "independentExtensionInventory",
         "fixtureConfigured",
         "lifecycleOwner",
         "migrationCount",
         "migrationOrderAndReplay",
+        "usageMigrationSemantics",
+        "deadlineBounded",
         "outputRedaction",
         "postflight",
         "postflightDriftRejected",
@@ -1312,6 +1614,13 @@ describe("benign child parent-observed P3 oracle", () => {
         signal: "SIGTERM",
         timestampMilliseconds: expect.any(Number),
       },
+    });
+  });
+
+  it("closes every fixed benign child that this suite actually spawned", () => {
+    expect(benignChildLifecycleCountersForTests()).toEqual({
+      spawned: 16,
+      closed: 16,
     });
   });
 });
