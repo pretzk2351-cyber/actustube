@@ -1,7 +1,17 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, readdir, rmdir, unlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rmdir,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -22,13 +32,17 @@ import {
 import { assertReadOnlySql } from "../scripts/staging-database-postflight/safety.mjs";
 import {
   allocatePostgresHarnessPort,
+  cancelableDelay,
   createPostgresHarnessEnvironment,
   evaluateHarnessTerminationIdentityForTests,
+  evaluateOwnershipRegistrationForTests,
+  evaluateParentObservedFaultForTests,
   invokeTerminationOnlyForExactIdentityForTests,
-  POSTGRES_HARNESS_FAULT_CONTRACTS,
-  runCleanupDeadlineContractForTests,
+  runCleanupWorkerDeadlineProbeForTests,
   runOwnedRootSafetyProbeForTests,
+  runOwnedRootRaceProbeForTests,
   runOwnedPostgresHarness,
+  validateLexicalUtilityChainForTests,
   validateWindowsUtilityAuthorityForTests,
   waitForChildCloseWithTimeout,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
@@ -1059,15 +1073,34 @@ describe("harness root claim and direct invocation", () => {
   );
 
   it.each(["root-exchange", "nested-link"] as const)(
-    "rejects %s without following an unrelated sentinel",
+    "handles %s without following an unrelated sentinel",
     async (kind) => {
       await expect(runOwnedRootSafetyProbeForTests(kind)).resolves.toEqual({
-        rejected: true,
+        rejected: kind === "root-exchange",
         sentinelMaintained: true,
         ownedRootRemaining: false,
       });
     }
   );
+
+  it.each([
+    ["concurrent-junction-swap", true],
+    ["concurrent-symlink-swap", true],
+    ["hardlink-swap", true],
+    ["root-rename-race", true],
+    ["ancestor-identity-change", true],
+    ["predictable-temp-precreation", false],
+    ["normal-owned-tree", false],
+  ] as const)("applies the no-follow policy for %s", async (kind, rejected) => {
+    const result = await runOwnedRootRaceProbeForTests(kind);
+    expect(result).toMatchObject({
+      kind,
+      rejected,
+      outsideContent: "preserve",
+      deleteOutsideCount: 0,
+      ownedRootRemaining: false,
+    });
+  });
 });
 
 describe("trusted Windows utility and harness environment", () => {
@@ -1112,33 +1145,133 @@ describe("trusted Windows utility and harness environment", () => {
       await rmdir(fakeRoot);
     }
   });
+
+  it("rejects a lexical intermediate junction before utility execution", async () => {
+    const volumeRoot = await mkdtemp(join(tmpdir(), "actustube-utility-chain-"));
+    const windowsRoot = join(volumeRoot, "Windows");
+    const system32 = join(windowsRoot, "System32");
+    const windowsPowerShell = join(system32, "WindowsPowerShell");
+    const powershellDirectory = join(windowsPowerShell, "v1.0");
+    const powershell = join(powershellDirectory, "powershell.exe");
+    const replacement = join(volumeRoot, "replacement");
+    const preserved = `${windowsPowerShell}-preserved`;
+    await mkdir(powershellDirectory, { recursive: true });
+    await writeFile(powershell, "sentinel executable", { flag: "wx" });
+    await mkdir(replacement);
+    expect(
+      validateLexicalUtilityChainForTests({
+        volumeRoot,
+        windowsRoot,
+        system32,
+        windowsPowerShell,
+        powershellDirectory,
+        powershell,
+      })
+    ).toBe(powershell);
+    await rename(windowsPowerShell, preserved);
+    await symlink(replacement, windowsPowerShell, "junction");
+    try {
+      expect(() =>
+        validateLexicalUtilityChainForTests({
+          volumeRoot,
+          windowsRoot,
+          system32,
+          windowsPowerShell,
+          powershellDirectory,
+          powershell,
+        })
+      ).toThrow("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
+      expect(await readFile(join(preserved, "v1.0", "powershell.exe"), "utf8")).toBe(
+        "sentinel executable"
+      );
+    } finally {
+      await rmdir(windowsPowerShell);
+      await rename(preserved, windowsPowerShell);
+      await unlink(powershell);
+      await rmdir(powershellDirectory);
+      await rmdir(windowsPowerShell);
+      await rmdir(system32);
+      await rmdir(windowsRoot);
+      await rmdir(replacement);
+      await rmdir(volumeRoot);
+    }
+  });
 });
 
 describe("fault oracle negative controls", () => {
-  it.each(Object.entries(POSTGRES_HARNESS_FAULT_CONTRACTS))(
+  const expectations = {
+    ready_hang: {
+      phases: ["created", "start_spawned", "ready_pending"],
+      terminalReason: "FORCED_CLEANUP_READY_HANG",
+      kind: "deadline",
+      exitCode: null,
+    },
+    partial_start_throw: {
+      phases: ["created", "start_spawned", "partial_start_failure"],
+      terminalReason: "CHILD_EXIT_PARTIAL_START_THROW",
+      kind: "exit",
+      exitCode: 70,
+    },
+    stop_hang: {
+      phases: ["created", "start_spawned", "ready", "stopping"],
+      terminalReason: "FORCED_CLEANUP_STOP_HANG",
+      kind: "deadline",
+      exitCode: null,
+    },
+    child_crash: {
+      phases: ["created", "start_spawned", "child_crash"],
+      terminalReason: "CHILD_EXIT_CRASH",
+      kind: "exit",
+      exitCode: 72,
+    },
+  } as const;
+
+  it.each(Object.entries(expectations))(
     "accepts only the canonical %s phase and reason",
     async (mode, contract: any) => {
       const result: any = await runOwnedPostgresHarness({ mode });
-      expect(result).toEqual({
-        schemaVersion: 2,
+      expect(result).toMatchObject({
+        schemaVersion: 3,
         occurrenceId: expect.stringMatching(/^[0-9a-f-]{36}$/),
         mode,
         phaseSequence: contract.phases,
         intendedFaultReached: true,
         terminalReason: contract.terminalReason,
+        parentObservation:
+          contract.kind === "deadline"
+            ? {
+                deadlineFired: true,
+                aliveAtDeadline: true,
+                closedBeforeDeadline: false,
+                cleanupTrigger: "deadline",
+                exitCode: null,
+                signal: null,
+              }
+            : {
+                deadlineFired: false,
+                aliveAtDeadline: false,
+                closedBeforeDeadline: true,
+                cleanupTrigger: "exit",
+                exitCode: contract.exitCode,
+                signal: null,
+              },
         environmentIsolation: {
           sourceSeparated: true,
           cleanupProbe: true,
           temporaryRootOwned: true,
         },
-        cleanup: { attempted: true, result: "complete" },
+        cleanup: {
+          attempted: true,
+          result: "complete",
+          terminatedCount: expect.any(Number),
+        },
         residue: { process: 0, listener: 0, directory: 0 },
       });
     },
     30_000
   );
 
-  it.each(Object.keys(POSTGRES_HARNESS_FAULT_CONTRACTS))(
+  it.each(Object.keys(expectations))(
     "rejects an early unrelated failure for %s",
     async (mode) => {
       await expect(
@@ -1147,28 +1280,74 @@ describe("fault oracle negative controls", () => {
     },
     20_000
   );
+
+  it.each(Object.entries(expectations))(
+    "derives %s only from the parent observation",
+    (mode, contract: any) => {
+      const canonical: any = {
+        mode,
+        phases: [...contract.phases],
+        protocolAuthenticated: true,
+        deadlineFired: contract.kind === "deadline",
+        aliveAtDeadline: contract.kind === "deadline",
+        closedBeforeDeadline: contract.kind !== "deadline",
+        cleanupTrigger: contract.kind,
+        close:
+          contract.kind === "exit"
+            ? { code: contract.exitCode, signal: null }
+            : undefined,
+        childTerminalReason: "SPOOFED_BY_CHILD",
+      };
+      expect(evaluateParentObservedFaultForTests(canonical)).toEqual({
+        accepted: true,
+        terminalReason: contract.terminalReason,
+      });
+      const rejected = [
+        { ...canonical, phases: contract.phases.slice(0, -1) },
+        { ...canonical, cleanupTrigger: "close" },
+        { ...canonical, close: { code: 0, signal: null } },
+        { ...canonical, close: { code: 73, signal: null } },
+        { ...canonical, close: { code: contract.exitCode, signal: "SIGTERM" } },
+        {
+          ...canonical,
+          deadlineFired: false,
+          aliveAtDeadline: false,
+          closedBeforeDeadline: true,
+          cleanupTrigger: "exit",
+          close: { code: 0, signal: null },
+        },
+      ];
+      for (const observation of rejected) {
+        expect(evaluateParentObservedFaultForTests(observation)).toEqual({
+          accepted: false,
+        });
+      }
+    }
+  );
 });
 
 describe("global cleanup deadline and cancelable timer", () => {
-  it("shares one monotonic budget and starts nothing after expiry", () => {
-    expect(
-      runCleanupDeadlineContractForTests(
-        [
-          { kind: "utility", duration: 6 },
-          { kind: "kill", duration: 4 },
-          { kind: "utility", duration: 1 },
-          { kind: "kill", duration: 1 },
-        ],
-        10
-      )
-    ).toEqual({
-      elapsed: 10,
-      remainingByStage: [10, 4, 0],
-      utilitySpawnCount: 1,
-      killCount: 1,
-      expired: true,
+  it.each([
+    "port",
+    "lstat",
+    "readdir",
+    "unlink",
+    "rmdir",
+    "process-query",
+    "utility",
+  ] as const)("hard-bounds a hanging %s cleanup operation", async (stage) => {
+    const result = await runCleanupWorkerDeadlineProbeForTests(stage);
+    expect(result).toMatchObject({
+      errorCode: "POSTGRES_HARNESS_FORCED_CLEANUP_TIMEOUT",
+      postDeadlineOperationStarts: 0,
+      finalProbeCount: 0,
+      workerListenerResidue: 0,
+      cleanupResult: "incomplete",
+      testFixtureRecovery: "complete",
     });
-  });
+    expect(result.operationStarts).toContain(stage);
+    expect(result.elapsedMilliseconds).toBeLessThan(2_750);
+  }, 10_000);
 
   it.each([
     ["close", Promise.resolve({ closed: true })],
@@ -1184,6 +1363,55 @@ describe("global cleanup deadline and cancelable timer", () => {
       cancel,
     }));
     expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("clears the real default timer after close, timeout, rejection, and abort", async () => {
+    vi.useFakeTimers();
+    try {
+      await expect(
+        waitForChildCloseWithTimeout(Promise.resolve({ closed: true }), 100)
+      ).resolves.toEqual({ closed: true });
+      expect(vi.getTimerCount()).toBe(0);
+
+      const timeoutResult = waitForChildCloseWithTimeout(
+        new Promise(() => undefined),
+        100
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(timeoutResult).resolves.toEqual({ timedOut: true });
+      expect(vi.getTimerCount()).toBe(0);
+
+      await expect(
+        waitForChildCloseWithTimeout(Promise.reject(new Error("expected")), 100)
+      ).rejects.toThrow("expected");
+      expect(vi.getTimerCount()).toBe(0);
+
+      const controller = new AbortController();
+      const add = vi.spyOn(controller.signal, "addEventListener");
+      const remove = vi.spyOn(controller.signal, "removeEventListener");
+      const aborted = waitForChildCloseWithTimeout(
+        new Promise(() => undefined),
+        100,
+        cancelableDelay,
+        controller.signal
+      );
+      controller.abort();
+      await expect(aborted).rejects.toThrow("POSTGRES_HARNESS_WAIT_ABORTED");
+      expect(add).toHaveBeenCalledOnce();
+      expect(remove).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+
+      const onFire = vi.fn();
+      const delay = cancelableDelay(50, "done", onFire);
+      const completion = delay.promise;
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(completion).resolves.toBe("done");
+      delay.cancel();
+      expect(onFire).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1252,6 +1480,85 @@ describe("PID generation and unrelated sentinel", () => {
       expect(terminate).not.toHaveBeenCalled();
       expect(testProcessAlive(sentinel.pid)).toBe(true);
     } finally {
+      await stopUnrelatedSentinel(sentinel);
+    }
+  });
+
+  it("never creates kill authority from a modified state file", async () => {
+    const sentinel = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", "setInterval(()=>{},1000)"],
+      { stdio: "ignore", windowsHide: true }
+    );
+    const stateRoot = await mkdtemp(join(tmpdir(), "actustube-state-authority-"));
+    const statePath = join(stateRoot, "lifecycle-state.json");
+    const ipcCapabilitySha256 = "a".repeat(64);
+    const ownership = {
+      occurrenceId: "owned-occurrence",
+      parentPid: 2121,
+      harnessPid: 4242,
+      ipcCapabilitySha256,
+    };
+    try {
+      await writeFile(
+        statePath,
+        JSON.stringify({ pid: sentinel.pid, role: "fault-worker" }),
+        { flag: "wx" }
+      );
+      const modifiedState = JSON.parse(await readFile(statePath, "utf8"));
+      const baseEntry = {
+        pid: modifiedState.pid,
+        parentPid: ownership.harnessPid,
+        creationIdentity: "638000000000000000",
+        executablePath: "C:\\Program Files\\nodejs\\node.exe",
+        role: "fault-worker",
+        occurrenceId: ownership.occurrenceId,
+        ipcCapabilitySha256,
+      };
+      expect(
+        evaluateOwnershipRegistrationForTests(
+          { ...baseEntry, authority: "state-file" },
+          ownership
+        )
+      ).toBe(false);
+      expect(
+        evaluateOwnershipRegistrationForTests(
+          { ...baseEntry, authority: "unauthenticated" },
+          ownership
+        )
+      ).toBe(false);
+      expect(
+        evaluateOwnershipRegistrationForTests(
+          { ...baseEntry, authority: "authenticated-ipc", occurrenceId: "wrong" },
+          ownership
+        )
+      ).toBe(false);
+      expect(
+        evaluateOwnershipRegistrationForTests(
+          {
+            ...baseEntry,
+            authority: "authenticated-ipc",
+            ipcCapabilitySha256: "b".repeat(64),
+          },
+          ownership
+        )
+      ).toBe(false);
+      expect(
+        evaluateOwnershipRegistrationForTests(
+          { ...baseEntry, authority: "authenticated-ipc", parentPid: 3131 },
+          ownership
+        )
+      ).toBe(false);
+      expect(
+        evaluateOwnershipRegistrationForTests(
+          { ...baseEntry, authority: "authenticated-ipc" },
+          ownership
+        )
+      ).toBe(true);
+      expect(testProcessAlive(sentinel.pid)).toBe(true);
+    } finally {
+      await unlink(statePath);
+      await rmdir(stateRoot);
       await stopUnrelatedSentinel(sentinel);
     }
   });

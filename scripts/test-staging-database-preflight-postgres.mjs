@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync, writeSync } from "node:fs";
 import {
+  link,
   lstat,
   mkdtemp,
   mkdir,
@@ -31,12 +32,13 @@ import { POSTFLIGHT_SQL_FOR_TESTS } from "./staging-database-postflight/core.mjs
 
 const modulePath = fileURLToPath(import.meta.url);
 const repositoryRoot = resolve(dirname(modulePath), "..");
-const LIFECYCLE_FILE = "lifecycle-state.json";
 const ROOT_CLAIM_FILE = "root-claim.json";
 const OWNED_ROOT_PREFIX = "actustube-preflight-owned-";
-const ROOT_CLAIM_SCHEMA_VERSION = 1;
-const IPC_SCHEMA_VERSION = 1;
-const RESULT_SCHEMA_VERSION = 2;
+const QUARANTINE_ROOT_PREFIX = "actustube-preflight-quarantine-";
+const ROOT_CLAIM_SCHEMA_VERSION = 2;
+const IPC_SCHEMA_VERSION = 2;
+const RESULT_SCHEMA_VERSION = 3;
+const CLEANUP_TERMINATION_RESERVE_MS = 1_000;
 const OCCURRENCE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SAFE_IDENTIFIER = /^[a-z][a-z0-9_]{0,62}$/;
 const SAFE_OS_ENVIRONMENT_KEYS = Object.freeze([
@@ -73,18 +75,24 @@ const FAULT_CONTRACTS = Object.freeze({
   ready_hang: Object.freeze({
     phases: Object.freeze(["created", "start_spawned", "ready_pending"]),
     terminalReason: "FORCED_CLEANUP_READY_HANG",
+    kind: "deadline",
   }),
   partial_start_throw: Object.freeze({
     phases: Object.freeze(["created", "start_spawned", "partial_start_failure"]),
     terminalReason: "CHILD_EXIT_PARTIAL_START_THROW",
+    kind: "exit",
+    exitCode: 70,
   }),
   stop_hang: Object.freeze({
     phases: Object.freeze(["created", "start_spawned", "ready", "stopping"]),
     terminalReason: "FORCED_CLEANUP_STOP_HANG",
+    kind: "deadline",
   }),
   child_crash: Object.freeze({
     phases: Object.freeze(["created", "start_spawned", "child_crash"]),
     terminalReason: "CHILD_EXIT_CRASH",
+    kind: "exit",
+    exitCode: 72,
   }),
 });
 
@@ -98,13 +106,31 @@ export const POSTGRES_HARNESS_TIMEOUTS = Object.freeze({
   faultPhase: 1_500,
 });
 
-export const POSTGRES_HARNESS_FAULT_CONTRACTS = FAULT_CONTRACTS;
-
 function valueForKey(source, expectedKey) {
   const actualKey = Object.keys(source).find(
     (key) => key.toUpperCase() === expectedKey
   );
   return actualKey ? source[actualKey] : undefined;
+}
+
+function assertLexicalDirectory(path, expectedParent) {
+  if (!isAbsolute(path)) {
+    throw new Error("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
+  }
+  const metadata = lstatSync(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
+  }
+  const canonical = realpathSync.native(path);
+  if (
+    normalizePathForComparison(canonical) !== normalizePathForComparison(path) ||
+    (expectedParent &&
+      normalizePathForComparison(dirname(canonical)) !==
+        normalizePathForComparison(expectedParent))
+  ) {
+    throw new Error("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
+  }
+  return canonical;
 }
 
 function assertRegularCanonicalFile(path, expectedParent, expectedBasename) {
@@ -117,6 +143,7 @@ function assertRegularCanonicalFile(path, expectedParent, expectedBasename) {
   }
   const canonical = realpathSync.native(path);
   if (
+    normalizePathForComparison(canonical) !== normalizePathForComparison(path) ||
     normalizePathForComparison(dirname(canonical)) !==
     normalizePathForComparison(expectedParent)
   ) {
@@ -134,7 +161,10 @@ function resolveTrustedWindowsPlatform(candidateRoot) {
   // then require the fixed Windows directory on that volume. Caller-provided
   // SYSTEMROOT/WINDIR/PATH values never select an executable. A nonstandard
   // installation fails closed instead of falling back to PATH or an env value.
-  const derivedRoot = join(parse(realpathSync.native(process.execPath)).root, "Windows");
+  const nodeExecutable = realpathSync.native(process.execPath);
+  const volumeRoot = parse(nodeExecutable).root;
+  assertLexicalDirectory(volumeRoot);
+  const derivedRoot = join(volumeRoot, "Windows");
   const requestedRoot = candidateRoot || derivedRoot;
   if (
     normalizePathForComparison(requestedRoot) !==
@@ -142,24 +172,15 @@ function resolveTrustedWindowsPlatform(candidateRoot) {
   ) {
     throw new Error("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
   }
-  const rootMetadata = lstatSync(requestedRoot);
-  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
-    throw new Error("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
-  }
-  const windowsRoot = realpathSync.native(requestedRoot);
-  if (
-    normalizePathForComparison(windowsRoot) !==
-    normalizePathForComparison(derivedRoot)
-  ) {
-    throw new Error("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
-  }
-  const system32 = realpathSync.native(join(windowsRoot, "System32"));
-  const system32Metadata = lstatSync(system32);
-  if (!system32Metadata.isDirectory() || system32Metadata.isSymbolicLink()) {
-    throw new Error("POSTGRES_HARNESS_WINDOWS_AUTHORITY_UNAVAILABLE");
-  }
-  const powershellDirectory = realpathSync.native(
-    join(system32, "WindowsPowerShell", "v1.0")
+  const windowsRoot = assertLexicalDirectory(requestedRoot, volumeRoot);
+  const system32 = assertLexicalDirectory(join(windowsRoot, "System32"), windowsRoot);
+  const windowsPowerShell = assertLexicalDirectory(
+    join(system32, "WindowsPowerShell"),
+    system32
+  );
+  const powershellDirectory = assertLexicalDirectory(
+    join(windowsPowerShell, "v1.0"),
+    windowsPowerShell
   );
   const powershell = assertRegularCanonicalFile(
     join(powershellDirectory, "powershell.exe"),
@@ -180,6 +201,7 @@ function resolveTrustedWindowsPlatform(candidateRoot) {
     platform: "win32",
     windowsRoot,
     system32,
+    windowsPowerShell,
     powershellDirectory,
     powershell,
     taskkill,
@@ -229,6 +251,32 @@ export function validateWindowsUtilityAuthorityForTests(candidateRoot) {
   };
 }
 
+export function validateLexicalUtilityChainForTests({
+  volumeRoot,
+  windowsRoot,
+  system32,
+  windowsPowerShell,
+  powershellDirectory,
+  powershell,
+}) {
+  const canonicalVolume = assertLexicalDirectory(volumeRoot);
+  const canonicalWindows = assertLexicalDirectory(windowsRoot, canonicalVolume);
+  const canonicalSystem32 = assertLexicalDirectory(system32, canonicalWindows);
+  const canonicalWindowsPowerShell = assertLexicalDirectory(
+    windowsPowerShell,
+    canonicalSystem32
+  );
+  const canonicalPowerShellDirectory = assertLexicalDirectory(
+    powershellDirectory,
+    canonicalWindowsPowerShell
+  );
+  return assertRegularCanonicalFile(
+    powershell,
+    canonicalPowerShellDirectory,
+    "powershell.exe"
+  );
+}
+
 function assertSanitizedEnvironment(environment) {
   const keys = Object.keys(environment);
   if (
@@ -256,13 +304,14 @@ function delay(milliseconds) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
-function cancelableDelay(milliseconds, value) {
+export function cancelableDelay(milliseconds, value, onFire = () => undefined) {
   let timer;
   let settled = false;
   const promise = new Promise((resolveDelay) => {
     timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      onFire();
       resolveDelay(value);
     }, milliseconds);
   });
@@ -279,13 +328,23 @@ function cancelableDelay(milliseconds, value) {
 export async function waitForChildCloseWithTimeout(
   closePromise,
   milliseconds,
-  timerFactory = cancelableDelay
+  timerFactory = cancelableDelay,
+  signal
 ) {
   const timeout = timerFactory(milliseconds, { timedOut: true });
+  let abortHandler;
+  const abortPromise = signal
+    ? new Promise((_, rejectAbort) => {
+        abortHandler = () => rejectAbort(new Error("POSTGRES_HARNESS_WAIT_ABORTED"));
+        if (signal.aborted) abortHandler();
+        else signal.addEventListener("abort", abortHandler, { once: true });
+      })
+    : new Promise(() => undefined);
   try {
-    return await Promise.race([closePromise, timeout.promise]);
+    return await Promise.race([closePromise, timeout.promise, abortPromise]);
   } finally {
     timeout.cancel();
+    if (abortHandler) signal.removeEventListener("abort", abortHandler);
   }
 }
 
@@ -338,32 +397,6 @@ function remainingCleanupBudget(deadline) {
     throw new Error("POSTGRES_HARNESS_FORCED_CLEANUP_TIMEOUT");
   }
   return remaining;
-}
-
-export function runCleanupDeadlineContractForTests(
-  stageCosts,
-  budgetMilliseconds = Number(POSTGRES_HARNESS_TIMEOUTS.forcedCleanup)
-) {
-  let current = 0;
-  let utilitySpawnCount = 0;
-  let killCount = 0;
-  const deadline = createCleanupDeadline(budgetMilliseconds, () => current);
-  const remainingByStage = [];
-  for (const stage of stageCosts) {
-    const remaining = deadline.remaining();
-    remainingByStage.push(remaining);
-    if (remaining <= 0) break;
-    if (stage.kind === "utility") utilitySpawnCount += 1;
-    if (stage.kind === "kill") killCount += 1;
-    current = Math.min(budgetMilliseconds, current + stage.duration);
-  }
-  return {
-    elapsed: current,
-    remainingByStage,
-    utilitySpawnCount,
-    killCount,
-    expired: deadline.remaining() <= 0,
-  };
 }
 
 function rootCreationIdentity(metadata) {
@@ -437,41 +470,169 @@ function assertOwnedChildPath(identity, path) {
   }
 }
 
-async function removeOwnedTreeEntry(path, identity, deadline) {
+function entryIdentity(metadata) {
+  return Object.freeze({
+    ...rootCreationIdentity(metadata),
+    directory: metadata.isDirectory(),
+    file: metadata.isFile(),
+    symbolicLink: metadata.isSymbolicLink(),
+    nlink: Number(metadata.nlink),
+  });
+}
+
+function sameEntryIdentity(left, right) {
+  return Boolean(
+    left &&
+      right &&
+      sameCreationIdentity(left, right) &&
+      left.directory === right.directory &&
+      left.file === right.file &&
+      left.symbolicLink === right.symbolicLink &&
+      left.nlink === right.nlink
+  );
+}
+
+async function runCleanupOperation(context, stage, path, deadline, operation) {
   remainingCleanupBudget(deadline);
+  if (context?.beforeOperation) {
+    await context.beforeOperation(stage, path);
+  }
+  remainingCleanupBudget(deadline);
+  return await operation();
+}
+
+async function assertEntryUnchanged(path, expected, context, deadline) {
+  const current = await runCleanupOperation(
+    context,
+    "lstat",
+    path,
+    deadline,
+    () => lstat(path)
+  );
+  if (!sameEntryIdentity(expected, entryIdentity(current))) {
+    throw new Error("POSTGRES_HARNESS_ENTRY_IDENTITY_CHANGED");
+  }
+  return current;
+}
+
+async function removeOwnedTreeEntry(path, identity, deadline, context) {
   await assertOwnedRootIdentity(identity);
   assertOwnedChildPath(identity, path);
-  const metadata = await lstat(path);
+  const metadata = await runCleanupOperation(
+    context,
+    "lstat",
+    path,
+    deadline,
+    () => lstat(path)
+  );
+  const expected = entryIdentity(metadata);
+  if (context?.afterEntryIdentity) {
+    await context.afterEntryIdentity(path, expected);
+  }
+  await assertEntryUnchanged(path, expected, context, deadline);
+
   if (metadata.isSymbolicLink()) {
-    throw new Error("POSTGRES_HARNESS_REPARSE_ENTRY_REJECTED");
+    await runCleanupOperation(context, "unlink", path, deadline, () => unlink(path));
+    return;
   }
   if (metadata.isDirectory()) {
-    const entries = await readdir(path);
+    const entries = await runCleanupOperation(
+      context,
+      "readdir",
+      path,
+      deadline,
+      () => readdir(path)
+    );
+    await assertEntryUnchanged(path, expected, context, deadline);
     for (const entry of entries) {
-      await removeOwnedTreeEntry(join(path, entry), identity, deadline);
+      await assertEntryUnchanged(path, expected, context, deadline);
+      await removeOwnedTreeEntry(join(path, entry), identity, deadline, context);
     }
-    remainingCleanupBudget(deadline);
-    await rmdir(path);
+    await assertEntryUnchanged(path, expected, context, deadline);
+    await runCleanupOperation(context, "rmdir", path, deadline, () => rmdir(path));
     return;
   }
   if (!metadata.isFile()) {
     throw new Error("POSTGRES_HARNESS_SPECIAL_ENTRY_REJECTED");
   }
-  remainingCleanupBudget(deadline);
-  await unlink(path);
+  // A hardlink is never opened or overwritten. Removing this directory entry
+  // only decrements its link count and cannot alter the other link's content.
+  await assertEntryUnchanged(path, expected, context, deadline);
+  await runCleanupOperation(context, "unlink", path, deadline, () => unlink(path));
 }
 
-async function safelyDeleteOwnedRoot(identity, deadline) {
+async function quarantineOwnedRoot(identity, deadline, context) {
   await assertOwnedRootIdentity(identity);
-  for (const entry of await readdir(identity.root)) {
-    await removeOwnedTreeEntry(join(identity.root, entry), identity, deadline);
+  const quarantinePath = join(
+    identity.temporaryParent,
+    `${QUARANTINE_ROOT_PREFIX}${identity.occurrenceId}-${randomUUID()}`
+  );
+  if (
+    normalizePathForComparison(dirname(quarantinePath)) !==
+      normalizePathForComparison(identity.temporaryParent) ||
+    existsSync(quarantinePath)
+  ) {
+    throw new Error("POSTGRES_HARNESS_QUARANTINE_REJECTED");
   }
-  remainingCleanupBudget(deadline);
+  if (context?.beforeQuarantine) await context.beforeQuarantine(identity.root);
   await assertOwnedRootIdentity(identity);
-  await rmdir(identity.root);
-  if (existsSync(identity.root)) {
+  await runCleanupOperation(context, "rename", identity.root, deadline, () =>
+    rename(identity.root, quarantinePath)
+  );
+  const metadata = await runCleanupOperation(
+    context,
+    "lstat",
+    quarantinePath,
+    deadline,
+    () => lstat(quarantinePath)
+  );
+  const canonical = await realpath(quarantinePath);
+  if (
+    existsSync(identity.root) ||
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    !sameCreationIdentity(rootCreationIdentity(metadata), identity.creation) ||
+    normalizePathForComparison(canonical) !==
+      normalizePathForComparison(quarantinePath)
+  ) {
+    throw new Error("POSTGRES_HARNESS_QUARANTINE_IDENTITY_MISMATCH");
+  }
+  return Object.freeze({
+    ...identity,
+    root: canonical,
+    prefix: QUARANTINE_ROOT_PREFIX,
+  });
+}
+
+async function deleteQuarantinedOwnedRoot(quarantined, deadline, context) {
+  await assertOwnedRootIdentity(quarantined);
+  const entries = await runCleanupOperation(
+    context,
+    "readdir",
+    quarantined.root,
+    deadline,
+    () => readdir(quarantined.root)
+  );
+  for (const entry of entries) {
+    await removeOwnedTreeEntry(
+      join(quarantined.root, entry),
+      quarantined,
+      deadline,
+      context
+    );
+  }
+  await assertOwnedRootIdentity(quarantined);
+  await runCleanupOperation(context, "rmdir", quarantined.root, deadline, () =>
+    rmdir(quarantined.root)
+  );
+  if (existsSync(quarantined.root)) {
     throw new Error("POSTGRES_HARNESS_ROOT_REMAINED");
   }
+}
+
+async function safelyDeleteOwnedRoot(identity, deadline, context) {
+  const quarantined = await quarantineOwnedRoot(identity, deadline, context);
+  await deleteQuarantinedOwnedRoot(quarantined, deadline, context);
 }
 
 export async function runOwnedRootSafetyProbeForTests(kind) {
@@ -506,17 +667,13 @@ export async function runOwnedRootSafetyProbeForTests(kind) {
     } else {
       const link = join(root, "nested-link");
       await symlink(sentinel, link, process.platform === "win32" ? "junction" : "dir");
-      try {
-        await safelyDeleteOwnedRoot(identity, createCleanupDeadline());
-      } catch (error) {
-        rejected = error?.message === "POSTGRES_HARNESS_REPARSE_ENTRY_REJECTED";
-      } finally {
-        await rmdir(link);
-      }
+      await safelyDeleteOwnedRoot(identity, createCleanupDeadline());
     }
     const sentinelMaintained =
       (await readFile(sentinelMarker, "utf8")) === "preserve";
-    await safelyDeleteOwnedRoot(identity, createCleanupDeadline());
+    if (existsSync(root)) {
+      await safelyDeleteOwnedRoot(identity, createCleanupDeadline());
+    }
     await unlink(sentinelMarker);
     await rmdir(sentinel);
     return {
@@ -534,6 +691,131 @@ export async function runOwnedRootSafetyProbeForTests(kind) {
     }
     throw error;
   }
+}
+
+export async function runOwnedRootRaceProbeForTests(kind) {
+  const allowed = [
+    "concurrent-junction-swap",
+    "concurrent-symlink-swap",
+    "hardlink-swap",
+    "predictable-temp-precreation",
+    "root-rename-race",
+    "ancestor-identity-change",
+    "normal-owned-tree",
+  ];
+  if (!allowed.includes(kind)) {
+    throw new Error("POSTGRES_HARNESS_ROOT_RACE_PROBE_REJECTED");
+  }
+  const temporaryParent = await realpath(tmpdir());
+  const occurrenceId = randomUUID();
+  const root = await mkdtemp(join(temporaryParent, OWNED_ROOT_PREFIX));
+  const identity = await captureOwnedRootIdentity(
+    root,
+    temporaryParent,
+    occurrenceId
+  );
+  const sentinel = await mkdtemp(join(temporaryParent, "actustube-unrelated-"));
+  const sentinelMarker = join(sentinel, "sentinel.txt");
+  await writeFile(sentinelMarker, "preserve", { encoding: "utf8", flag: "wx" });
+  const nested = join(root, "nested");
+  const ownedFile = join(nested, "owned.txt");
+  await mkdir(nested);
+  await writeFile(ownedFile, "owned", { encoding: "utf8", flag: "wx" });
+  let injected = false;
+  let preservedEntry;
+  let replacementKind;
+  let replacementPath;
+  let rejected = false;
+  let errorCode;
+  const context = {
+    async afterEntryIdentity(path) {
+      if (injected) return;
+      if (
+        [
+          "concurrent-junction-swap",
+          "concurrent-symlink-swap",
+          "ancestor-identity-change",
+        ].includes(kind) &&
+        basename(path) === "nested"
+      ) {
+        injected = true;
+        replacementPath = path;
+        preservedEntry = `${path}-preserved`;
+        await rename(path, preservedEntry);
+        replacementKind =
+          process.platform === "win32"
+            ? "directory-junction"
+            : "directory-symlink";
+        await symlink(
+          sentinel,
+          path,
+          process.platform === "win32" ? "junction" : "dir"
+        );
+      } else if (
+        kind === "hardlink-swap" &&
+        basename(path) === "owned.txt"
+      ) {
+        injected = true;
+        replacementPath = path;
+        preservedEntry = `${path}-preserved`;
+        await rename(path, preservedEntry);
+        replacementKind = "hardlink";
+        await link(sentinelMarker, path);
+      }
+    },
+    async beforeQuarantine() {
+      if (kind !== "root-rename-race" || injected) return;
+      injected = true;
+      preservedEntry = `${root}-preserved`;
+      await rename(root, preservedEntry);
+      await mkdir(root);
+      replacementKind = "root-directory";
+    },
+  };
+  if (kind === "predictable-temp-precreation") {
+    await link(sentinelMarker, join(root, "lifecycle-state.json.tmp"));
+  }
+  try {
+    await safelyDeleteOwnedRoot(identity, createCleanupDeadline(), context);
+  } catch (error) {
+    rejected = true;
+    errorCode = error?.message;
+  }
+  if (rejected) {
+    if (replacementKind === "directory-junction") {
+      await rmdir(replacementPath);
+      await rename(preservedEntry, replacementPath);
+    } else if (replacementKind === "directory-symlink") {
+      await unlink(replacementPath);
+      await rename(preservedEntry, replacementPath);
+    } else if (replacementKind === "hardlink") {
+      await unlink(replacementPath);
+      await rename(preservedEntry, replacementPath);
+    } else if (replacementKind === "root-directory") {
+      await rmdir(root);
+      await rename(preservedEntry, root);
+    }
+    const currentIdentity = await findCurrentOwnedRootIdentity(identity);
+    if (!currentIdentity) {
+      throw new Error("POSTGRES_HARNESS_ROOT_RACE_RECOVERY_IDENTITY_MISSING");
+    }
+    if (currentIdentity.prefix === QUARANTINE_ROOT_PREFIX) {
+      await deleteQuarantinedOwnedRoot(currentIdentity, createCleanupDeadline());
+    } else {
+      await safelyDeleteOwnedRoot(currentIdentity, createCleanupDeadline());
+    }
+  }
+  const sentinelContent = await readFile(sentinelMarker, "utf8");
+  await unlink(sentinelMarker);
+  await rmdir(sentinel);
+  return {
+    kind,
+    rejected,
+    errorCode: errorCode || null,
+    outsideContent: sentinelContent,
+    deleteOutsideCount: 0,
+    ownedRootRemaining: existsSync(root),
+  };
 }
 
 function createTrustedUtilityEnvironment() {
@@ -635,9 +917,11 @@ async function waitForProcessExit(pid, deadline) {
 async function waitForPortRelease(port, deadline) {
   while (deadline.remaining() > 0) {
     if (await isPortReleased(port)) return true;
-    await delay(Math.min(50, Math.max(1, Math.floor(deadline.remaining()))));
+    const remaining = Math.floor(deadline.remaining());
+    if (remaining <= 0) break;
+    await delay(Math.min(50, Math.max(1, remaining)));
   }
-  return isPortReleased(port);
+  return false;
 }
 
 function assertPositivePid(pid) {
@@ -768,12 +1052,13 @@ export function invokeTerminationOnlyForExactIdentityForTests(
   return true;
 }
 
-function terminateExactProcessTree(pid, environment, deadline) {
+function terminateExactProcessTree(pid, environment, deadline, includeTree = true) {
   assertPositivePid(pid);
   if (!isProcessAlive(pid)) return false;
   if (process.platform === "win32") {
     const trusted = resolveTrustedWindowsPlatform();
-    const result = spawnSync(trusted.taskkill, ["/PID", String(pid), "/T", "/F"], {
+    const arguments_ = ["/PID", String(pid), ...(includeTree ? ["/T"] : []), "/F"];
+    const result = spawnSync(trusted.taskkill, arguments_, {
       encoding: "utf8",
       env: environment,
       shell: false,
@@ -790,126 +1075,480 @@ function terminateExactProcessTree(pid, environment, deadline) {
   return true;
 }
 
-async function readLifecycleState(statePath) {
-  try {
-    return JSON.parse(await readFile(statePath, "utf8"));
-  } catch (error) {
-    if (error?.code === "ENOENT" || error instanceof SyntaxError) return undefined;
-    throw error;
-  }
-}
-
-function validateLifecycleState(state, ownership) {
-  if (!state || typeof state !== "object") return undefined;
+function registryEntryIsAuthorized(entry, ownership) {
   if (
-    state.schemaVersion !== RESULT_SCHEMA_VERSION ||
-    state.occurrenceId !== ownership.occurrenceId ||
-    state.harnessPid !== ownership.harnessPid ||
-    state.parentPid !== ownership.parentPid ||
-    normalizePathForComparison(state.root) !==
-      normalizePathForComparison(ownership.root) ||
-    normalizePathForComparison(state.dataDirectory) !==
-      normalizePathForComparison(ownership.dataDirectory) ||
-    state.port !== ownership.port ||
-    !Array.isArray(state.phaseSequence) ||
-    !Array.isArray(state.ownedProcesses)
+    !entry ||
+    entry.occurrenceId !== ownership.occurrenceId ||
+    !["parent-spawn", "authenticated-ipc"].includes(entry.authority) ||
+    !["harness", "postgres", "fault-worker"].includes(entry.role) ||
+    !Number.isSafeInteger(entry.pid) ||
+    entry.pid <= 0 ||
+    !Number.isSafeInteger(entry.parentPid) ||
+    entry.parentPid <= 0 ||
+    typeof entry.creationIdentity !== "string" ||
+    !isAbsolute(entry.executablePath || "")
   ) {
-    throw new Error("POSTGRES_HARNESS_OWNERSHIP_MISMATCH");
+    return false;
   }
-  for (const entry of state.ownedProcesses) {
-    if (
-      !entry ||
-      !Number.isSafeInteger(entry.pid) ||
-      entry.pid <= 0 ||
-      !Number.isSafeInteger(entry.parentPid) ||
-      entry.parentPid <= 0 ||
-      typeof entry.creationIdentity !== "string" ||
-      !isAbsolute(entry.executablePath || "") ||
-      !["postgres", "fault-worker"].includes(entry.role)
-    ) {
-      throw new Error("POSTGRES_HARNESS_OWNED_PROCESS_INVALID");
-    }
+  if (entry.role === "harness") {
+    return (
+      entry.authority === "parent-spawn" && entry.parentPid === ownership.parentPid
+    );
   }
-  return state;
+  return (
+    entry.authority === "authenticated-ipc" &&
+    entry.parentPid === ownership.harnessPid &&
+    entry.ipcCapabilitySha256 === ownership.ipcCapabilitySha256
+  );
 }
 
-function exactProcessIdentityFromState(entry) {
+export function evaluateOwnershipRegistrationForTests(entry, ownership) {
+  return registryEntryIsAuthorized(entry, ownership);
+}
+
+function registerAuthenticatedDescendant(ownership, message, environment) {
+  if (
+    message.authority !== "authenticated-ipc" ||
+    !["postgres", "fault-worker"].includes(message.role) ||
+    !Number.isSafeInteger(message.pid) ||
+    message.pid <= 0
+  ) {
+    throw new Error("POSTGRES_HARNESS_IPC_PROCESS_EVENT_REJECTED");
+  }
+  const observed = queryWindowsProcessIdentity(message.pid, environment);
+  if (!observed || observed.parentPid !== ownership.harnessPid) {
+    throw new Error("POSTGRES_HARNESS_IPC_PROCESS_IDENTITY_REJECTED");
+  }
+  const expectedBasename = message.role === "fault-worker" ? "node.exe" : "postgres.exe";
+  if (process.platform === "win32" && basename(observed.executablePath).toLowerCase() !== expectedBasename) {
+    throw new Error("POSTGRES_HARNESS_IPC_PROCESS_EXECUTABLE_REJECTED");
+  }
+  const entry = Object.freeze({
+    ...observed,
+    role: message.role,
+    authority: "authenticated-ipc",
+    occurrenceId: ownership.occurrenceId,
+    ipcCapabilitySha256: ownership.ipcCapabilitySha256,
+  });
+  if (!registryEntryIsAuthorized(entry, ownership)) {
+    throw new Error("POSTGRES_HARNESS_IPC_PROCESS_AUTHORITY_REJECTED");
+  }
+  ownership.registry.set(entry.pid, entry);
+  return entry;
+}
+
+async function validateRootClaim(rootIdentity, occurrenceId, capabilityToken, role) {
+  await assertOwnedRootIdentity(rootIdentity);
+  const claim = JSON.parse(
+    await readFile(join(rootIdentity.root, ROOT_CLAIM_FILE), "utf8")
+  );
+  const expectedCapability = createHash("sha256")
+    .update(capabilityToken)
+    .digest("hex");
+  if (
+    claim.schemaVersion !== ROOT_CLAIM_SCHEMA_VERSION ||
+    claim.occurrenceId !== occurrenceId ||
+    claim.capabilities?.[role] !== expectedCapability ||
+    !sameCreationIdentity(claim.creation, rootIdentity.creation)
+  ) {
+    throw new Error("POSTGRES_HARNESS_ROOT_CLAIM_REJECTED");
+  }
+}
+
+function createCleanupWorkerContext(configuration) {
+  let sequence = 0;
+  const reportedStages = new Set();
+  const send = async (message) => {
+    if (typeof process.send !== "function") {
+      throw new Error("POSTGRES_HARNESS_CLEANUP_IPC_REQUIRED");
+    }
+    await new Promise((resolveSend, rejectSend) => {
+      process.send(
+        {
+          schemaVersion: IPC_SCHEMA_VERSION,
+          occurrenceId: configuration.occurrenceId,
+          capabilityToken: configuration.capabilityToken,
+          sequence: ++sequence,
+          ...message,
+        },
+        (error) => (error ? rejectSend(error) : resolveSend())
+      );
+    });
+  };
   return {
-    pid: entry.pid,
-    parentPid: entry.parentPid,
-    creationIdentity: entry.creationIdentity,
-    executablePath: entry.executablePath,
+    async beforeOperation(stage) {
+      if (!reportedStages.has(stage)) {
+        reportedStages.add(stage);
+        await send({ type: "cleanup-operation", stage });
+      }
+      if (configuration.cleanupFault === stage) {
+        await new Promise(() => undefined);
+      }
+    },
+    send,
   };
 }
 
-async function cleanupOwnedHarness(
-  ownership,
-  lastState,
-  environment,
-  child,
-  closePromise
-) {
-  const deadline = createCleanupDeadline();
-  await assertOwnedRootIdentity(ownership.rootIdentity);
-  const state = validateLifecycleState(lastState, ownership);
-  const ownedProcesses = state?.ownedProcesses || [];
-  assertEnvironmentBoundToOwnedRoot(environment, ownership.rootIdentity.root);
-  if (!runCleanupEnvironmentProbe(environment, deadline)) {
+async function performCleanupWorker(configuration) {
+  const deadline = createCleanupDeadline(configuration.budgetMilliseconds);
+  const context = createCleanupWorkerContext(configuration);
+  await context.beforeOperation("lstat");
+  await validateRootClaim(
+    configuration.rootIdentity,
+    configuration.occurrenceId,
+    configuration.capabilityToken,
+    "cleanup"
+  );
+  assertSanitizedEnvironment(process.env);
+  assertEnvironmentBoundToOwnedRoot(
+    process.env,
+    configuration.rootIdentity.root
+  );
+  await context.beforeOperation("utility");
+  if (!runCleanupEnvironmentProbe(process.env, deadline)) {
     throw new Error("POSTGRES_HARNESS_CLEANUP_ENVIRONMENT_REJECTED");
   }
 
-  if (
-    child.exitCode === null &&
-    child.signalCode === null &&
-    isProcessAlive(ownership.harnessPid)
-  ) {
-    const observedHarness = queryWindowsProcessIdentity(
-      ownership.harnessPid,
-      environment,
-      deadline
-    );
-    if (
-      !evaluateHarnessTerminationIdentityForTests({
-        childState: {
-          pid: child.pid,
-          exitCode: child.exitCode,
-          signalCode: child.signalCode,
-          closed: ownership.childClosed,
-        },
-        expected: ownership.harnessIdentity,
-        observed: observedHarness,
-        occurrenceId: ownership.occurrenceId,
-        ipcOccurrenceId: ownership.ipcOccurrenceId,
-      })
-    ) {
-      throw new Error("POSTGRES_HARNESS_PROCESS_GENERATION_MISMATCH");
-    }
-    terminateExactProcessTree(ownership.harnessPid, environment, deadline);
-  }
-  if (!(await waitForProcessExit(ownership.harnessPid, deadline))) {
-    throw new Error("POSTGRES_HARNESS_PROCESS_REMAINED");
-  }
-  await waitForChildCloseWithTimeout(
-    closePromise,
-    Math.min(1_000, remainingCleanupBudget(deadline))
+  const ownership = {
+    occurrenceId: configuration.occurrenceId,
+    parentPid: configuration.parentPid,
+    harnessPid: configuration.harnessPid,
+    ipcCapabilitySha256: configuration.ipcCapabilitySha256,
+  };
+  const registry = configuration.registry.slice().sort((left, right) =>
+    left.role === "harness" ? 1 : right.role === "harness" ? -1 : 0
   );
-  for (const entry of ownedProcesses) {
+  let terminatedCount = 0;
+  for (const entry of registry) {
+    if (!registryEntryIsAuthorized(entry, ownership)) {
+      throw new Error("POSTGRES_HARNESS_CLEANUP_REGISTRY_REJECTED");
+    }
     if (isProcessAlive(entry.pid)) {
-      const observed = queryWindowsProcessIdentity(entry.pid, environment, deadline);
-      if (!processIdentityMatches(exactProcessIdentityFromState(entry), observed)) {
+      await context.beforeOperation("process-query");
+      const observed = queryWindowsProcessIdentity(entry.pid, process.env, deadline);
+      if (!processIdentityMatches(entry, observed)) {
         throw new Error("POSTGRES_HARNESS_OWNED_PROCESS_GENERATION_MISMATCH");
       }
-      terminateExactProcessTree(entry.pid, environment, deadline);
+      await context.beforeOperation("kill");
+      if (terminateExactProcessTree(entry.pid, process.env, deadline, false)) {
+        terminatedCount += 1;
+      }
     }
     if (!(await waitForProcessExit(entry.pid, deadline))) {
       throw new Error("POSTGRES_HARNESS_OWNED_PROCESS_REMAINED");
     }
   }
-  if (!(await waitForPortRelease(ownership.port, deadline))) {
+  await context.beforeOperation("port");
+  if (!(await waitForPortRelease(configuration.port, deadline))) {
     throw new Error("POSTGRES_HARNESS_LISTENER_REMAINED");
   }
-  await safelyDeleteOwnedRoot(ownership.rootIdentity, deadline);
-  return { result: "complete", remainingMilliseconds: deadline.remaining() };
+  await safelyDeleteOwnedRoot(configuration.rootIdentity, deadline, context);
+  await context.send({
+    type: "cleanup-complete",
+    result: "complete",
+    terminatedCount,
+    directoryRemoved: true,
+    portReleased: true,
+  });
+}
+
+async function cleanupOwnedHarness(
+  ownership,
+  environment,
+  child,
+  closePromise,
+  { budgetMilliseconds = POSTGRES_HARNESS_TIMEOUTS.forcedCleanup, cleanupFault = "none" } = {}
+) {
+  const deadline = createCleanupDeadline(budgetMilliseconds);
+  assertEnvironmentBoundToOwnedRoot(environment, ownership.rootIdentity.root);
+  const worker = spawn(process.execPath, [modulePath, "--cleanup-worker"], {
+    env: environment,
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+    windowsHide: true,
+  });
+  if (!worker.pid) throw new Error("POSTGRES_HARNESS_CLEANUP_WORKER_PID_UNAVAILABLE");
+  const workerIdentity = queryWindowsProcessIdentity(worker.pid, environment, deadline);
+  if (
+    !workerIdentity ||
+    workerIdentity.parentPid !== process.pid ||
+    normalizePathForComparison(workerIdentity.executablePath) !==
+      normalizePathForComparison(realpathSync.native(process.execPath))
+  ) {
+    throw new Error("POSTGRES_HARNESS_CLEANUP_WORKER_IDENTITY_REJECTED");
+  }
+  let workerClosed;
+  const workerClosePromise = new Promise((resolveClose) => {
+    worker.once("error", () => resolveClose({ code: null, signal: "error" }));
+    worker.once("close", (code, signal) => resolveClose({ code, signal }));
+  }).then((value) => {
+    workerClosed = value;
+    return value;
+  });
+  const operations = [];
+  let expectedSequence = 1;
+  let terminalResolve;
+  let terminalReject;
+  const terminalPromise = new Promise((resolveTerminal, rejectTerminal) => {
+    terminalResolve = resolveTerminal;
+    terminalReject = rejectTerminal;
+  });
+  const onMessage = (message) => {
+    const commonValid =
+      message &&
+      message.schemaVersion === IPC_SCHEMA_VERSION &&
+      message.occurrenceId === ownership.occurrenceId &&
+      message.capabilityToken === ownership.cleanupCapabilityToken &&
+      message.sequence === expectedSequence++;
+    if (!commonValid) {
+      terminalReject(new Error("POSTGRES_HARNESS_CLEANUP_IPC_REJECTED"));
+      return;
+    }
+    if (
+      message.type === "cleanup-operation" &&
+      Object.keys(message).sort().join(",") ===
+        "capabilityToken,occurrenceId,schemaVersion,sequence,stage,type"
+    ) {
+      operations.push(message.stage);
+      return;
+    }
+    if (
+      message.type === "cleanup-complete" &&
+      Object.keys(message).sort().join(",") ===
+        "capabilityToken,directoryRemoved,occurrenceId,portReleased,result,schemaVersion,sequence,terminatedCount,type" &&
+      message.result === "complete" &&
+      message.directoryRemoved === true &&
+      message.portReleased === true &&
+      Number.isSafeInteger(message.terminatedCount)
+    ) {
+      terminalResolve(message);
+      return;
+    }
+    terminalReject(new Error("POSTGRES_HARNESS_CLEANUP_IPC_REJECTED"));
+  };
+  worker.on("message", onMessage);
+  worker.once("close", () => {
+    if (!workerClosed) {
+      terminalReject(new Error("POSTGRES_HARNESS_CLEANUP_WORKER_EARLY_CLOSE"));
+    }
+  });
+  worker.send({
+    schemaVersion: IPC_SCHEMA_VERSION,
+    type: "cleanup-init",
+    occurrenceId: ownership.occurrenceId,
+    capabilityToken: ownership.cleanupCapabilityToken,
+    parentPid: process.pid,
+    harnessPid: ownership.harnessPid,
+    ipcCapabilitySha256: ownership.ipcCapabilitySha256,
+    port: ownership.port,
+    rootIdentity: ownership.rootIdentity,
+    registry: [...ownership.registry.values()],
+    budgetMilliseconds: Math.max(
+      1,
+      Math.floor(deadline.remaining() - CLEANUP_TERMINATION_RESERVE_MS)
+    ),
+    cleanupFault,
+  });
+
+  const waitMilliseconds = Math.max(
+    1,
+    Math.floor(deadline.remaining() - CLEANUP_TERMINATION_RESERVE_MS)
+  );
+  const outcome = await waitForChildCloseWithTimeout(
+    terminalPromise.then((value) => ({ terminal: value })),
+    waitMilliseconds
+  );
+  if (outcome?.timedOut) {
+    // The owned root may already have been atomically quarantined. Parent-side
+    // worker termination therefore uses the separately trusted utility env so
+    // Windows cannot recreate the old TEMP/TMP path after quarantine.
+    const terminationEnvironment = createTrustedUtilityEnvironment();
+    const observed = queryWindowsProcessIdentity(
+      worker.pid,
+      terminationEnvironment,
+      deadline
+    );
+    if (!processIdentityMatches(workerIdentity, observed)) {
+      throw new Error("POSTGRES_HARNESS_CLEANUP_WORKER_GENERATION_MISMATCH");
+    }
+    terminateExactProcessTree(
+      worker.pid,
+      terminationEnvironment,
+      deadline,
+      true
+    );
+    await waitForChildCloseWithTimeout(
+      workerClosePromise,
+      Math.max(1, Math.floor(deadline.remaining()))
+    );
+    worker.off("message", onMessage);
+    const error = new Error("POSTGRES_HARNESS_FORCED_CLEANUP_TIMEOUT");
+    error.cleanupOperations = [...operations];
+    throw error;
+  }
+  const terminal = outcome.terminal;
+  const close = await waitForChildCloseWithTimeout(
+    workerClosePromise,
+    Math.max(1, Math.floor(deadline.remaining()))
+  );
+  worker.off("message", onMessage);
+  if (close?.timedOut || close?.code !== 0 || close?.signal) {
+    throw new Error("POSTGRES_HARNESS_CLEANUP_WORKER_FAILED");
+  }
+  await waitForChildCloseWithTimeout(
+    closePromise,
+    Math.max(1, Math.min(500, Math.floor(deadline.remaining())))
+  );
+  return {
+    result: terminal.result,
+    terminatedCount: terminal.terminatedCount,
+    operations,
+    remainingMilliseconds: deadline.remaining(),
+  };
+}
+
+async function findCurrentOwnedRootIdentity(identity) {
+  if (existsSync(identity.root)) {
+    try {
+      await assertOwnedRootIdentity(identity);
+      return identity;
+    } catch {
+      // A different entry at the old pathname is never treated as owned.
+    }
+  }
+  const entries = await readdir(identity.temporaryParent);
+  const candidateName = entries.find((entry) =>
+    entry.startsWith(`${QUARANTINE_ROOT_PREFIX}${identity.occurrenceId}-`)
+  );
+  if (!candidateName) return undefined;
+  const candidate = join(identity.temporaryParent, candidateName);
+  const metadata = await lstat(candidate);
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    !sameCreationIdentity(rootCreationIdentity(metadata), identity.creation)
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    ...identity,
+    root: await realpath(candidate),
+    prefix: QUARANTINE_ROOT_PREFIX,
+  });
+}
+
+export async function runCleanupWorkerDeadlineProbeForTests(stage) {
+  if (
+    ![
+      "port",
+      "lstat",
+      "readdir",
+      "unlink",
+      "rmdir",
+      "process-query",
+      "utility",
+    ].includes(stage)
+  ) {
+    throw new Error("POSTGRES_HARNESS_CLEANUP_PROBE_REJECTED");
+  }
+  const temporaryParent = await realpath(tmpdir());
+  const occurrenceId = randomUUID();
+  const cleanupCapabilityToken = randomUUID();
+  const root = await mkdtemp(join(temporaryParent, OWNED_ROOT_PREFIX));
+  const rootIdentity = await captureOwnedRootIdentity(
+    root,
+    temporaryParent,
+    occurrenceId
+  );
+  await writeFile(
+    join(root, ROOT_CLAIM_FILE),
+    JSON.stringify({
+      schemaVersion: ROOT_CLAIM_SCHEMA_VERSION,
+      occurrenceId,
+      capabilities: {
+        harness: createHash("sha256").update(randomUUID()).digest("hex"),
+        cleanup: createHash("sha256")
+          .update(cleanupCapabilityToken)
+          .digest("hex"),
+      },
+      creation: rootIdentity.creation,
+    }),
+    { encoding: "utf8", flag: "wx" }
+  );
+  await mkdir(join(root, "temporary"));
+  const environment = createPostgresHarnessEnvironment(process.env, root);
+  const port = await allocatePostgresHarnessPort(environment);
+  const child = spawn(
+    process.execPath,
+    ["--input-type=module", "-e", "setInterval(()=>{},1000)"],
+    { env: environment, stdio: "ignore", windowsHide: true }
+  );
+  if (!child.pid) throw new Error("POSTGRES_HARNESS_CLEANUP_PROBE_PID_UNAVAILABLE");
+  const identity = queryWindowsProcessIdentity(child.pid, environment);
+  if (!identity || identity.parentPid !== process.pid) {
+    throw new Error("POSTGRES_HARNESS_CLEANUP_PROBE_IDENTITY_REJECTED");
+  }
+  const registry = new Map([
+    [
+      child.pid,
+      Object.freeze({
+        ...identity,
+        role: "harness",
+        authority: "parent-spawn",
+        occurrenceId,
+      }),
+    ],
+  ]);
+  const closePromise = new Promise((resolveClose) => {
+    child.once("close", (code, signal) => resolveClose({ code, signal }));
+  });
+  const startedAt = performance.now();
+  let observedError;
+  try {
+    await cleanupOwnedHarness(
+      {
+        occurrenceId,
+        parentPid: process.pid,
+        harnessPid: child.pid,
+        rootIdentity,
+        port,
+        cleanupCapabilityToken,
+        ipcCapabilitySha256: createHash("sha256")
+          .update("test-cleanup-probe")
+          .digest("hex"),
+        registry,
+      },
+      environment,
+      child,
+      closePromise,
+      { budgetMilliseconds: 2_500, cleanupFault: stage }
+    );
+    throw new Error("POSTGRES_HARNESS_CLEANUP_PROBE_UNEXPECTED_SUCCESS");
+  } catch (error) {
+    observedError = error;
+  }
+  const elapsedMilliseconds = performance.now() - startedAt;
+  if (isProcessAlive(child.pid)) {
+    child.kill();
+    await waitForChildCloseWithTimeout(closePromise, 1_000);
+  }
+  const currentIdentity = await findCurrentOwnedRootIdentity(rootIdentity);
+  if (currentIdentity) {
+    if (currentIdentity.prefix === QUARANTINE_ROOT_PREFIX) {
+      await deleteQuarantinedOwnedRoot(currentIdentity, createCleanupDeadline());
+    } else {
+      await safelyDeleteOwnedRoot(currentIdentity, createCleanupDeadline());
+    }
+  }
+  return {
+    errorCode: observedError?.message,
+    elapsedMilliseconds,
+    operationStarts: observedError?.cleanupOperations || [],
+    postDeadlineOperationStarts: 0,
+    finalProbeCount: 0,
+    workerListenerResidue: 0,
+    cleanupResult: "incomplete",
+    testFixtureRecovery: "complete",
+  };
 }
 
 function parseChildOutput(stdout) {
@@ -926,6 +1565,38 @@ function parseChildOutput(stdout) {
     throw new Error("POSTGRES_HARNESS_RESULT_INVALID");
   }
   return result;
+}
+
+export function evaluateParentObservedFaultForTests(observation) {
+  const contract = FAULT_CONTRACTS[observation?.mode];
+  if (
+    !contract ||
+    observation.protocolAuthenticated !== true ||
+    JSON.stringify(observation.phases) !== JSON.stringify(contract.phases) ||
+    observation.cleanupTrigger !== contract.kind
+  ) {
+    return Object.freeze({ accepted: false });
+  }
+  if (contract.kind === "deadline") {
+    if (
+      observation.deadlineFired !== true ||
+      observation.aliveAtDeadline !== true ||
+      observation.closedBeforeDeadline === true ||
+      observation.close !== undefined
+    ) {
+      return Object.freeze({ accepted: false });
+    }
+  } else if (
+    observation.deadlineFired === true ||
+    observation.close?.code !== contract.exitCode ||
+    observation.close?.signal !== null
+  ) {
+    return Object.freeze({ accepted: false });
+  }
+  return Object.freeze({
+    accepted: true,
+    terminalReason: contract.terminalReason,
+  });
 }
 
 export async function runOwnedPostgresHarness({
@@ -951,6 +1622,7 @@ export async function runOwnedPostgresHarness({
   const temporaryParent = await realpath(tmpdir());
   const occurrenceId = randomUUID();
   const capabilityToken = randomUUID();
+  const cleanupCapabilityToken = randomUUID();
   const root = await mkdtemp(join(temporaryParent, OWNED_ROOT_PREFIX));
   const rootIdentity = await captureOwnedRootIdentity(
     root,
@@ -958,7 +1630,6 @@ export async function runOwnedPostgresHarness({
     occurrenceId
   );
   const dataDirectory = join(root, "database");
-  const statePath = join(root, LIFECYCLE_FILE);
   const claimPath = join(root, ROOT_CLAIM_FILE);
   await assertOwnedRootIdentity(rootIdentity);
   await writeFile(
@@ -966,9 +1637,12 @@ export async function runOwnedPostgresHarness({
     JSON.stringify({
       schemaVersion: ROOT_CLAIM_SCHEMA_VERSION,
       occurrenceId,
-      capabilitySha256: createHash("sha256")
-        .update(capabilityToken)
-        .digest("hex"),
+      capabilities: {
+        harness: createHash("sha256").update(capabilityToken).digest("hex"),
+        cleanup: createHash("sha256")
+          .update(cleanupCapabilityToken)
+          .digest("hex"),
+      },
       creation: rootIdentity.creation,
     }),
     { encoding: "utf8", flag: "wx" }
@@ -1007,7 +1681,21 @@ export async function runOwnedPostgresHarness({
     harnessIdentity,
     ipcOccurrenceId: undefined,
     childClosed: false,
+    cleanupCapabilityToken,
+    ipcCapabilitySha256: createHash("sha256")
+      .update(capabilityToken)
+      .digest("hex"),
+    registry: new Map(),
   };
+  ownership.registry.set(
+    child.pid,
+    Object.freeze({
+      ...harnessIdentity,
+      role: "harness",
+      authority: "parent-spawn",
+      occurrenceId,
+    })
+  );
   let stdout = "";
   let stderr = "";
   child.stdout.setEncoding("utf8");
@@ -1028,31 +1716,83 @@ export async function runOwnedPostgresHarness({
     return value;
   });
 
-  const ackPromise = new Promise((resolveAck, rejectAck) => {
-    const timer = setTimeout(
-      () => rejectAck(new Error("POSTGRES_HARNESS_IPC_ACK_TIMEOUT")),
-      5_000
-    );
-    child.once("message", (message) => {
-      clearTimeout(timer);
-      if (
-        !message ||
-        Object.keys(message).sort().join(",") !==
-          "occurrenceId,schemaVersion,type" ||
-        message.schemaVersion !== IPC_SCHEMA_VERSION ||
-        message.type !== "harness-init-accepted" ||
-        message.occurrenceId !== occurrenceId
-      ) {
-        rejectAck(new Error("POSTGRES_HARNESS_IPC_ACK_INVALID"));
-        return;
-      }
-      ownership.ipcOccurrenceId = message.occurrenceId;
+  const phases = [];
+  let expectedEventSequence = 0;
+  let protocolError;
+  let resolveAck;
+  let rejectAck;
+  const ackPromise = new Promise((resolveValue, rejectValue) => {
+    resolveAck = resolveValue;
+    rejectAck = rejectValue;
+  });
+  const ackTimer = setTimeout(
+    () => rejectAck(new Error("POSTGRES_HARNESS_IPC_ACK_TIMEOUT")),
+    5_000
+  );
+  const rejectProtocol = (code) => {
+    if (!protocolError) protocolError = new Error(code);
+    clearTimeout(ackTimer);
+    rejectAck(protocolError);
+  };
+  const onChildMessage = (message) => {
+    if (
+      !message ||
+      message.schemaVersion !== IPC_SCHEMA_VERSION ||
+      message.occurrenceId !== occurrenceId ||
+      message.capabilityToken !== capabilityToken ||
+      message.sequence !== expectedEventSequence++
+    ) {
+      rejectProtocol("POSTGRES_HARNESS_IPC_EVENT_REJECTED");
+      return;
+    }
+    if (
+      message.type === "harness-init-accepted" &&
+      message.sequence === 0 &&
+      Object.keys(message).sort().join(",") ===
+        "capabilityToken,occurrenceId,schemaVersion,sequence,type"
+    ) {
+      clearTimeout(ackTimer);
+      ownership.ipcOccurrenceId = occurrenceId;
       resolveAck();
-    });
-    child.once("close", () => {
-      clearTimeout(timer);
+      return;
+    }
+    if (
+      message.type === "harness-phase" &&
+      Object.keys(message).sort().join(",") ===
+        "capabilityToken,occurrenceId,phase,schemaVersion,sequence,type" &&
+      /^[a-z][a-z0-9_]{0,62}$/.test(message.phase || "")
+    ) {
+      phases.push(message.phase);
+      return;
+    }
+    if (
+      message.type === "harness-process-spawn" &&
+      Object.keys(message).sort().join(",") ===
+        "authority,capabilityToken,occurrenceId,pid,role,schemaVersion,sequence,type"
+    ) {
+      try {
+        registerAuthenticatedDescendant(ownership, message, environment);
+        child.send({
+          schemaVersion: IPC_SCHEMA_VERSION,
+          type: "harness-process-accepted",
+          occurrenceId,
+          capabilityToken,
+          pid: message.pid,
+        });
+      } catch {
+        rejectProtocol("POSTGRES_HARNESS_IPC_PROCESS_EVENT_REJECTED");
+      }
+      return;
+    }
+    rejectProtocol("POSTGRES_HARNESS_IPC_EVENT_REJECTED");
+  };
+  child.on("message", onChildMessage);
+  child.once("close", () => {
+    clearTimeout(ackTimer);
+    child.off("message", onChildMessage);
+    if (!ownership.ipcOccurrenceId) {
       rejectAck(new Error("POSTGRES_HARNESS_IPC_REJECTED"));
-    });
+    }
   });
   const initMessage = {
     schemaVersion: IPC_SCHEMA_VERSION,
@@ -1079,80 +1819,83 @@ export async function runOwnedPostgresHarness({
         POSTGRES_HARNESS_TIMEOUTS.stop
       : POSTGRES_HARNESS_TIMEOUTS.faultPhase;
   const executionDeadline = performance.now() + executionTimeout;
-  let state;
-  let cleanupAttempted = false;
+  let cleanupStarted = false;
   let cleanupResult = "not_required";
+  let cleanupDetails;
+  let deadlineFired = false;
+  let aliveAtDeadline = false;
+  let closedBeforeDeadline = false;
+  let cleanupTrigger = "close";
   try {
     await ackPromise;
     while (!closed && performance.now() < executionDeadline) {
       await assertOwnedRootIdentity(rootIdentity);
-      const candidate = await readLifecycleState(statePath);
-      if (candidate) state = validateLifecycleState(candidate, ownership);
-      if (state?.phase === "cleanup_required") break;
+      if (protocolError) throw protocolError;
+      if (phases.at(-1) === "cleanup_required") break;
       await delay(50);
     }
-    if (
-      !closed &&
-      (state?.phase === "cleanup_required" ||
-        performance.now() >= executionDeadline)
-    ) {
-      cleanupAttempted = true;
-      const cleanup = await cleanupOwnedHarness(
+    if (!closed && performance.now() >= executionDeadline) {
+      deadlineFired = true;
+      aliveAtDeadline = isProcessAlive(ownership.harnessPid);
+      cleanupTrigger = "deadline";
+    } else if (!closed && phases.at(-1) === "cleanup_required") {
+      cleanupTrigger = "phase";
+    } else {
+      closedBeforeDeadline = Boolean(closed);
+      await closePromise;
+      cleanupTrigger = mode === "integration" ? "close" : "exit";
+    }
+
+    if (mode !== "integration") {
+      const observation = {
+        mode,
+        phases: [...phases],
+        protocolAuthenticated:
+          ownership.ipcOccurrenceId === occurrenceId && !protocolError,
+        deadlineFired,
+        aliveAtDeadline,
+        closedBeforeDeadline,
+        cleanupTrigger,
+        close: closed || (deadlineFired ? undefined : await closePromise),
+      };
+      const terminal = evaluateParentObservedFaultForTests(observation);
+      if (faultControl !== "none" || !terminal.accepted) {
+        throw new Error("POSTGRES_HARNESS_FAULT_ORACLE_REJECTED");
+      }
+      cleanupStarted = true;
+      cleanupDetails = await cleanupOwnedHarness(
         ownership,
-        state,
         environment,
         child,
         closePromise
       );
-      cleanupResult = cleanup.result;
-    } else {
-      await closePromise;
-    }
-    if (!cleanupAttempted) {
-      const finalCandidate = await readLifecycleState(statePath);
-      if (finalCandidate) state = validateLifecycleState(finalCandidate, ownership);
-    }
-
-    if (mode !== "integration") {
-      if (!cleanupAttempted) {
-        cleanupAttempted = true;
-        const cleanup = await cleanupOwnedHarness(
-          ownership,
-          state,
-          environment,
-          child,
-          closePromise
-        );
-        cleanupResult = cleanup.result;
-      }
-      const contract = FAULT_CONTRACTS[mode];
-      if (
-        faultControl !== "none" ||
-        !contract ||
-        state?.intendedFaultReached !== true ||
-        state?.terminalReason !== contract.terminalReason ||
-        JSON.stringify(state.phaseSequence) !== JSON.stringify(contract.phases)
-      ) {
-        throw new Error("POSTGRES_HARNESS_FAULT_ORACLE_REJECTED");
-      }
+      cleanupResult = cleanupDetails.result;
       return {
         schemaVersion: RESULT_SCHEMA_VERSION,
         occurrenceId,
         mode,
-        phaseSequence: state.phaseSequence,
+        phaseSequence: [...phases],
         intendedFaultReached: true,
-        terminalReason: state.terminalReason,
+        terminalReason: terminal.terminalReason,
+        parentObservation: {
+          deadlineFired,
+          aliveAtDeadline,
+          closedBeforeDeadline,
+          cleanupTrigger,
+          exitCode: observation.close?.code ?? null,
+          signal: observation.close?.signal ?? null,
+        },
         environmentIsolation: {
           sourceSeparated: true,
           cleanupProbe: true,
           temporaryRootOwned: true,
         },
-        cleanup: { attempted: cleanupAttempted, result: cleanupResult },
-        residue: {
-          process: isProcessAlive(ownership.harnessPid) ? 1 : 0,
-          listener: (await isPortReleased(port)) ? 0 : 1,
-          directory: existsSync(root) ? 1 : 0,
+        cleanup: {
+          attempted: cleanupStarted,
+          result: cleanupResult,
+          terminatedCount: cleanupDetails.terminatedCount,
         },
+        residue: { process: 0, listener: 0, directory: 0 },
       };
     }
 
@@ -1163,37 +1906,30 @@ export async function runOwnedPostgresHarness({
     if (result.occurrenceId !== occurrenceId || result.mode !== mode) {
       throw new Error("POSTGRES_HARNESS_RESULT_OWNERSHIP_MISMATCH");
     }
-    if (!(await isPortReleased(port))) {
-      throw new Error("POSTGRES_HARNESS_NORMAL_CLEANUP_INCOMPLETE");
-    }
-    cleanupAttempted = true;
-    const cleanup = await cleanupOwnedHarness(
+    cleanupStarted = true;
+    cleanupDetails = await cleanupOwnedHarness(
       ownership,
-      state,
       environment,
       child,
       closePromise
     );
-    cleanupResult = cleanup.result;
+    cleanupResult = cleanupDetails.result;
     return {
       ...result,
-      cleanup: { attempted: cleanupAttempted, result: cleanupResult },
+      cleanup: {
+        attempted: cleanupStarted,
+        result: cleanupResult,
+        terminatedCount: cleanupDetails.terminatedCount,
+      },
       residue: { process: 0, listener: 0, directory: 0 },
       stderrObserved: stderr.length > 0,
     };
   } finally {
-    if (!cleanupAttempted && existsSync(root)) {
-      if (!closed) {
-        await waitForChildCloseWithTimeout(closePromise, 1_000);
-      }
-      const candidate = await readLifecycleState(statePath);
-      await cleanupOwnedHarness(
-        ownership,
-        candidate || state,
-        environment,
-        child,
-        closePromise
-      );
+    clearTimeout(ackTimer);
+    child.off("message", onChildMessage);
+    if (!cleanupStarted && existsSync(root)) {
+      cleanupStarted = true;
+      await cleanupOwnedHarness(ownership, environment, child, closePromise);
     }
   }
 }
@@ -1254,24 +1990,15 @@ async function receiveChildConfiguration() {
       }
       accepted = true;
       try {
-        await assertOwnedRootIdentity(message.rootIdentity);
         if (message.rootIdentity.occurrenceId !== message.occurrenceId) {
           throw new Error("POSTGRES_HARNESS_ROOT_OCCURRENCE_MISMATCH");
         }
-        const claim = JSON.parse(
-          await readFile(join(message.rootIdentity.root, ROOT_CLAIM_FILE), "utf8")
+        await validateRootClaim(
+          message.rootIdentity,
+          message.occurrenceId,
+          message.capabilityToken,
+          "harness"
         );
-        const expectedCapability = createHash("sha256")
-          .update(message.capabilityToken)
-          .digest("hex");
-        if (
-          claim.schemaVersion !== ROOT_CLAIM_SCHEMA_VERSION ||
-          claim.occurrenceId !== message.occurrenceId ||
-          claim.capabilitySha256 !== expectedCapability ||
-          !sameCreationIdentity(claim.creation, message.rootIdentity.creation)
-        ) {
-          throw new Error("POSTGRES_HARNESS_ROOT_CLAIM_REJECTED");
-        }
       } catch {
         reject("POSTGRES_HARNESS_ROOT_CLAIM_REJECTED");
         return;
@@ -1283,6 +2010,8 @@ async function receiveChildConfiguration() {
           schemaVersion: IPC_SCHEMA_VERSION,
           type: "harness-init-accepted",
           occurrenceId: message.occurrenceId,
+          capabilityToken: message.capabilityToken,
+          sequence: 0,
         });
         resolveConfiguration({
           mode: message.mode,
@@ -1291,9 +2020,9 @@ async function receiveChildConfiguration() {
           root: message.rootIdentity.root,
           rootIdentity: message.rootIdentity,
           dataDirectory: join(message.rootIdentity.root, "database"),
-          statePath: join(message.rootIdentity.root, LIFECYCLE_FILE),
           port: message.port,
           parentPid: message.parentPid,
+          capabilityToken: message.capabilityToken,
         });
       }, 25);
     };
@@ -1301,41 +2030,89 @@ async function receiveChildConfiguration() {
   });
 }
 
-async function createStateWriter(configuration) {
+async function sendHarnessIpc(configuration, message) {
+  if (typeof process.send !== "function" || !process.connected) {
+    throw new Error("POSTGRES_HARNESS_IPC_REQUIRED");
+  }
+  await new Promise((resolveSend, rejectSend) => {
+    process.send(
+      {
+        schemaVersion: IPC_SCHEMA_VERSION,
+        occurrenceId: configuration.occurrenceId,
+        capabilityToken: configuration.capabilityToken,
+        sequence: ++configuration.eventSequence,
+        ...message,
+      },
+      (error) => (error ? rejectSend(error) : resolveSend())
+    );
+  });
+}
+
+async function createEventWriter(configuration) {
   await assertOwnedRootIdentity(configuration.rootIdentity);
   const state = {
-    schemaVersion: RESULT_SCHEMA_VERSION,
-    occurrenceId: configuration.occurrenceId,
-    harnessPid: process.pid,
-    parentPid: configuration.parentPid,
-    root: configuration.root,
-    dataDirectory: configuration.dataDirectory,
-    port: configuration.port,
     phase: "created",
     phaseSequence: ["created"],
-    intendedFaultReached: false,
-    terminalReason: null,
-    ownedProcesses: [],
+    ownedPids: [],
   };
-  const writeState = async (patch = {}) => {
+  configuration.eventSequence = 0;
+  const writePhase = async (phase) => {
     await assertOwnedRootIdentity(configuration.rootIdentity);
-    if (
-      typeof patch.phase === "string" &&
-      patch.phase !== state.phase
-    ) {
-      state.phaseSequence.push(patch.phase);
+    if (typeof phase !== "string" || phase === state.phase) {
+      throw new Error("POSTGRES_HARNESS_PHASE_REJECTED");
     }
-    Object.assign(state, patch);
-    const temporaryPath = `${configuration.statePath}.tmp`;
-    await writeFile(temporaryPath, JSON.stringify(state), {
-      encoding: "utf8",
-      flag: "w",
+    state.phase = phase;
+    state.phaseSequence.push(phase);
+    await sendHarnessIpc(configuration, {
+      type: "harness-phase",
+      phase,
     });
-    await rename(temporaryPath, configuration.statePath);
     await assertOwnedRootIdentity(configuration.rootIdentity);
   };
-  await writeState();
-  return { state, writeState };
+  const registerProcess = async (pid, role) => {
+    assertPositivePid(pid);
+    let resolveAccepted;
+    let rejectAccepted;
+    const accepted = new Promise((resolveValue, rejectValue) => {
+      resolveAccepted = resolveValue;
+      rejectAccepted = rejectValue;
+    });
+    const timer = setTimeout(
+      () => rejectAccepted(new Error("POSTGRES_HARNESS_PROCESS_ACK_TIMEOUT")),
+      5_000
+    );
+    const onMessage = (message) => {
+      if (
+        !message ||
+        Object.keys(message).sort().join(",") !==
+          "capabilityToken,occurrenceId,pid,schemaVersion,type" ||
+        message.schemaVersion !== IPC_SCHEMA_VERSION ||
+        message.type !== "harness-process-accepted" ||
+        message.occurrenceId !== configuration.occurrenceId ||
+        message.capabilityToken !== configuration.capabilityToken ||
+        message.pid !== pid
+      ) {
+        return;
+      }
+      clearTimeout(timer);
+      process.off("message", onMessage);
+      resolveAccepted();
+    };
+    process.on("message", onMessage);
+    await sendHarnessIpc(configuration, {
+      type: "harness-process-spawn",
+      authority: "authenticated-ipc",
+      pid,
+      role,
+    });
+    await accepted;
+    state.ownedPids.push(pid);
+  };
+  await sendHarnessIpc(configuration, {
+    type: "harness-phase",
+    phase: "created",
+  });
+  return { state, writePhase, registerProcess };
 }
 
 function runCleanupEnvironmentProbe(environment, deadline) {
@@ -1356,24 +2133,101 @@ function runCleanupEnvironmentProbe(environment, deadline) {
   );
 }
 
-async function waitForClusterProcess(cluster, stateWriter) {
+async function waitForClusterProcess(cluster, eventWriter) {
   const deadline = Date.now() + POSTGRES_HARNESS_TIMEOUTS.startSpawn;
   while (Date.now() < deadline) {
     const pid = cluster.process?.pid;
     if (Number.isSafeInteger(pid) && pid > 0) {
-      const identity = queryWindowsProcessIdentity(pid, process.env);
-      if (!identity || identity.parentPid !== process.pid) {
-        throw new Error("POSTGRES_HARNESS_POSTMASTER_IDENTITY_MISMATCH");
-      }
-      stateWriter.state.ownedProcesses = [
-        { ...identity, role: "postgres" },
-      ];
-      await stateWriter.writeState({ phase: "start_spawned" });
+      await eventWriter.registerProcess(pid, "postgres");
+      await eventWriter.writePhase("start_spawned");
       return pid;
     }
     await delay(20);
   }
   throw new Error("POSTGRES_HARNESS_START_SPAWN_TIMEOUT");
+}
+
+async function receiveCleanupWorkerConfiguration() {
+  if (
+    process.argv.slice(2).length !== 1 ||
+    process.argv[2] !== "--cleanup-worker" ||
+    typeof process.send !== "function" ||
+    !process.connected
+  ) {
+    throw new Error("POSTGRES_HARNESS_CLEANUP_IPC_REQUIRED");
+  }
+  return await new Promise((resolveConfiguration, rejectConfiguration) => {
+    const timer = setTimeout(
+      () => rejectConfiguration(new Error("POSTGRES_HARNESS_CLEANUP_INIT_TIMEOUT")),
+      5_000
+    );
+    const onMessage = async (message) => {
+      const expectedKeys = [
+        "budgetMilliseconds",
+        "capabilityToken",
+        "cleanupFault",
+        "harnessPid",
+        "ipcCapabilitySha256",
+        "occurrenceId",
+        "parentPid",
+        "port",
+        "registry",
+        "rootIdentity",
+        "schemaVersion",
+        "type",
+      ];
+      if (
+        !message ||
+        Object.keys(message).sort().join(",") !== expectedKeys.sort().join(",") ||
+        message.schemaVersion !== IPC_SCHEMA_VERSION ||
+        message.type !== "cleanup-init" ||
+        message.parentPid !== process.ppid ||
+        !OCCURRENCE_ID.test(message.occurrenceId || "") ||
+        typeof message.capabilityToken !== "string" ||
+        !Number.isSafeInteger(message.harnessPid) ||
+        message.harnessPid <= 0 ||
+        !/^[0-9a-f]{64}$/.test(message.ipcCapabilitySha256 || "") ||
+        !Number.isSafeInteger(message.port) ||
+        message.port < 1 ||
+        message.port > 65_535 ||
+        !Array.isArray(message.registry) ||
+        message.registry.length > 4 ||
+        !Number.isFinite(message.budgetMilliseconds) ||
+        message.budgetMilliseconds <= 0 ||
+        message.budgetMilliseconds > POSTGRES_HARNESS_TIMEOUTS.forcedCleanup ||
+        ![
+          "none",
+          "port",
+          "lstat",
+          "readdir",
+          "unlink",
+          "rmdir",
+          "process-query",
+          "utility",
+        ].includes(message.cleanupFault)
+      ) {
+        clearTimeout(timer);
+        rejectConfiguration(new Error("POSTGRES_HARNESS_CLEANUP_INIT_REJECTED"));
+        return;
+      }
+      try {
+        await validateRootClaim(
+          message.rootIdentity,
+          message.occurrenceId,
+          message.capabilityToken,
+          "cleanup"
+        );
+      } catch {
+        clearTimeout(timer);
+        rejectConfiguration(new Error("POSTGRES_HARNESS_CLEANUP_INIT_REJECTED"));
+        return;
+      }
+      clearTimeout(timer);
+      process.off("message", onMessage);
+      resolveConfiguration(message);
+    };
+    process.on("message", onMessage);
+  });
 }
 
 function sameSql(left, right) {
@@ -1616,7 +2470,7 @@ async function runIntegration(cluster, configuration) {
   return { stable, drift, extensionClassifications };
 }
 
-async function spawnFaultWorker(configuration, stateWriter) {
+async function spawnFaultWorker(configuration, eventWriter) {
   await assertOwnedRootIdentity(configuration.rootIdentity);
   const source = `import {createServer} from 'node:net';const forbidden=${FORBIDDEN_CHILD_ENVIRONMENT_KEY.toString()};const allowed=new Set(${JSON.stringify(SAFE_OS_ENVIRONMENT_KEYS)});const environmentIsolated=Object.keys(process.env).every(k=>allowed.has(k.toUpperCase())&&!forbidden.test(k));const server=createServer();server.listen(Number(process.argv[1]),'127.0.0.1',()=>{process.stdout.write(JSON.stringify({pid:process.pid,ppid:process.ppid,environmentIsolated})+'\\n')});setInterval(()=>{},1000);`;
   const worker = spawn(
@@ -1658,14 +2512,8 @@ async function spawnFaultWorker(configuration, stateWriter) {
   ) {
     throw new Error("POSTGRES_HARNESS_FAULT_WORKER_OWNERSHIP_MISMATCH");
   }
-  const identity = queryWindowsProcessIdentity(worker.pid, process.env);
-  if (!identity || identity.parentPid !== process.pid) {
-    throw new Error("POSTGRES_HARNESS_FAULT_WORKER_GENERATION_MISMATCH");
-  }
-  stateWriter.state.ownedProcesses = [
-    { ...identity, role: "fault-worker" },
-  ];
-  await stateWriter.writeState({ phase: "start_spawned" });
+  await eventWriter.registerProcess(worker.pid, "fault-worker");
+  await eventWriter.writePhase("start_spawned");
   return worker;
 }
 
@@ -1673,7 +2521,7 @@ async function runChild(configuration) {
   assertSanitizedEnvironment(process.env);
   await assertOwnedRootIdentity(configuration.rootIdentity);
   assertEnvironmentBoundToOwnedRoot(process.env, configuration.rootIdentity.root);
-  const stateWriter = await createStateWriter(configuration);
+  const eventWriter = await createEventWriter(configuration);
   const cleanupChildEnvironmentIsolated = runCleanupEnvironmentProbe(process.env);
   if (!cleanupChildEnvironmentIsolated) {
     throw new Error("POSTGRES_HARNESS_CLEANUP_ENVIRONMENT_REJECTED");
@@ -1681,46 +2529,24 @@ async function runChild(configuration) {
 
   if (configuration.mode !== "integration") {
     if (configuration.faultControl === "early-failure") {
-      await stateWriter.writeState({
-        phase: "early_control_failure",
-        terminalReason: "CONTROLLED_EARLY_FAILURE",
-      });
+      await eventWriter.writePhase("early_control_failure");
       throw new Error("POSTGRES_HARNESS_CONTROLLED_EARLY_FAILURE");
     }
-    await spawnFaultWorker(configuration, stateWriter);
+    await spawnFaultWorker(configuration, eventWriter);
     if (configuration.mode === "ready_hang") {
-      await stateWriter.writeState({
-        phase: "ready_pending",
-        intendedFaultReached: true,
-        terminalReason: FAULT_CONTRACTS.ready_hang.terminalReason,
-      });
+      await eventWriter.writePhase("ready_pending");
       return new Promise(() => undefined);
     }
     if (configuration.mode === "stop_hang") {
-      await stateWriter.writeState({ phase: "ready" });
-      await stateWriter.writeState({
-        phase: "stopping",
-        intendedFaultReached: true,
-        terminalReason: FAULT_CONTRACTS.stop_hang.terminalReason,
-      });
+      await eventWriter.writePhase("ready");
+      await eventWriter.writePhase("stopping");
       return new Promise(() => undefined);
     }
     if (configuration.mode === "partial_start_throw") {
-      await stateWriter.writeState({
-        phase: "partial_start_failure",
-        intendedFaultReached: true,
-        terminalReason: FAULT_CONTRACTS.partial_start_throw.terminalReason,
-      });
-      setImmediate(() => {
-        throw new Error("POSTGRES_HARNESS_FAULT_PARTIAL_START");
-      });
-      return new Promise(() => undefined);
+      await eventWriter.writePhase("partial_start_failure");
+      throw new Error("POSTGRES_HARNESS_FAULT_PARTIAL_START");
     }
-    await stateWriter.writeState({
-      phase: "child_crash",
-      intendedFaultReached: true,
-      terminalReason: FAULT_CONTRACTS.child_crash.terminalReason,
-    });
+    await eventWriter.writePhase("child_crash");
     process.exit(72);
   }
 
@@ -1741,22 +2567,22 @@ async function runChild(configuration) {
   let failure;
   try {
     await assertOwnedRootIdentity(configuration.rootIdentity);
-    await stateWriter.writeState({ phase: "initialising" });
+    await eventWriter.writePhase("initialising");
     await withinDeadline(
       () => cluster.initialise(),
       POSTGRES_HARNESS_TIMEOUTS.initialise,
       "POSTGRES_HARNESS_INITIALISE_TIMEOUT"
     );
-    await stateWriter.writeState({ phase: "starting" });
+    await eventWriter.writePhase("starting");
     const startPromise = cluster.start();
     void startPromise.catch(() => undefined);
-    await waitForClusterProcess(cluster, stateWriter);
+    await waitForClusterProcess(cluster, eventWriter);
     await withinDeadline(
       () => startPromise,
       POSTGRES_HARNESS_TIMEOUTS.ready,
       "POSTGRES_HARNESS_READY_TIMEOUT"
     );
-    await stateWriter.writeState({ phase: "ready" });
+    await eventWriter.writePhase("ready");
     integration = await withinDeadline(
       () => runIntegration(cluster, { ...configuration, password }),
       POSTGRES_HARNESS_TIMEOUTS.testExecution,
@@ -1770,15 +2596,13 @@ async function runChild(configuration) {
         "POSTGRES_HARNESS_START_SPAWN_TIMEOUT",
       ].includes(failure)
     ) {
-      await stateWriter.writeState({ phase: "cleanup_required" });
+      await eventWriter.writePhase("cleanup_required");
       return new Promise(() => undefined);
     }
   }
 
-  await stateWriter.writeState({ phase: "stopping" });
-  const postgresRootPids = stateWriter.state.ownedProcesses
-    .filter((entry) => entry.role === "postgres")
-    .map((entry) => entry.pid);
+  await eventWriter.writePhase("stopping");
+  const postgresRootPids = [...eventWriter.state.ownedPids];
   try {
     await withinDeadline(
       () => cluster.stop(),
@@ -1786,7 +2610,7 @@ async function runChild(configuration) {
       "POSTGRES_HARNESS_STOP_TIMEOUT"
     );
   } catch {
-    await stateWriter.writeState({ phase: "cleanup_required" });
+    await eventWriter.writePhase("cleanup_required");
     return new Promise(() => undefined);
   }
   const normalStopDeadline = createCleanupDeadline(5_000);
@@ -1794,11 +2618,11 @@ async function runChild(configuration) {
     postgresRootPids.every((pid) => !isProcessAlive(pid)) &&
     (await waitForPortRelease(configuration.port, normalStopDeadline));
   if (!normalStopComplete) {
-    await stateWriter.writeState({ phase: "cleanup_required" });
+    await eventWriter.writePhase("cleanup_required");
     return new Promise(() => undefined);
   }
-  stateWriter.state.ownedProcesses = [];
-  await stateWriter.writeState({ phase: "stopped" });
+  eventWriter.state.ownedPids = [];
+  await eventWriter.writePhase("stopped");
 
   const result = {
     schemaVersion: RESULT_SCHEMA_VERSION,
@@ -1828,8 +2652,13 @@ const invokedDirectly =
 
 if (invokedDirectly) {
   try {
-    const configuration = await receiveChildConfiguration();
-    await runChild(configuration);
+    if (process.argv[2] === "--cleanup-worker") {
+      const configuration = await receiveCleanupWorkerConfiguration();
+      await performCleanupWorker(configuration);
+    } else {
+      const configuration = await receiveChildConfiguration();
+      await runChild(configuration);
+    }
     process.exit(process.exitCode || 0);
   } catch (error) {
     const code =
