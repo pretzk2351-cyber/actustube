@@ -23,10 +23,13 @@ import {
   EXTERNAL_FIXTURE_EXTENSION_CONTRACT_FOR_TESTS,
   HARNESS_DEADLINE_LIMITS_FOR_TESTS,
   INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS,
+  createIndependentDeadlineContextsForTests,
   externalFixtureSuccessResultForTests,
   harnessAuthorityBoundaryForTests,
   runConnectionOnlyHarness,
   runHarnessDeadlineProbeForTests,
+  runHarnessTransactionBoundaryProbeForTests,
+  runMigrationOwnerBoundaryProbeForTests,
   validateExternalFixtureConfigurationForTests,
   validateIndependentExtensionInventoryForTests,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
@@ -951,6 +954,8 @@ function createDeadlineFakeClient({
   queryHang = false,
   endHang = false,
   lateQueryRejection = false,
+  hangOnStatement = null as string | null,
+  rejectOnStatement = null as string | null,
 } = {}) {
   const counters = {
     connect: 0,
@@ -958,22 +963,35 @@ function createDeadlineFakeClient({
     end: 0,
     destroy: 0,
   };
+  const state = {
+    connected: false,
+    usable: true,
+    destroyed: false,
+    ended: false,
+    queriesAtDestroy: null as number | null,
+  };
   const client = {
     connection: {
       stream: {
         destroy() {
           counters.destroy += 1;
+          state.destroyed = true;
+          state.usable = false;
+          state.queriesAtDestroy = counters.query.length;
         },
       },
     },
     connect() {
       counters.connect += 1;
-      return connectHang
-        ? new Promise(() => undefined)
-        : Promise.resolve(undefined);
+      if (connectHang) return new Promise(() => undefined);
+      state.connected = true;
+      return Promise.resolve(undefined);
     },
     query(statement: string) {
       counters.query.push(statement);
+      if (rejectOnStatement === statement) {
+        return Promise.reject(new Error("fixed-finite-query-failure"));
+      }
       if (lateQueryRejection) {
         return new Promise((_resolve, reject) => {
           setTimeout(
@@ -982,18 +1000,152 @@ function createDeadlineFakeClient({
           );
         });
       }
-      return queryHang
+      return queryHang || hangOnStatement === statement
         ? new Promise(() => undefined)
         : Promise.resolve({ rows: [] });
     },
     end() {
       counters.end += 1;
+      state.ended = true;
+      state.usable = false;
       return endHang
         ? new Promise(() => undefined)
         : Promise.resolve(undefined);
     },
   };
-  return { client, counters };
+  return { client, counters, state };
+}
+
+const testLegacyOwner = "actustube_ci_usage_legacy_owner";
+const testMigrationExecutor = "actustube_ci_usage_migration_executor";
+const testFixtureSessionRole = "actustube_ci_fixture";
+const testLegacyOwnerOid = "81001";
+const testMigrationExecutorOid = "81002";
+const testUsageOwnerIdentities = [
+  "public.reserve_usage_limits(uuid,integer,public.usage_metric,timestamp with time zone)",
+  "public.usage_period_boundaries_v1(timestamp with time zone)",
+  "public.resolve_effective_usage_plan_v1(uuid,timestamp with time zone)",
+  "public.reserve_usage_limits_v2(uuid,integer,public.usage_metric,timestamp with time zone)",
+  "public.get_usage_status_v1(uuid,integer,timestamp with time zone)",
+] as const;
+
+function validMigrationRolePrecondition(
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    session_role: testFixtureSessionRole,
+    effective_role: testMigrationExecutor,
+    legacy_function_owner_oid: testLegacyOwnerOid,
+    legacy_owner_oid: testLegacyOwnerOid,
+    legacy_owner_name: testLegacyOwner,
+    migration_executor_oid: testMigrationExecutorOid,
+    migration_executor_name: testMigrationExecutor,
+    has_legacy_membership: true,
+    legacy_owner_restricted: true,
+    migration_executor_restricted: true,
+    ...overrides,
+  };
+}
+
+function validUsageOwnerPostcondition() {
+  return testUsageOwnerIdentities.map((functionIdentity, index) => ({
+    function_identity: functionIdentity,
+    ordinal: index + 1,
+    function_oid: String(82001 + index),
+    owner_oid: testLegacyOwnerOid,
+    owner_name: testLegacyOwner,
+    acl_text: "{fixed_acl}",
+    security_definer: true,
+    search_path: ["search_path=public, pg_temp"],
+  }));
+}
+
+function ownerBoundaryQueryLabel(statement: string) {
+  if (statement.includes("CREATE ROLE") && statement.includes(testLegacyOwner)) {
+    return "create-fixed-roles";
+  }
+  if (statement.includes("fixture_database_grant")) return "minimal-grants";
+  if (statement.startsWith("SET ROLE")) return "set-migration-executor";
+  if (statement === "RESET ROLE") return "reset-role";
+  if (statement.includes("AS migration_executor_restricted") &&
+      !statement.includes("legacy_function AS")) {
+    return "migration-executor-identity";
+  }
+  if (statement.includes("ALTER FUNCTION") && statement.includes("OWNER TO")) {
+    return "legacy-owner-baseline";
+  }
+  if (statement.trimStart().startsWith("GRANT") &&
+      statement.includes(testLegacyOwner) &&
+      statement.includes(testMigrationExecutor)) {
+    return "legacy-owner-membership";
+  }
+  if (statement.includes("WITH legacy_function AS")) return "role-precondition";
+  if (statement.includes("WITH expected(function_identity, ordinal)")) {
+    return "owner-postcondition";
+  }
+  return "unknown-fixed-query";
+}
+
+function createMigrationOwnerFakeClient({
+  preconditionRows = [validMigrationRolePrecondition()],
+  postconditionRows = validUsageOwnerPostcondition(),
+  hangOnLabel = null as string | null,
+} = {}) {
+  const state = {
+    query: [] as string[],
+    parameters: [] as unknown[][],
+    connect: 0,
+    end: 0,
+    destroy: 0,
+    usable: true,
+    queriesAtDestroy: null as number | null,
+  };
+  const client = {
+    connection: {
+      stream: {
+        destroy() {
+          state.destroy += 1;
+          state.usable = false;
+          state.queriesAtDestroy = state.query.length;
+        },
+      },
+    },
+    connect() {
+      state.connect += 1;
+      return Promise.resolve();
+    },
+    query(statement: string, parameters: unknown[] = []) {
+      state.query.push(statement);
+      state.parameters.push(parameters);
+      const label = ownerBoundaryQueryLabel(statement);
+      if (label === hangOnLabel) return new Promise(() => undefined);
+      if (label === "migration-executor-identity") {
+        return Promise.resolve({
+          rows: [
+            {
+              session_role: testFixtureSessionRole,
+              effective_role: testMigrationExecutor,
+              migration_executor_name: testMigrationExecutor,
+              migration_executor_restricted: true,
+            },
+          ],
+        });
+      }
+      if (label === "role-precondition") {
+        return Promise.resolve({ rows: preconditionRows });
+      }
+      if (label === "owner-postcondition") {
+        return Promise.resolve({ rows: postconditionRows });
+      }
+      return Promise.resolve({ rows: [] });
+    },
+    end() {
+      state.end += 1;
+      state.usable = false;
+      return Promise.resolve();
+    },
+  };
+  return { client, state };
 }
 
 async function runDirectHarnessInvocation(
@@ -1073,6 +1225,26 @@ describe("connection-only external fixture boundary", () => {
     expect(source).toContain("github_actions_service_container");
     expect(source).toContain("clientFactory");
 
+    const harnessExports = await import(
+      "../scripts/test-staging-database-preflight-postgres.mjs"
+    );
+    expect(Object.keys(harnessExports).sort()).toEqual(
+      [
+        "EXTERNAL_FIXTURE_EXTENSION_CONTRACT_FOR_TESTS",
+        "HARNESS_DEADLINE_LIMITS_FOR_TESTS",
+        "INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS",
+        "createIndependentDeadlineContextsForTests",
+        "externalFixtureSuccessResultForTests",
+        "harnessAuthorityBoundaryForTests",
+        "runConnectionOnlyHarness",
+        "runHarnessDeadlineProbeForTests",
+        "runHarnessTransactionBoundaryProbeForTests",
+        "runMigrationOwnerBoundaryProbeForTests",
+        "validateExternalFixtureConfigurationForTests",
+        "validateIndependentExtensionInventoryForTests",
+      ].sort()
+    );
+
     const connectionFactory = vi.fn();
     await expect(
       runConnectionOnlyHarness({
@@ -1123,6 +1295,242 @@ describe("connection-only external fixture boundary", () => {
     ).toBeLessThanOrEqual(HARNESS_DEADLINE_LIMITS_FOR_TESTS.totalMilliseconds);
   });
 
+  it("exercises the distinct owner boundary in the fixed production order", async () => {
+    const fake = createMigrationOwnerFakeClient();
+    const result = await runMigrationOwnerBoundaryProbeForTests({
+      client: fake.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    const labels = fake.state.query.map(ownerBoundaryQueryLabel);
+    expect(result).toMatchObject({
+      failureMarker: null,
+      timedOut: false,
+      activeClientCount: 0,
+    });
+    expect(labels).toEqual([
+      "create-fixed-roles",
+      "minimal-grants",
+      "set-migration-executor",
+      "migration-executor-identity",
+      "reset-role",
+      "legacy-owner-baseline",
+      "legacy-owner-membership",
+      "set-migration-executor",
+      "role-precondition",
+      "reset-role",
+      "owner-postcondition",
+    ]);
+    expect(result.operationStarts).toMatchObject({
+      connect: 1,
+      query: 11,
+      close: 1,
+      migration: 2,
+    });
+    expect(fake.state).toMatchObject({
+      connect: 1,
+      end: 1,
+      destroy: 0,
+      usable: false,
+    });
+    const preconditionParameters = fake.state.parameters[8];
+    expect(preconditionParameters).toEqual([
+      testUsageOwnerIdentities[0],
+      testLegacyOwner,
+      testMigrationExecutor,
+    ]);
+    expect(fake.state.parameters[10]).toEqual([testUsageOwnerIdentities]);
+    expect(JSON.stringify(result)).not.toMatch(
+      /actustube_ci_usage_|alter function|grant create|owner to/i
+    );
+
+    const source = await readFile(postgresHarnessModule, "utf8");
+    const flow = source.slice(
+      source.indexOf("async function applyMigrationsAndRuntimeAcl"),
+      source.indexOf("function usageSignatureArraySql")
+    );
+    const orderedOperations = [
+      "createUsageFixtureRoles(client)",
+      "grantUsageMigrationPrivileges(client)",
+      "applyMigrationCount(context, client, EXPECTED_MIGRATION_MAX)",
+      "configureUsageMigrationBaseline(client)",
+      "grantLegacyOwnerMembership(client)",
+      "verifyPublicAclMigrationFailure(context, client, configuration.role)",
+      "applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT)",
+      "assertUsageOwnerPostcondition(client, configuration.role)",
+    ];
+    let previousIndex = -1;
+    for (const operation of orderedOperations) {
+      const operationIndex = flow.indexOf(operation, previousIndex + 1);
+      expect(operationIndex).toBeGreaterThan(previousIndex);
+      previousIndex = operationIndex;
+    }
+  });
+
+  it.each([
+    [
+      "legacy owner equals Migration executor",
+      [
+        validMigrationRolePrecondition({
+          legacy_function_owner_oid: testMigrationExecutorOid,
+          legacy_owner_oid: testMigrationExecutorOid,
+          legacy_owner_name: testMigrationExecutor,
+        }),
+      ],
+    ],
+    [
+      "legacy owner equals session role",
+      [validMigrationRolePrecondition({ legacy_owner_name: testFixtureSessionRole })],
+    ],
+    [
+      "legacy function remains owned by Migration executor",
+      [
+        validMigrationRolePrecondition({
+          legacy_function_owner_oid: testMigrationExecutorOid,
+        }),
+      ],
+    ],
+    [
+      "Migration effective role is legacy owner",
+      [validMigrationRolePrecondition({ effective_role: testLegacyOwner })],
+    ],
+    [
+      "legacy membership is missing",
+      [validMigrationRolePrecondition({ has_legacy_membership: false })],
+    ],
+    ["precondition row is missing", []],
+    [
+      "precondition row is duplicated",
+      [validMigrationRolePrecondition(), validMigrationRolePrecondition()],
+    ],
+    [
+      "precondition row has an unknown key",
+      [validMigrationRolePrecondition({ unknown_key: true })],
+    ],
+  ])("rejects %s before the final Migration phase", async (_label, rows) => {
+    const fake = createMigrationOwnerFakeClient({ preconditionRows: rows });
+    const result = await runMigrationOwnerBoundaryProbeForTests({
+      client: fake.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_MIGRATION_ROLE_PRECONDITION_MISMATCH"
+    );
+    const labels = fake.state.query.map(ownerBoundaryQueryLabel);
+    expect(labels).toContain("role-precondition");
+    expect(labels).not.toContain("owner-postcondition");
+    expect(result.operationStarts.migration).toBe(1);
+    expect(fake.state.destroy).toBe(0);
+    expect(fake.state.end).toBe(1);
+  });
+
+  it.each([
+    [
+      "all targets owned by Migration executor",
+      validUsageOwnerPostcondition().map((row) => ({
+        ...row,
+        owner_oid: testMigrationExecutorOid,
+        owner_name: testMigrationExecutor,
+      })),
+    ],
+    [
+      "all targets owned by session role",
+      validUsageOwnerPostcondition().map((row) => ({
+        ...row,
+        owner_oid: "81003",
+        owner_name: testFixtureSessionRole,
+      })),
+    ],
+    [
+      "one target owner name mismatch",
+      validUsageOwnerPostcondition().map((row, index) =>
+        index === 3 ? { ...row, owner_name: "actustube_ci_wrong_owner" } : row
+      ),
+    ],
+    [
+      "one target owner OID mismatch",
+      validUsageOwnerPostcondition().map((row, index) =>
+        index === 4 ? { ...row, owner_oid: "81999" } : row
+      ),
+    ],
+  ])("rejects the owner postcondition when %s", async (_label, rows) => {
+    const fake = createMigrationOwnerFakeClient({ postconditionRows: rows });
+    const result = await runMigrationOwnerBoundaryProbeForTests({
+      client: fake.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_OWNER_POSTCONDITION_MISMATCH"
+    );
+    expect(fake.state.query.map(ownerBoundaryQueryLabel)).toContain(
+      "owner-postcondition"
+    );
+    expect(fake.state.destroy).toBe(0);
+    expect(fake.state.end).toBe(1);
+  });
+
+  it("starts no reset, owner, grant, or postcondition query after a role precondition timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = createMigrationOwnerFakeClient({
+        hangOnLabel: "role-precondition",
+      });
+      const pending = runMigrationOwnerBoundaryProbeForTests({
+        client: fake.client,
+        expectedSessionRole: testFixtureSessionRole,
+        deadlineLimits: {
+          totalMilliseconds: 100,
+          connectMilliseconds: 20,
+          queryMilliseconds: 20,
+          closeMilliseconds: 20,
+          phaseMilliseconds: 20,
+          migrationMilliseconds: 20,
+        },
+      });
+      await vi.advanceTimersByTimeAsync(120);
+      const result = await pending;
+      const labels = fake.state.query.map(ownerBoundaryQueryLabel);
+      expect(result).toMatchObject({
+        failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
+        timedOut: true,
+        activeClientCount: 0,
+        destroyed: true,
+      });
+      expect(labels.at(-1)).toBe("role-precondition");
+      expect(labels.filter((label) => label === "reset-role")).toHaveLength(1);
+      expect(labels).not.toContain("owner-postcondition");
+      expect(fake.state.queriesAtDestroy).toBe(fake.state.query.length);
+      expect(fake.state.destroy).toBe(1);
+      expect(fake.state.end).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     "connect-hang",
     "raw-query-hang",
@@ -1144,13 +1552,15 @@ describe("connection-only external fixture boundary", () => {
           connectHang: scenario === "connect-hang",
           queryHang: [
             "raw-query-hang",
-            "transaction-hang",
             "independent-inventory-hang",
             "cleanup-query-hang",
           ].includes(scenario),
+          hangOnStatement:
+            scenario === "transaction-hang"
+              ? "SELECT fixed_transaction_body_probe"
+              : null,
           endHang: scenario === "end-hang",
         });
-        const unrelatedDestroy = vi.fn();
         const pending = runHarnessDeadlineProbeForTests({
           scenario,
           client: fake.client,
@@ -1174,7 +1584,6 @@ describe("connection-only external fixture boundary", () => {
           postTimeoutOperationStarts: 0,
         });
         expect(fake.counters.destroy).toBe(1);
-        expect(unrelatedDestroy).not.toHaveBeenCalled();
         expect(fake.counters.query).not.toContain("SELECT blocked_after_timeout");
         expect(vi.getTimerCount()).toBe(0);
       } finally {
@@ -1182,6 +1591,194 @@ describe("connection-only external fixture boundary", () => {
       }
     }
   );
+
+  it("isolates a timed-out Client from a simultaneously registered unrelated context", async () => {
+    vi.useFakeTimers();
+    const beforeUnhandled = process.listenerCount("unhandledRejection");
+    try {
+      const target = createDeadlineFakeClient({
+        hangOnStatement: "SELECT fixed_independent_context_probe",
+      });
+      const unrelated = createDeadlineFakeClient();
+      const contexts = await createIndependentDeadlineContextsForTests({
+        targetClient: target.client,
+        unrelatedClient: unrelated.client,
+        deadlineLimits: {
+          totalMilliseconds: 100,
+          connectMilliseconds: 20,
+          queryMilliseconds: 20,
+          closeMilliseconds: 20,
+          phaseMilliseconds: 20,
+          migrationMilliseconds: 20,
+        },
+      });
+      expect(contexts.inspectTargetForTests()).toMatchObject({
+        timedOut: false,
+        activeClientCount: 1,
+        registered: true,
+        usable: true,
+        destroyed: false,
+      });
+      expect(contexts.inspectUnrelatedForTests()).toMatchObject({
+        timedOut: false,
+        activeClientCount: 1,
+        registered: true,
+        usable: true,
+        destroyed: false,
+      });
+
+      await vi.advanceTimersByTimeAsync(25);
+      expect(await contexts.targetOperation).toBe(
+        "EXTERNAL_FIXTURE_OPERATION_TIMEOUT"
+      );
+      expect(target.counters).toMatchObject({
+        connect: 1,
+        query: ["SELECT fixed_independent_context_probe"],
+        end: 0,
+        destroy: 1,
+      });
+      expect(target.state).toMatchObject({
+        usable: false,
+        destroyed: true,
+        queriesAtDestroy: 1,
+      });
+      expect(contexts.inspectTargetForTests()).toMatchObject({
+        timedOut: true,
+        activeClientCount: 0,
+        registered: false,
+        usable: false,
+        destroyed: true,
+        destroyCount: 1,
+        operationStarts: { connect: 1, query: 1, close: 0 },
+      });
+      expect(unrelated.counters).toEqual({
+        connect: 1,
+        query: [],
+        end: 0,
+        destroy: 0,
+      });
+      expect(unrelated.state).toMatchObject({
+        usable: true,
+        destroyed: false,
+        ended: false,
+      });
+      expect(contexts.inspectUnrelatedForTests()).toMatchObject({
+        timedOut: false,
+        activeClientCount: 1,
+        registered: true,
+        usable: true,
+        destroyed: false,
+        operationStarts: { connect: 1, query: 0, close: 0 },
+      });
+
+      await contexts.closeUnrelatedForTests();
+      expect(unrelated.counters).toEqual({
+        connect: 1,
+        query: [],
+        end: 1,
+        destroy: 0,
+      });
+      expect(contexts.inspectUnrelatedForTests()).toMatchObject({
+        timedOut: false,
+        activeClientCount: 0,
+        registered: false,
+        usable: false,
+        destroyed: false,
+        closed: true,
+        operationStarts: { connect: 1, query: 0, close: 1 },
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(process.listenerCount("unhandledRejection")).toBe(beforeUnhandled);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses withRollback and starts no ROLLBACK after a transaction body timeout", async () => {
+    vi.useFakeTimers();
+    const beforeUnhandled = process.listenerCount("unhandledRejection");
+    try {
+      const fake = createDeadlineFakeClient({
+        hangOnStatement: "SELECT fixed_transaction_body_probe",
+      });
+      const pending = runHarnessTransactionBoundaryProbeForTests({
+        client: fake.client,
+        deadlineLimits: {
+          totalMilliseconds: 100,
+          connectMilliseconds: 20,
+          queryMilliseconds: 20,
+          closeMilliseconds: 20,
+          phaseMilliseconds: 20,
+          migrationMilliseconds: 20,
+        },
+      });
+      await vi.advanceTimersByTimeAsync(25);
+      const result = await pending;
+      expect(fake.counters.query).toEqual([
+        "BEGIN",
+        "SELECT fixed_transaction_body_probe",
+      ]);
+      expect(fake.counters.query.filter((query) => query === "ROLLBACK")).toHaveLength(
+        0
+      );
+      expect(fake.counters.query.filter((query) => query === "COMMIT")).toHaveLength(
+        0
+      );
+      expect(fake.counters).toMatchObject({ end: 0, destroy: 1 });
+      expect(fake.state.queriesAtDestroy).toBe(2);
+      expect(result).toMatchObject({
+        failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
+        timedOut: true,
+        activeClientCount: 0,
+        destroyed: true,
+        closed: false,
+        operationStarts: { connect: 1, query: 2, close: 0 },
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(process.listenerCount("unhandledRejection")).toBe(beforeUnhandled);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the same withRollback path and performs one rollback for a finite body error", async () => {
+    const beforeUnhandled = process.listenerCount("unhandledRejection");
+    const fake = createDeadlineFakeClient({
+      rejectOnStatement: "SELECT fixed_transaction_body_probe",
+    });
+    const result = await runHarnessTransactionBoundaryProbeForTests({
+      client: fake.client,
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(fake.counters.query).toEqual([
+      "BEGIN",
+      "SELECT fixed_transaction_body_probe",
+      "ROLLBACK",
+    ]);
+    expect(fake.counters.query.filter((query) => query === "ROLLBACK")).toHaveLength(
+      1
+    );
+    expect(fake.counters.query.filter((query) => query === "COMMIT")).toHaveLength(
+      0
+    );
+    expect(fake.counters).toMatchObject({ end: 1, destroy: 0 });
+    expect(result).toMatchObject({
+      failureMarker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED",
+      timedOut: false,
+      activeClientCount: 0,
+      destroyed: false,
+      closed: true,
+      operationStarts: { connect: 1, query: 3, close: 1 },
+    });
+    expect(process.listenerCount("unhandledRejection")).toBe(beforeUnhandled);
+  });
 
   it("uses a short real timer for a non-settling query and handles its late rejection", async () => {
     const fake = createDeadlineFakeClient({ lateQueryRejection: true });

@@ -44,6 +44,10 @@ const USAGE_FIXTURE_ROLES = Object.freeze({
   deniedRuntime: "actustube_ci_usage_denied",
   publicProbe: "actustube_ci_usage_public_probe",
 });
+const USAGE_MIGRATION_BOUNDARY_ROLES = Object.freeze({
+  legacyOwner: "actustube_ci_usage_legacy_owner",
+  migrationExecutor: "actustube_ci_usage_migration_executor",
+});
 const LEGACY_USAGE_SIGNATURE =
   "public.reserve_usage_limits(uuid,integer,public.usage_metric,timestamp with time zone)";
 const VERSIONED_USAGE_SIGNATURES = Object.freeze([
@@ -763,14 +767,71 @@ async function applyMigrationCount(context, client, expectedCount) {
   );
 }
 
+function assertUsageFixtureRoleSeparation(sessionRole) {
+  const internalRoles = [
+    ...Object.values(USAGE_FIXTURE_ROLES),
+    ...Object.values(USAGE_MIGRATION_BOUNDARY_ROLES),
+    RUNTIME_ROLE,
+  ];
+  requireHarness(
+    SAFE_IDENTIFIER.test(sessionRole) &&
+      new Set(internalRoles).size === internalRoles.length &&
+      !internalRoles.includes(sessionRole),
+    "EXTERNAL_FIXTURE_ROLE_CONTRACT_MISMATCH"
+  );
+}
+
+async function createUsageFixtureRoles(client) {
+  const roles = USAGE_FIXTURE_ROLES;
+  const boundary = USAGE_MIGRATION_BOUNDARY_ROLES;
+  await client.query(`
+    CREATE ROLE ${quoteIdentifier(boundary.legacyOwner)}
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    CREATE ROLE ${quoteIdentifier(boundary.migrationExecutor)}
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    CREATE ROLE ${quoteIdentifier(roles.explicitRuntime)}
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    CREATE ROLE ${quoteIdentifier(roles.runtimeGroup)}
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    CREATE ROLE ${quoteIdentifier(roles.membershipRuntime)}
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    CREATE ROLE ${quoteIdentifier(roles.deniedRuntime)}
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    CREATE ROLE ${quoteIdentifier(roles.publicProbe)}
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  `);
+}
+
+async function grantUsageMigrationPrivileges(client) {
+  const boundary = USAGE_MIGRATION_BOUNDARY_ROLES;
+  await client.query(`
+    DO $fixture_database_grant$
+    BEGIN
+      EXECUTE pg_catalog.format(
+        'GRANT CREATE ON DATABASE %I TO %I',
+        pg_catalog.current_database(),
+        '${boundary.migrationExecutor}'
+      );
+    END;
+    $fixture_database_grant$;
+    GRANT USAGE, CREATE ON SCHEMA public TO
+      ${quoteIdentifier(boundary.migrationExecutor)},
+      ${quoteIdentifier(boundary.legacyOwner)};
+    GRANT USAGE ON SCHEMA drizzle
+      TO ${quoteIdentifier(boundary.migrationExecutor)};
+    GRANT SELECT, INSERT ON TABLE drizzle.__drizzle_migrations
+      TO ${quoteIdentifier(boundary.migrationExecutor)};
+    GRANT USAGE, SELECT ON SEQUENCE drizzle.__drizzle_migrations_id_seq
+      TO ${quoteIdentifier(boundary.migrationExecutor)};
+  `);
+}
+
 async function configureUsageMigrationBaseline(client) {
   const roles = USAGE_FIXTURE_ROLES;
+  const boundary = USAGE_MIGRATION_BOUNDARY_ROLES;
   await client.query(`
-    CREATE ROLE ${quoteIdentifier(roles.explicitRuntime)} NOLOGIN;
-    CREATE ROLE ${quoteIdentifier(roles.runtimeGroup)} NOLOGIN;
-    CREATE ROLE ${quoteIdentifier(roles.membershipRuntime)} NOLOGIN;
-    CREATE ROLE ${quoteIdentifier(roles.deniedRuntime)} NOLOGIN;
-    CREATE ROLE ${quoteIdentifier(roles.publicProbe)} NOLOGIN;
+    ALTER FUNCTION ${LEGACY_USAGE_SIGNATURE}
+      OWNER TO ${quoteIdentifier(boundary.legacyOwner)};
     GRANT ${quoteIdentifier(roles.runtimeGroup)}
       TO ${quoteIdentifier(roles.membershipRuntime)};
     GRANT USAGE ON SCHEMA public TO
@@ -786,13 +847,182 @@ async function configureUsageMigrationBaseline(client) {
   `);
 }
 
-async function verifyPublicAclMigrationFailure(context, client) {
+async function grantLegacyOwnerMembership(client) {
+  await client.query(`
+    GRANT ${quoteIdentifier(USAGE_MIGRATION_BOUNDARY_ROLES.legacyOwner)}
+      TO ${quoteIdentifier(USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor)}
+  `);
+}
+
+async function withMigrationExecutorRole(context, client, operation) {
+  await client.query(
+    `SET ROLE ${quoteIdentifier(USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor)}`
+  );
+  try {
+    return await operation();
+  } finally {
+    if (!context.timedOut && remainingTotalMilliseconds(context) > 0) {
+      await client.query("RESET ROLE");
+    }
+  }
+}
+
+function singleExactRow(result, expectedKeys, code) {
+  requireHarness(
+    Array.isArray(result?.rows) &&
+      result.rows.length === 1 &&
+      exactOwnKeys(result.rows[0], expectedKeys),
+    code
+  );
+  return result.rows[0];
+}
+
+async function assertMigrationExecutorIdentity(client, expectedSessionRole) {
+  const result = await client.query(
+    `SELECT
+       session_user AS session_role,
+       current_user AS effective_role,
+       role.rolname AS migration_executor_name,
+       (
+         NOT role.rolcanlogin
+         AND NOT role.rolsuper
+         AND NOT role.rolcreatedb
+         AND NOT role.rolcreaterole
+         AND NOT role.rolreplication
+         AND NOT role.rolbypassrls
+       ) AS migration_executor_restricted
+     FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = $1`,
+    [USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor]
+  );
+  const row = singleExactRow(
+    result,
+    [
+      "session_role",
+      "effective_role",
+      "migration_executor_name",
+      "migration_executor_restricted",
+    ],
+    "EXTERNAL_FIXTURE_MIGRATION_ROLE_PRECONDITION_MISMATCH"
+  );
+  requireHarness(
+    row.session_role === expectedSessionRole &&
+      row.effective_role === USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor &&
+      row.migration_executor_name ===
+        USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor &&
+      row.migration_executor_restricted === true,
+    "EXTERNAL_FIXTURE_MIGRATION_ROLE_PRECONDITION_MISMATCH"
+  );
+}
+
+function validateMigrationRolePrecondition(result, expectedSessionRole) {
+  const row = singleExactRow(
+    result,
+    [
+      "session_role",
+      "effective_role",
+      "legacy_function_owner_oid",
+      "legacy_owner_oid",
+      "legacy_owner_name",
+      "migration_executor_oid",
+      "migration_executor_name",
+      "has_legacy_membership",
+      "legacy_owner_restricted",
+      "migration_executor_restricted",
+    ],
+    "EXTERNAL_FIXTURE_MIGRATION_ROLE_PRECONDITION_MISMATCH"
+  );
+  const boundary = USAGE_MIGRATION_BOUNDARY_ROLES;
+  requireHarness(
+    row.session_role === expectedSessionRole &&
+      row.effective_role === boundary.migrationExecutor &&
+      row.legacy_owner_name === boundary.legacyOwner &&
+      row.migration_executor_name === boundary.migrationExecutor &&
+      typeof row.legacy_function_owner_oid === "string" &&
+      /^[1-9][0-9]*$/.test(row.legacy_function_owner_oid) &&
+      row.legacy_function_owner_oid === row.legacy_owner_oid &&
+      typeof row.migration_executor_oid === "string" &&
+      /^[1-9][0-9]*$/.test(row.migration_executor_oid) &&
+      row.legacy_owner_oid !== row.migration_executor_oid &&
+      row.effective_role !== row.legacy_owner_name &&
+      row.session_role !== row.legacy_owner_name &&
+      row.has_legacy_membership === true &&
+      row.legacy_owner_restricted === true &&
+      row.migration_executor_restricted === true,
+    "EXTERNAL_FIXTURE_MIGRATION_ROLE_PRECONDITION_MISMATCH"
+  );
+  return row;
+}
+
+async function assertMigrationRolePrecondition(client, expectedSessionRole) {
+  const boundary = USAGE_MIGRATION_BOUNDARY_ROLES;
+  const result = await client.query(
+    `WITH legacy_function AS (
+       SELECT procedure.proowner
+       FROM pg_catalog.pg_proc AS procedure
+       WHERE procedure.oid = pg_catalog.to_regprocedure($1)
+     ),
+     legacy_role AS (
+       SELECT * FROM pg_catalog.pg_roles WHERE rolname = $2
+     ),
+     migration_executor AS (
+       SELECT * FROM pg_catalog.pg_roles WHERE rolname = $3
+     )
+     SELECT
+       session_user AS session_role,
+       current_user AS effective_role,
+       legacy_function.proowner::text AS legacy_function_owner_oid,
+       legacy_role.oid::text AS legacy_owner_oid,
+       legacy_role.rolname AS legacy_owner_name,
+       migration_executor.oid::text AS migration_executor_oid,
+       migration_executor.rolname AS migration_executor_name,
+       pg_catalog.pg_has_role(
+         migration_executor.oid,
+         legacy_role.oid,
+         'MEMBER'
+       ) AS has_legacy_membership,
+       (
+         NOT legacy_role.rolcanlogin
+         AND NOT legacy_role.rolsuper
+         AND NOT legacy_role.rolcreatedb
+         AND NOT legacy_role.rolcreaterole
+         AND NOT legacy_role.rolreplication
+         AND NOT legacy_role.rolbypassrls
+       ) AS legacy_owner_restricted,
+       (
+         NOT migration_executor.rolcanlogin
+         AND NOT migration_executor.rolsuper
+         AND NOT migration_executor.rolcreatedb
+         AND NOT migration_executor.rolcreaterole
+         AND NOT migration_executor.rolreplication
+         AND NOT migration_executor.rolbypassrls
+       ) AS migration_executor_restricted
+     FROM legacy_function
+     CROSS JOIN legacy_role
+     CROSS JOIN migration_executor`,
+    [LEGACY_USAGE_SIGNATURE, boundary.legacyOwner, boundary.migrationExecutor]
+  );
+  validateMigrationRolePrecondition(result, expectedSessionRole);
+}
+
+async function verifyPublicAclMigrationFailure(
+  context,
+  client,
+  expectedSessionRole
+) {
   await client.query(
     `GRANT EXECUTE ON FUNCTION ${LEGACY_USAGE_SIGNATURE} TO PUBLIC`
   );
-  await expectDatabaseFailure(
-    () => applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT),
-    "P0001"
+  await withMigrationExecutorRole(context, client, async () => {
+    await assertMigrationRolePrecondition(client, expectedSessionRole);
+    await expectDatabaseFailure(
+      () => applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT),
+      "P0001"
+    );
+  });
+  requireHarness(
+    !context.timedOut,
+    "EXTERNAL_FIXTURE_OPERATION_TIMEOUT"
   );
   await assertMigrationLedger(client, EXPECTED_MIGRATION_MAX);
   const result = await client.query(`
@@ -822,6 +1052,93 @@ async function verifyPublicAclMigrationFailure(context, client) {
   await client.query(
     `REVOKE ALL PRIVILEGES ON FUNCTION ${LEGACY_USAGE_SIGNATURE} FROM PUBLIC`
   );
+}
+
+const USAGE_OWNER_IDENTITIES = Object.freeze([
+  LEGACY_USAGE_SIGNATURE,
+  ...VERSIONED_USAGE_SIGNATURES,
+]);
+
+function validateUsageOwnerPostcondition(result, expectedSessionRole) {
+  const code = "EXTERNAL_FIXTURE_OWNER_POSTCONDITION_MISMATCH";
+  requireHarness(
+    Array.isArray(result?.rows) &&
+      result.rows.length === USAGE_OWNER_IDENTITIES.length,
+    code
+  );
+  const expectedOwner = USAGE_MIGRATION_BOUNDARY_ROLES.legacyOwner;
+  const executor = USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor;
+  let legacyOwnerOid = null;
+  const observedIdentities = new Set();
+  for (const [index, row] of result.rows.entries()) {
+    requireHarness(
+      exactOwnKeys(row, [
+        "function_identity",
+        "ordinal",
+        "function_oid",
+        "owner_oid",
+        "owner_name",
+        "acl_text",
+        "security_definer",
+        "search_path",
+      ]) &&
+        row.function_identity === USAGE_OWNER_IDENTITIES[index] &&
+        row.ordinal === index + 1 &&
+        typeof row.function_oid === "string" &&
+        /^[1-9][0-9]*$/.test(row.function_oid) &&
+        typeof row.owner_oid === "string" &&
+        /^[1-9][0-9]*$/.test(row.owner_oid) &&
+        row.owner_name === expectedOwner &&
+        row.owner_name !== executor &&
+        row.owner_name !== expectedSessionRole &&
+        typeof row.acl_text === "string" &&
+        row.acl_text.length > 0 &&
+        typeof row.security_definer === "boolean" &&
+        Array.isArray(row.search_path) &&
+        row.search_path.length === 1 &&
+        row.search_path[0] === "search_path=public, pg_temp" &&
+        !observedIdentities.has(row.function_identity),
+      code
+    );
+    observedIdentities.add(row.function_identity);
+    if (index === 0) legacyOwnerOid = row.owner_oid;
+    requireHarness(row.owner_oid === legacyOwnerOid, code);
+  }
+  requireHarness(
+    observedIdentities.size === USAGE_OWNER_IDENTITIES.length &&
+      typeof legacyOwnerOid === "string",
+    code
+  );
+  return true;
+}
+
+async function assertUsageOwnerPostcondition(client, expectedSessionRole) {
+  const result = await client.query(
+    `WITH expected(function_identity, ordinal) AS (
+       SELECT function_identity, ordinal::integer
+       FROM unnest($1::text[]) WITH ORDINALITY
+         AS expected(function_identity, ordinal)
+     )
+     SELECT
+       expected.function_identity,
+       expected.ordinal,
+       target.oid::text AS function_oid,
+       target.proowner::text AS owner_oid,
+       pg_catalog.pg_get_userbyid(target.proowner) AS owner_name,
+       target.proacl::text AS acl_text,
+       target.prosecdef AS security_definer,
+       target.proconfig AS search_path
+     FROM expected
+     LEFT JOIN LATERAL (
+       SELECT procedure.*
+       FROM pg_catalog.pg_proc AS procedure
+       WHERE procedure.oid =
+         pg_catalog.to_regprocedure(expected.function_identity)
+     ) AS target ON true
+     ORDER BY expected.ordinal`,
+    [USAGE_OWNER_IDENTITIES]
+  );
+  validateUsageOwnerPostcondition(result, expectedSessionRole);
 }
 
 async function configureRuntimeAcl(client, configuration) {
@@ -883,6 +1200,7 @@ async function applyMigrationsAndRuntimeAcl(
   configuration,
   specification
 ) {
+  assertUsageFixtureRoleSeparation(configuration.role);
   requireHarness(
     specification.migrations.length === EXPECTED_MIGRATION_COUNT &&
       specification.migrations.at(-1)?.tag.startsWith("0006_"),
@@ -897,11 +1215,17 @@ async function applyMigrationsAndRuntimeAcl(
       await client.query(
         "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
       );
-      await applyMigrationCount(context, client, EXPECTED_MIGRATION_MAX);
+      await createUsageFixtureRoles(client);
+      await grantUsageMigrationPrivileges(client);
+      await withMigrationExecutorRole(context, client, async () => {
+        await assertMigrationExecutorIdentity(client, configuration.role);
+        await applyMigrationCount(context, client, EXPECTED_MIGRATION_MAX);
+      });
       await assertMigrationLedger(client, EXPECTED_MIGRATION_MAX);
       await verifyOldMigrationCompatibility(context, client);
       await configureUsageMigrationBaseline(client);
-      await verifyPublicAclMigrationFailure(context, client);
+      await grantLegacyOwnerMembership(client);
+      await verifyPublicAclMigrationFailure(context, client, configuration.role);
       legacyAclHash = (
         await client.query(
           `SELECT pg_catalog.md5(proacl::text) AS acl_hash
@@ -914,17 +1238,26 @@ async function applyMigrationsAndRuntimeAcl(
         typeof legacyAclHash === "string",
         "EXTERNAL_FIXTURE_LEGACY_ACL_UNAVAILABLE"
       );
-      await applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT);
+      await withMigrationExecutorRole(context, client, async () => {
+        await assertMigrationRolePrecondition(client, configuration.role);
+        await applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT);
+      });
       await assertMigrationLedger(client, EXPECTED_MIGRATION_COUNT);
-      await applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT);
+      await assertUsageOwnerPostcondition(client, configuration.role);
+      await withMigrationExecutorRole(context, client, async () => {
+        await assertMigrationRolePrecondition(client, configuration.role);
+        await applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT);
+      });
       await assertMigrationLedger(client, EXPECTED_MIGRATION_COUNT);
+      await assertUsageOwnerPostcondition(client, configuration.role);
     }
   );
   await verifyUsageAclInheritance(
     context,
     clientFactory,
     configuration,
-    legacyAclHash
+    legacyAclHash,
+    configuration.role
   );
   await verifyPlanResolution(context, clientFactory, configuration);
   await verifyReservationLifecycle(context, clientFactory, configuration);
@@ -1046,13 +1379,15 @@ async function verifyUsageAclInheritance(
   context,
   clientFactory,
   configuration,
-  legacyAclHash
+  legacyAclHash,
+  expectedSessionRole
 ) {
   await withClient(
     context,
     clientFactory,
     fixtureCredentials(configuration),
     async (client) => {
+      await assertUsageOwnerPostcondition(client, expectedSessionRole);
       const targets = usageSignatureArraySql();
       await catalogBoolean(
         client,
@@ -1736,6 +2071,60 @@ export function validateIndependentExtensionInventoryForTests(rows) {
   return Object.freeze({ match: true });
 }
 
+export async function runMigrationOwnerBoundaryProbeForTests({
+  client,
+  expectedSessionRole,
+  deadlineLimits,
+}) {
+  assertUsageFixtureRoleSeparation(expectedSessionRole);
+  const context = createDeadlineContext(deadlineLimits);
+  let failureMarker = null;
+  try {
+    await withClient(context, () => client, {}, async (ownedClient) => {
+      await createUsageFixtureRoles(ownedClient);
+      await grantUsageMigrationPrivileges(ownedClient);
+      await withMigrationExecutorRole(context, ownedClient, async () => {
+        await assertMigrationExecutorIdentity(
+          ownedClient,
+          expectedSessionRole
+        );
+        await runBoundedPhase(
+          context,
+          "migration",
+          context.limits.migrationMilliseconds,
+          () => Promise.resolve()
+        );
+      });
+      await configureUsageMigrationBaseline(ownedClient);
+      await grantLegacyOwnerMembership(ownedClient);
+      await withMigrationExecutorRole(context, ownedClient, async () => {
+        await assertMigrationRolePrecondition(ownedClient, expectedSessionRole);
+        await runBoundedPhase(
+          context,
+          "migration",
+          context.limits.migrationMilliseconds,
+          () => Promise.resolve()
+        );
+      });
+      await assertUsageOwnerPostcondition(ownedClient, expectedSessionRole);
+    });
+  } catch (error) {
+    failureMarker =
+      error instanceof HarnessIssue
+        ? error.code
+        : "EXTERNAL_FIXTURE_VERIFICATION_FAILED";
+  }
+  const ownedClient = [...context.ownedClients][0];
+  return Object.freeze({
+    failureMarker,
+    timedOut: context.timedOut,
+    activeClientCount: context.activeClients.size,
+    usable: ownedClient?.usable === true,
+    destroyed: ownedClient?.destroyed === true,
+    operationStarts: Object.freeze({ ...context.operationStarts }),
+  });
+}
+
 /**
  * @param {{
  *   environment?: NodeJS.ProcessEnv,
@@ -1944,35 +2333,39 @@ export async function runHarnessDeadlineProbeForTests({
   const startedAt = performance.now();
   let failureMarker = null;
   try {
-    const ownedClient = await openClient(context, () => client, {});
-    if (scenario === "total-deadline-exhausted") {
-      context.absoluteDeadline = performance.now() - 1;
-      await ownedClient.proxy.query("SELECT fixed_deadline_probe");
-    } else if (scenario === "raw-query-hang") {
-      await ownedClient.proxy.query("SELECT fixed_deadline_probe");
-    } else if (scenario === "transaction-hang") {
-      await ownedClient.proxy.query("BEGIN");
-    } else if (scenario === "independent-inventory-hang") {
-      await ownedClient.proxy.query(INDEPENDENT_EXTENSION_INVENTORY_SQL);
-    } else if (scenario === "cleanup-query-hang") {
-      await ownedClient.proxy.query("ROLLBACK");
-    } else if (scenario === "end-hang") {
-      await closeOwnedClient(context, ownedClient);
-    } else if (
-      scenario === "migration-hang" ||
-      scenario === "preflight-hang" ||
-      scenario === "postflight-hang"
-    ) {
-      await runBoundedPhase(
-        context,
-        scenario === "migration-hang" ? "migration" : "phase",
-        scenario === "migration-hang"
-          ? context.limits.migrationMilliseconds
-          : context.limits.phaseMilliseconds,
-        neverSettlingOperation
+    if (scenario === "transaction-hang") {
+      await withRollback(context, () => client, {}, (transactionClient) =>
+        transactionClient.query("SELECT fixed_transaction_body_probe")
       );
-    } else if (scenario !== "connect-hang") {
-      throw new HarnessIssue("EXTERNAL_FIXTURE_DEADLINE_PROBE_INVALID");
+    } else {
+      const ownedClient = await openClient(context, () => client, {});
+      if (scenario === "total-deadline-exhausted") {
+        context.absoluteDeadline = performance.now() - 1;
+        await ownedClient.proxy.query("SELECT fixed_deadline_probe");
+      } else if (scenario === "raw-query-hang") {
+        await ownedClient.proxy.query("SELECT fixed_deadline_probe");
+      } else if (scenario === "independent-inventory-hang") {
+        await ownedClient.proxy.query(INDEPENDENT_EXTENSION_INVENTORY_SQL);
+      } else if (scenario === "cleanup-query-hang") {
+        await ownedClient.proxy.query("ROLLBACK");
+      } else if (scenario === "end-hang") {
+        await closeOwnedClient(context, ownedClient);
+      } else if (
+        scenario === "migration-hang" ||
+        scenario === "preflight-hang" ||
+        scenario === "postflight-hang"
+      ) {
+        await runBoundedPhase(
+          context,
+          scenario === "migration-hang" ? "migration" : "phase",
+          scenario === "migration-hang"
+            ? context.limits.migrationMilliseconds
+            : context.limits.phaseMilliseconds,
+          neverSettlingOperation
+        );
+      } else if (scenario !== "connect-hang") {
+        throw new HarnessIssue("EXTERNAL_FIXTURE_DEADLINE_PROBE_INVALID");
+      }
     }
   } catch (error) {
     failureMarker =
@@ -2013,6 +2406,91 @@ export async function runHarnessDeadlineProbeForTests({
         (total, value) => total + value,
         0
       ),
+  });
+}
+
+function ownedClientStateForTests(context, ownedClient) {
+  return Object.freeze({
+    timedOut: context.timedOut,
+    activeClientCount: context.activeClients.size,
+    registered: context.activeClients.has(ownedClient),
+    usable: ownedClient.usable,
+    destroyed: ownedClient.destroyed,
+    closed: ownedClient.closed,
+    destroyCount: ownedClient.destroyCount,
+    operationStarts: Object.freeze({ ...context.operationStarts }),
+  });
+}
+
+export async function createIndependentDeadlineContextsForTests({
+  targetClient,
+  unrelatedClient,
+  deadlineLimits,
+}) {
+  requireHarness(
+    targetClient !== unrelatedClient,
+    "EXTERNAL_FIXTURE_DEADLINE_PROBE_INVALID"
+  );
+  const targetContext = createDeadlineContext(deadlineLimits);
+  const unrelatedContext = createDeadlineContext(deadlineLimits);
+  const targetOwnedClient = await openClient(
+    targetContext,
+    () => targetClient,
+    {}
+  );
+  const unrelatedOwnedClient = await openClient(
+    unrelatedContext,
+    () => unrelatedClient,
+    {}
+  );
+  const targetOperation = targetOwnedClient.proxy
+    .query("SELECT fixed_independent_context_probe")
+    .then(
+      () => null,
+      (error) =>
+        error instanceof HarnessIssue
+          ? error.code
+          : "EXTERNAL_FIXTURE_VERIFICATION_FAILED"
+    );
+
+  return Object.freeze({
+    targetOperation,
+    inspectTargetForTests() {
+      return ownedClientStateForTests(targetContext, targetOwnedClient);
+    },
+    inspectUnrelatedForTests() {
+      return ownedClientStateForTests(unrelatedContext, unrelatedOwnedClient);
+    },
+    async closeUnrelatedForTests() {
+      await closeOwnedClient(unrelatedContext, unrelatedOwnedClient);
+    },
+  });
+}
+
+export async function runHarnessTransactionBoundaryProbeForTests({
+  client,
+  deadlineLimits,
+}) {
+  const context = createDeadlineContext(deadlineLimits);
+  let failureMarker = null;
+  try {
+    await withRollback(context, () => client, {}, (transactionClient) =>
+      transactionClient.query("SELECT fixed_transaction_body_probe")
+    );
+  } catch (error) {
+    failureMarker =
+      error instanceof HarnessIssue
+        ? error.code
+        : "EXTERNAL_FIXTURE_VERIFICATION_FAILED";
+  }
+  const ownedClient = [...context.ownedClients][0];
+  return Object.freeze({
+    failureMarker,
+    timedOut: context.timedOut,
+    activeClientCount: context.activeClients.size,
+    destroyed: ownedClient?.destroyed === true,
+    closed: ownedClient?.closed === true,
+    operationStarts: Object.freeze({ ...context.operationStarts }),
   });
 }
 
