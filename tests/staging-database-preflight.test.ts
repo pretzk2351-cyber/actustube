@@ -30,6 +30,7 @@ import {
   runHarnessDeadlineProbeForTests,
   runHarnessTransactionBoundaryProbeForTests,
   runMigrationOwnerBoundaryProbeForTests,
+  runOwnershipCanonicalizationProbeForTests,
   validateExternalFixtureConfigurationForTests,
   validateIndependentExtensionInventoryForTests,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
@@ -1047,7 +1048,30 @@ function validMigrationRolePrecondition(
   };
 }
 
-function validUsageOwnerPostcondition() {
+function validInitialMigrationBoundaryRoles() {
+  return [
+    {
+      ordinal: 1,
+      role_name: testLegacyOwner,
+      role_oid: testLegacyOwnerOid,
+      session_role: testFixtureSessionRole,
+      effective_role: testFixtureSessionRole,
+      role_restricted: true,
+      oid_is_separated: true,
+    },
+    {
+      ordinal: 2,
+      role_name: testMigrationExecutor,
+      role_oid: testMigrationExecutorOid,
+      session_role: testFixtureSessionRole,
+      effective_role: testFixtureSessionRole,
+      role_restricted: true,
+      oid_is_separated: true,
+    },
+  ];
+}
+
+function validUsageOwnerPostcondition(): Array<Record<string, any>> {
   return testUsageOwnerIdentities.map((functionIdentity, index) => ({
     function_identity: functionIdentity,
     ordinal: index + 1,
@@ -1055,23 +1079,33 @@ function validUsageOwnerPostcondition() {
     owner_oid: testLegacyOwnerOid,
     owner_name: testLegacyOwner,
     acl_text: "{fixed_acl}",
-    security_definer: true,
+    security_definer: false,
     search_path: ["search_path=public, pg_temp"],
   }));
 }
 
-function ownerBoundaryQueryLabel(statement: string) {
+function ownerBoundaryQueryLabel(
+  statement: string,
+  parameters: unknown[] = []
+) {
   if (statement.includes("CREATE ROLE") && statement.includes(testLegacyOwner)) {
     return "create-fixed-roles";
   }
   if (statement.includes("fixture_database_grant")) return "minimal-grants";
   if (statement.startsWith("SET ROLE")) return "set-migration-executor";
   if (statement === "RESET ROLE") return "reset-role";
+  if (statement.includes("WITH expected(role_name, ordinal)")) {
+    return "initial-role-contract";
+  }
   if (statement.includes("AS migration_executor_restricted") &&
       !statement.includes("legacy_function AS")) {
     return "migration-executor-identity";
   }
-  if (statement.includes("ALTER FUNCTION") && statement.includes("OWNER TO")) {
+  if (
+    statement.includes("ALTER FUNCTION") &&
+    statement.includes("OWNER TO") &&
+    !statement.includes("OWNER TO SESSION_USER")
+  ) {
     return "legacy-owner-baseline";
   }
   if (statement.trimStart().startsWith("GRANT") &&
@@ -1083,17 +1117,45 @@ function ownerBoundaryQueryLabel(statement: string) {
   if (statement.includes("WITH expected(function_identity, ordinal)")) {
     return "owner-postcondition";
   }
+  if (statement.includes("fixed_migration_callback_probe")) {
+    return `migration-callback-${String(parameters[0] ?? "unknown")}`;
+  }
+  if (statement.includes("fixed_before_final_boundary")) {
+    return "before-final-boundary";
+  }
+  if (statement.includes("unsupported_owned_object")) {
+    return "pre-canonical-inventory";
+  }
+  if (statement.includes("'database'::text AS object_kind")) {
+    return "post-canonical-snapshot";
+  }
+  if (/^ALTER (?:SCHEMA|TABLE|SEQUENCE|TYPE|FUNCTION) /.test(statement)) {
+    return "canonical-owner-change";
+  }
+  if (statement.includes("fixed_postflight_boundary")) {
+    return "postflight-boundary";
+  }
   return "unknown-fixed-query";
 }
 
 function createMigrationOwnerFakeClient({
+  initialRoleRows = validInitialMigrationBoundaryRoles(),
   preconditionRows = [validMigrationRolePrecondition()],
   postconditionRows = validUsageOwnerPostcondition(),
   hangOnLabel = null as string | null,
+  rejectOnLabel = null as string | null,
 } = {}) {
   const state = {
     query: [] as string[],
     parameters: [] as unknown[][],
+    labels: [] as string[],
+    activeRole: testFixtureSessionRole,
+    callbackObservations: [] as Array<{
+      kind: string;
+      sequence: number;
+      client: unknown;
+      activeRole: string;
+    }>,
     connect: 0,
     end: 0,
     destroy: 0,
@@ -1117,8 +1179,27 @@ function createMigrationOwnerFakeClient({
     query(statement: string, parameters: unknown[] = []) {
       state.query.push(statement);
       state.parameters.push(parameters);
-      const label = ownerBoundaryQueryLabel(statement);
+      const label = ownerBoundaryQueryLabel(statement, parameters);
+      state.labels.push(label);
+      if (label === "set-migration-executor") {
+        state.activeRole = testMigrationExecutor;
+      } else if (label === "reset-role") {
+        state.activeRole = testFixtureSessionRole;
+      } else if (label.startsWith("migration-callback-")) {
+        state.callbackObservations.push({
+          kind: label.slice("migration-callback-".length),
+          sequence: state.query.length,
+          client,
+          activeRole: state.activeRole,
+        });
+      }
       if (label === hangOnLabel) return new Promise(() => undefined);
+      if (label === rejectOnLabel) {
+        return Promise.reject(new Error("fixed-owner-boundary-failure"));
+      }
+      if (label === "initial-role-contract") {
+        return Promise.resolve({ rows: initialRoleRows });
+      }
       if (label === "migration-executor-identity") {
         return Promise.resolve({
           rows: [
@@ -1142,6 +1223,337 @@ function createMigrationOwnerFakeClient({
     end() {
       state.end += 1;
       state.usable = false;
+      return Promise.resolve();
+    },
+  };
+  return { client, state };
+}
+
+const testRepositoryTables = [
+  "analysis_runs",
+  "improvement_actions",
+  "oauth_accounts",
+  "plans",
+  "usage_reservation_leases",
+  "user_plan_assignments",
+  "user_usage_buckets",
+  "users",
+] as const;
+const testRepositoryIndexes = [
+  "analysis_runs_id_user_unique",
+  "analysis_runs_pkey",
+  "analysis_runs_user_analyzed_idx",
+  "improvement_actions_analysis_run_unique",
+  "improvement_actions_one_planned_per_user",
+  "improvement_actions_pkey",
+  "improvement_actions_user_updated_idx",
+  "oauth_accounts_pkey",
+  "oauth_accounts_provider_account_unique",
+  "oauth_accounts_user_id_idx",
+  "plans_pkey",
+  "usage_reservation_leases_created_at_idx",
+  "usage_reservation_leases_pkey",
+  "usage_reservation_leases_user_metric_idx",
+  "user_plan_assignments_one_active_per_user",
+  "user_plan_assignments_pkey",
+  "user_plan_assignments_plan_code_idx",
+  "user_usage_buckets_period_start_idx",
+  "user_usage_buckets_pkey",
+  "user_usage_buckets_scope_unique",
+  "users_pkey",
+  "users_status_idx",
+] as const;
+const testRepositoryEnums = [
+  "improvement_action_status",
+  "plan_assignment_source",
+  "plan_assignment_status",
+  "usage_metric",
+  "usage_period_kind",
+  "user_status",
+] as const;
+const testCanonicalFunctions = [
+  {
+    name: "finalize_ai_consult_reservation",
+    identity:
+      "p_reservation_id uuid, p_user_id uuid, p_analysis_run_id uuid, p_ai_consult_snapshot jsonb, p_created_at timestamp with time zone",
+  },
+  {
+    name: "finalize_channel_analysis_reservation",
+    identity:
+      "p_reservation_id uuid, p_user_id uuid, p_channel_id character varying, p_channel_title character varying, p_analysis_snapshot jsonb, p_regular_video_count integer, p_short_video_count integer, p_regular_average_views bigint, p_short_average_views bigint, p_analyzed_at timestamp with time zone",
+  },
+  {
+    name: "finalize_usage_reservation",
+    identity: "p_reservation_id uuid, p_user_id uuid",
+  },
+  {
+    name: "get_usage_status_v1",
+    identity:
+      "p_user_id uuid, p_session_version integer, p_now timestamp with time zone",
+  },
+  {
+    name: "recover_stale_usage_reservations",
+    identity:
+      "p_stale_before timestamp with time zone, p_batch_size integer",
+  },
+  {
+    name: "release_usage_limits",
+    identity: "p_reservation_id uuid, p_user_id uuid",
+  },
+  {
+    name: "reserve_usage_limits",
+    identity:
+      "p_user_id uuid, p_session_version integer, p_metric usage_metric, p_now timestamp with time zone",
+  },
+  {
+    name: "reserve_usage_limits_v2",
+    identity:
+      "p_user_id uuid, p_session_version integer, p_metric usage_metric, p_now timestamp with time zone",
+  },
+  {
+    name: "resolve_effective_usage_plan_v1",
+    identity: "p_user_id uuid, p_now timestamp with time zone",
+  },
+  {
+    name: "sync_google_oauth_account",
+    identity:
+      "p_provider_account_id character varying, p_email character varying, p_name character varying, p_image_url character varying, p_granted_scope text, p_seen_at timestamp with time zone",
+  },
+  {
+    name: "usage_period_boundaries_v1",
+    identity: "p_now timestamp with time zone",
+  },
+] as const;
+const testLegacyOwnedFunctionNames = new Set([
+  "get_usage_status_v1",
+  "reserve_usage_limits",
+  "reserve_usage_limits_v2",
+  "resolve_effective_usage_plan_v1",
+  "usage_period_boundaries_v1",
+]);
+
+type TestOwnershipRow = {
+  object_kind: string;
+  schema_name: string | null;
+  object_name: string;
+  function_identity: string | null;
+  owner_name: string;
+};
+
+function sortTestOwnershipRows(rows: TestOwnershipRow[]) {
+  const keys = [
+    "object_kind",
+    "schema_name",
+    "object_name",
+    "function_identity",
+    "owner_name",
+  ] as const;
+  return [...rows].sort((left, right) => {
+    for (const key of keys) {
+      const comparison = String(left[key] ?? "").localeCompare(
+        String(right[key] ?? "")
+      );
+      if (comparison !== 0) return comparison;
+    }
+    return 0;
+  });
+}
+
+function validPreCanonicalOwnershipRows(): TestOwnershipRow[] {
+  return sortTestOwnershipRows([
+    ...testRepositoryTables.map((name) => ({
+      object_kind: "table",
+      schema_name: "public",
+      object_name: name,
+      function_identity: null,
+      owner_name: testMigrationExecutor,
+    })),
+    ...testRepositoryIndexes.map((name) => ({
+      object_kind: "index",
+      schema_name: "public",
+      object_name: name,
+      function_identity: null,
+      owner_name: testMigrationExecutor,
+    })),
+    ...testRepositoryEnums.map((name) => ({
+      object_kind: "type",
+      schema_name: "public",
+      object_name: name,
+      function_identity: null,
+      owner_name: testMigrationExecutor,
+    })),
+    ...testCanonicalFunctions.map((entry) => ({
+      object_kind: "function",
+      schema_name: "public",
+      object_name: entry.name,
+      function_identity: entry.identity,
+      owner_name: testLegacyOwnedFunctionNames.has(entry.name)
+        ? testLegacyOwner
+        : testMigrationExecutor,
+    })),
+  ]);
+}
+
+function validPostCanonicalOwnershipRows(): TestOwnershipRow[] {
+  return sortTestOwnershipRows([
+    {
+      object_kind: "database",
+      schema_name: null,
+      object_name: "current_database",
+      function_identity: null,
+      owner_name: testFixtureSessionRole,
+    },
+    ...["drizzle", "public"].map((name) => ({
+      object_kind: "schema",
+      schema_name: name,
+      object_name: name,
+      function_identity: null,
+      owner_name: testFixtureSessionRole,
+    })),
+    ...testRepositoryTables.map((name) => ({
+      object_kind: "table",
+      schema_name: "public",
+      object_name: name,
+      function_identity: null,
+      owner_name: testFixtureSessionRole,
+    })),
+    {
+      object_kind: "table",
+      schema_name: "drizzle",
+      object_name: "__drizzle_migrations",
+      function_identity: null,
+      owner_name: testFixtureSessionRole,
+    },
+    ...testRepositoryIndexes.map((name) => ({
+      object_kind: "index",
+      schema_name: "public",
+      object_name: name,
+      function_identity: null,
+      owner_name: testFixtureSessionRole,
+    })),
+    {
+      object_kind: "index",
+      schema_name: "drizzle",
+      object_name: "__drizzle_migrations_pkey",
+      function_identity: null,
+      owner_name: testFixtureSessionRole,
+    },
+    {
+      object_kind: "sequence",
+      schema_name: "drizzle",
+      object_name: "__drizzle_migrations_id_seq",
+      function_identity: null,
+      owner_name: testFixtureSessionRole,
+    },
+    ...testRepositoryEnums.map((name) => ({
+      object_kind: "type",
+      schema_name: "public",
+      object_name: name,
+      function_identity: null,
+      owner_name: testFixtureSessionRole,
+    })),
+    ...testCanonicalFunctions.map((entry) => ({
+      object_kind: "function",
+      schema_name: "public",
+      object_name: entry.name,
+      function_identity: entry.identity,
+      owner_name: testFixtureSessionRole,
+    })),
+  ]);
+}
+
+function createOwnershipCanonicalizationFakeClient({
+  preRows = validPreCanonicalOwnershipRows(),
+  postRows = validPostCanonicalOwnershipRows(),
+  rejectOwnerChangeAt = null as number | null,
+  hangOwnerChangeAt = null as number | null,
+  hangOnSnapshot = false,
+  events = [] as string[],
+} = {}) {
+  const state = {
+    connect: 0,
+    query: [] as string[],
+    parameters: [] as unknown[][],
+    labels: [] as string[],
+    ownerChanges: [] as string[],
+    end: 0,
+    destroy: 0,
+    queriesAtDestroy: null as number | null,
+  };
+  const client = {
+    connection: {
+      stream: {
+        destroy() {
+          state.destroy += 1;
+          state.queriesAtDestroy = state.query.length;
+        },
+      },
+    },
+    connect() {
+      state.connect += 1;
+      return Promise.resolve();
+    },
+    query(statement: string, parameters: unknown[] = []) {
+      state.query.push(statement);
+      state.parameters.push(parameters);
+      const label = ownerBoundaryQueryLabel(statement, parameters);
+      state.labels.push(label);
+      events.push(label);
+      if (label === "pre-canonical-inventory") {
+        return Promise.resolve({ rows: preRows });
+      }
+      if (label === "post-canonical-snapshot") {
+        return hangOnSnapshot
+          ? new Promise(() => undefined)
+          : Promise.resolve({ rows: postRows });
+      }
+      if (label === "canonical-owner-change") {
+        state.ownerChanges.push(statement);
+        if (state.ownerChanges.length === hangOwnerChangeAt) {
+          return new Promise(() => undefined);
+        }
+        if (state.ownerChanges.length === rejectOwnerChangeAt) {
+          return Promise.reject(new Error("fixed-canonicalization-failure"));
+        }
+      }
+      return Promise.resolve({ rows: [] });
+    },
+    end() {
+      state.end += 1;
+      return Promise.resolve();
+    },
+  };
+  return { client, state };
+}
+
+function createPostflightBoundaryFakeClient(events: string[] = []) {
+  const state = {
+    connect: 0,
+    query: [] as string[],
+    end: 0,
+    destroy: 0,
+  };
+  const client = {
+    connection: {
+      stream: {
+        destroy() {
+          state.destroy += 1;
+        },
+      },
+    },
+    connect() {
+      state.connect += 1;
+      events.push("postflight-connect");
+      return Promise.resolve();
+    },
+    query(statement: string) {
+      state.query.push(statement);
+      events.push(ownerBoundaryQueryLabel(statement));
+      return Promise.resolve({ rows: [] });
+    },
+    end() {
+      state.end += 1;
+      events.push("postflight-close");
       return Promise.resolve();
     },
   };
@@ -1240,6 +1652,7 @@ describe("connection-only external fixture boundary", () => {
         "runHarnessDeadlineProbeForTests",
         "runHarnessTransactionBoundaryProbeForTests",
         "runMigrationOwnerBoundaryProbeForTests",
+        "runOwnershipCanonicalizationProbeForTests",
         "validateExternalFixtureConfigurationForTests",
         "validateIndependentExtensionInventoryForTests",
       ].sort()
@@ -1309,7 +1722,7 @@ describe("connection-only external fixture boundary", () => {
         migrationMilliseconds: 100,
       },
     });
-    const labels = fake.state.query.map(ownerBoundaryQueryLabel);
+    const labels = fake.state.labels;
     expect(result).toMatchObject({
       failureMarker: null,
       timedOut: false,
@@ -1317,22 +1730,31 @@ describe("connection-only external fixture boundary", () => {
     });
     expect(labels).toEqual([
       "create-fixed-roles",
+      "initial-role-contract",
       "minimal-grants",
       "set-migration-executor",
       "migration-executor-identity",
+      "migration-callback-baseline",
       "reset-role",
       "legacy-owner-baseline",
       "legacy-owner-membership",
+      "before-final-boundary",
       "set-migration-executor",
       "role-precondition",
+      "migration-callback-final",
+      "reset-role",
+      "owner-postcondition",
+      "set-migration-executor",
+      "role-precondition",
+      "migration-callback-replay",
       "reset-role",
       "owner-postcondition",
     ]);
     expect(result.operationStarts).toMatchObject({
       connect: 1,
-      query: 11,
+      query: 20,
       close: 1,
-      migration: 2,
+      migration: 3,
     });
     expect(fake.state).toMatchObject({
       connect: 1,
@@ -1340,37 +1762,245 @@ describe("connection-only external fixture boundary", () => {
       destroy: 0,
       usable: false,
     });
-    const preconditionParameters = fake.state.parameters[8];
-    expect(preconditionParameters).toEqual([
-      testUsageOwnerIdentities[0],
-      testLegacyOwner,
-      testMigrationExecutor,
+    expect(fake.state.callbackObservations).toHaveLength(3);
+    expect(fake.state.callbackObservations.map((entry) => entry.kind)).toEqual([
+      "baseline",
+      "final",
+      "replay",
     ]);
-    expect(fake.state.parameters[10]).toEqual([testUsageOwnerIdentities]);
+    expect(
+      fake.state.callbackObservations.every(
+        (entry) =>
+          entry.client === fake.client &&
+          entry.activeRole === testMigrationExecutor
+      )
+    ).toBe(true);
+    const baselineIndex = labels.indexOf("migration-callback-baseline");
+    const finalIndex = labels.indexOf("migration-callback-final");
+    const replayIndex = labels.indexOf("migration-callback-replay");
+    expect(baselineIndex).toBeGreaterThan(labels.indexOf("set-migration-executor"));
+    expect(baselineIndex).toBeLessThan(labels.indexOf("reset-role"));
+    expect(finalIndex).toBeGreaterThan(labels.indexOf("role-precondition"));
+    expect(finalIndex).toBeLessThan(labels.indexOf("reset-role", finalIndex + 1));
+    expect(replayIndex).toBeGreaterThan(
+      labels.lastIndexOf("role-precondition")
+    );
+    expect(replayIndex).toBeLessThan(labels.lastIndexOf("reset-role"));
+    const preconditionParameterIndexes = labels
+      .map((label, index) => (label === "role-precondition" ? index : -1))
+      .filter((index) => index >= 0);
+    expect(preconditionParameterIndexes).toHaveLength(2);
+    for (const index of preconditionParameterIndexes) {
+      expect(fake.state.parameters[index]).toEqual([
+        testUsageOwnerIdentities[0],
+        testLegacyOwner,
+        testMigrationExecutor,
+      ]);
+    }
+    const postconditionParameterIndexes = labels
+      .map((label, index) => (label === "owner-postcondition" ? index : -1))
+      .filter((index) => index >= 0);
+    expect(postconditionParameterIndexes).toHaveLength(2);
+    for (const index of postconditionParameterIndexes) {
+      expect(fake.state.parameters[index]).toEqual([testUsageOwnerIdentities]);
+    }
+    const grantStatement = fake.state.query[labels.indexOf("minimal-grants")];
+    expect(grantStatement).toContain("GRANT USAGE, CREATE ON SCHEMA drizzle");
+    expect(grantStatement).toContain(testMigrationExecutor);
+    expect(labels.indexOf("minimal-grants")).toBeLessThan(baselineIndex);
     expect(JSON.stringify(result)).not.toMatch(
       /actustube_ci_usage_|alter function|grant create|owner to/i
     );
 
     const source = await readFile(postgresHarnessModule, "utf8");
-    const flow = source.slice(
-      source.indexOf("async function applyMigrationsAndRuntimeAcl"),
-      source.indexOf("function usageSignatureArraySql")
+    expect(
+      source.match(/async function orchestrateUsageMigrationOwnerBoundary/g)
+    ).toHaveLength(1);
+    expect(source).not.toContain("() => Promise.resolve()");
+  });
+
+  it.each([
+    ["missing legacy owner", validInitialMigrationBoundaryRoles().slice(1)],
+    [
+      "duplicate role row",
+      [
+        validInitialMigrationBoundaryRoles()[0],
+        validInitialMigrationBoundaryRoles()[0],
+      ],
+    ],
+    [
+      "duplicate role OID",
+      validInitialMigrationBoundaryRoles().map((row, index) =>
+        index === 1 ? { ...row, role_oid: testLegacyOwnerOid } : row
+      ),
+    ],
+    [
+      "noncanonical role OID",
+      validInitialMigrationBoundaryRoles().map((row, index) =>
+        index === 1 ? { ...row, role_oid: "081002" } : row
+      ),
+    ],
+    [
+      "elevated legacy owner",
+      validInitialMigrationBoundaryRoles().map((row, index) =>
+        index === 0 ? { ...row, role_restricted: false } : row
+      ),
+    ],
+    [
+      "session or runtime OID collision",
+      validInitialMigrationBoundaryRoles().map((row, index) =>
+        index === 0 ? { ...row, oid_is_separated: false } : row
+      ),
+    ],
+    [
+      "unknown catalog key",
+      validInitialMigrationBoundaryRoles().map((row, index) =>
+        index === 1 ? { ...row, unknown_key: true } : row
+      ),
+    ],
+  ])("rejects the initial dual-role contract when %s", async (_label, rows) => {
+    const fake = createMigrationOwnerFakeClient({ initialRoleRows: rows });
+    const result = await runMigrationOwnerBoundaryProbeForTests({
+      client: fake.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_INITIAL_ROLE_CONTRACT_MISMATCH"
     );
-    const orderedOperations = [
-      "createUsageFixtureRoles(client)",
-      "grantUsageMigrationPrivileges(client)",
-      "applyMigrationCount(context, client, EXPECTED_MIGRATION_MAX)",
-      "configureUsageMigrationBaseline(client)",
-      "grantLegacyOwnerMembership(client)",
-      "verifyPublicAclMigrationFailure(context, client, configuration.role)",
-      "applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT)",
-      "assertUsageOwnerPostcondition(client, configuration.role)",
-    ];
-    let previousIndex = -1;
-    for (const operation of orderedOperations) {
-      const operationIndex = flow.indexOf(operation, previousIndex + 1);
-      expect(operationIndex).toBeGreaterThan(previousIndex);
-      previousIndex = operationIndex;
+    expect(fake.state.labels).toEqual([
+      "create-fixed-roles",
+      "initial-role-contract",
+    ]);
+    expect(fake.state.callbackObservations).toEqual([]);
+    expect(result.operationStarts.migration).toBe(0);
+    expect(fake.state.destroy).toBe(0);
+    expect(fake.state.end).toBe(1);
+  });
+
+  it("grants only the fixed executor USAGE and CREATE on drizzle before baseline Migration", async () => {
+    const fake = createMigrationOwnerFakeClient();
+    const result = await runMigrationOwnerBoundaryProbeForTests({
+      client: fake.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBeNull();
+    const grantIndex = fake.state.labels.indexOf("minimal-grants");
+    const grantStatement = fake.state.query[grantIndex];
+    expect(grantStatement).toMatch(
+      /GRANT USAGE, CREATE ON SCHEMA drizzle\s+TO "actustube_ci_usage_migration_executor";/
+    );
+    expect(grantStatement).not.toMatch(
+      /GRANT USAGE, CREATE ON SCHEMA drizzle[\s\S]*?(?:PUBLIC|actustube_ci_fixture_runtime|actustube_ci_usage_legacy_owner)/
+    );
+    expect(fake.state.labels.indexOf("initial-role-contract")).toBeLessThan(
+      grantIndex
+    );
+    expect(grantIndex).toBeLessThan(
+      fake.state.labels.indexOf("migration-callback-baseline")
+    );
+  });
+
+  it("rejects a Migration callback that attempts to replace the shared Client", async () => {
+    const fake = createMigrationOwnerFakeClient();
+    const result = await runMigrationOwnerBoundaryProbeForTests({
+      client: fake.client,
+      expectedSessionRole: testFixtureSessionRole,
+      callbackScenario: "replace-client",
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_MIGRATION_CALLBACK_REPLACEMENT"
+    );
+    expect(fake.state.callbackObservations.map((entry) => entry.kind)).toEqual([
+      "baseline",
+    ]);
+    expect(fake.state.labels).not.toContain("migration-callback-final");
+    expect(fake.state.labels).not.toContain("migration-callback-replay");
+  });
+
+  it("starts no later callback after a finite final callback failure", async () => {
+    const fake = createMigrationOwnerFakeClient({
+      rejectOnLabel: "migration-callback-final",
+    });
+    const result = await runMigrationOwnerBoundaryProbeForTests({
+      client: fake.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe("EXTERNAL_FIXTURE_VERIFICATION_FAILED");
+    expect(fake.state.callbackObservations.map((entry) => entry.kind)).toEqual([
+      "baseline",
+      "final",
+    ]);
+    expect(fake.state.labels).not.toContain("migration-callback-replay");
+    expect(fake.state.labels).not.toContain("owner-postcondition");
+  });
+
+  it("starts no reset or later callback after a baseline callback timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = createMigrationOwnerFakeClient({
+        hangOnLabel: "migration-callback-baseline",
+      });
+      const pending = runMigrationOwnerBoundaryProbeForTests({
+        client: fake.client,
+        expectedSessionRole: testFixtureSessionRole,
+        deadlineLimits: {
+          totalMilliseconds: 100,
+          connectMilliseconds: 20,
+          queryMilliseconds: 20,
+          closeMilliseconds: 20,
+          phaseMilliseconds: 20,
+          migrationMilliseconds: 20,
+        },
+      });
+      await vi.advanceTimersByTimeAsync(120);
+      const result = await pending;
+      expect(result).toMatchObject({
+        failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
+        timedOut: true,
+        destroyed: true,
+      });
+      expect(fake.state.callbackObservations.map((entry) => entry.kind)).toEqual([
+        "baseline",
+      ]);
+      expect(fake.state.labels).not.toContain("reset-role");
+      expect(fake.state.labels).not.toContain("migration-callback-final");
+      expect(fake.state.labels).not.toContain("migration-callback-replay");
+      expect(fake.state.queriesAtDestroy).toBe(fake.state.query.length);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -1431,7 +2061,7 @@ describe("connection-only external fixture boundary", () => {
     expect(result.failureMarker).toBe(
       "EXTERNAL_FIXTURE_MIGRATION_ROLE_PRECONDITION_MISMATCH"
     );
-    const labels = fake.state.query.map(ownerBoundaryQueryLabel);
+    const labels = fake.state.labels;
     expect(labels).toContain("role-precondition");
     expect(labels).not.toContain("owner-postcondition");
     expect(result.operationStarts.migration).toBe(1);
@@ -1468,6 +2098,45 @@ describe("connection-only external fixture boundary", () => {
         index === 4 ? { ...row, owner_oid: "81999" } : row
       ),
     ],
+    [
+      "duplicate function OID",
+      validUsageOwnerPostcondition().map((row, index, rows) =>
+        index === 4 ? { ...row, function_oid: rows[0].function_oid } : row
+      ),
+    ],
+    [
+      "zero function OID",
+      validUsageOwnerPostcondition().map((row, index) =>
+        index === 1 ? { ...row, function_oid: "0" } : row
+      ),
+    ],
+    [
+      "negative function OID",
+      validUsageOwnerPostcondition().map((row, index) =>
+        index === 2 ? { ...row, function_oid: "-1" } : row
+      ),
+    ],
+    [
+      "noncanonical function OID",
+      validUsageOwnerPostcondition().map((row, index) =>
+        index === 3 ? { ...row, function_oid: "082004" } : row
+      ),
+    ],
+    [
+      "one SECURITY DEFINER function",
+      validUsageOwnerPostcondition().map((row, index) =>
+        index === 2 ? { ...row, security_definer: true } : row
+      ),
+    ],
+    ["one function missing", validUsageOwnerPostcondition().slice(0, -1)],
+    [
+      "one unknown function",
+      validUsageOwnerPostcondition().map((row, index) =>
+        index === 4
+          ? { ...row, function_identity: "public.unknown_fixture_function()" }
+          : row
+      ),
+    ],
   ])("rejects the owner postcondition when %s", async (_label, rows) => {
     const fake = createMigrationOwnerFakeClient({ postconditionRows: rows });
     const result = await runMigrationOwnerBoundaryProbeForTests({
@@ -1485,9 +2154,7 @@ describe("connection-only external fixture boundary", () => {
     expect(result.failureMarker).toBe(
       "EXTERNAL_FIXTURE_OWNER_POSTCONDITION_MISMATCH"
     );
-    expect(fake.state.query.map(ownerBoundaryQueryLabel)).toContain(
-      "owner-postcondition"
-    );
+    expect(fake.state.labels).toContain("owner-postcondition");
     expect(fake.state.destroy).toBe(0);
     expect(fake.state.end).toBe(1);
   });
@@ -1512,7 +2179,7 @@ describe("connection-only external fixture boundary", () => {
       });
       await vi.advanceTimersByTimeAsync(120);
       const result = await pending;
-      const labels = fake.state.query.map(ownerBoundaryQueryLabel);
+      const labels = fake.state.labels;
       expect(result).toMatchObject({
         failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
         timedOut: true,
@@ -1529,6 +2196,308 @@ describe("connection-only external fixture boundary", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("canonicalizes only the fixed repository objects before starting postflight once", async () => {
+    const events: string[] = [];
+    const canonical = createOwnershipCanonicalizationFakeClient({ events });
+    const postflight = createPostflightBoundaryFakeClient(events);
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      client: canonical.client,
+      postflightClient: postflight.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result).toMatchObject({
+      failureMarker: null,
+      timedOut: false,
+      activeClientCount: 0,
+    });
+    expect(canonical.state.labels[0]).toBe("pre-canonical-inventory");
+    expect(canonical.state.labels.at(-1)).toBe("post-canonical-snapshot");
+    expect(canonical.state.ownerChanges).toHaveLength(29);
+    expect(
+      canonical.state.ownerChanges.every(
+        (statement) =>
+          statement.endsWith("OWNER TO SESSION_USER") &&
+          !statement.includes("REASSIGN OWNED")
+      )
+    ).toBe(true);
+    for (const tableName of testRepositoryTables) {
+      expect(canonical.state.ownerChanges).toContain(
+        `ALTER TABLE "public"."${tableName}" OWNER TO SESSION_USER`
+      );
+    }
+    for (const enumName of testRepositoryEnums) {
+      expect(canonical.state.ownerChanges).toContain(
+        `ALTER TYPE "public"."${enumName}" OWNER TO SESSION_USER`
+      );
+    }
+    for (const entry of testCanonicalFunctions) {
+      expect(
+        canonical.state.ownerChanges.some((statement) =>
+          statement.startsWith(`ALTER FUNCTION "public"."${entry.name}"(`)
+        )
+      ).toBe(true);
+    }
+    expect(canonical.state.ownerChanges).toContain(
+      'ALTER SCHEMA "public" OWNER TO SESSION_USER'
+    );
+    expect(canonical.state.ownerChanges).toContain(
+      'ALTER SCHEMA "drizzle" OWNER TO SESSION_USER'
+    );
+    expect(canonical.state.ownerChanges).toContain(
+      'ALTER TABLE "drizzle"."__drizzle_migrations" OWNER TO SESSION_USER'
+    );
+    expect(canonical.state.ownerChanges).toContain(
+      'ALTER SEQUENCE "drizzle"."__drizzle_migrations_id_seq" OWNER TO SESSION_USER'
+    );
+    expect(canonical.state.parameters[0]).toEqual([
+      [testLegacyOwner, testMigrationExecutor],
+    ]);
+    expect(canonical.state.parameters.at(-1)).toEqual([["drizzle", "public"]]);
+    expect(postflight.state).toEqual({
+      connect: 1,
+      query: [
+        "SELECT 'fixed_postflight_boundary'::text AS fixed_boundary_probe",
+      ],
+      end: 1,
+      destroy: 0,
+    });
+    expect(events.indexOf("post-canonical-snapshot")).toBeLessThan(
+      events.indexOf("postflight-connect")
+    );
+    expect(events.filter((event) => event === "postflight-boundary")).toHaveLength(
+      1
+    );
+  });
+
+  it.each([
+    ["missing object", validPreCanonicalOwnershipRows().slice(1)],
+    [
+      "extra object",
+      [
+        ...validPreCanonicalOwnershipRows(),
+        {
+          object_kind: "table",
+          schema_name: "public",
+          object_name: "unexpected_table",
+          function_identity: null,
+          owner_name: testMigrationExecutor,
+        },
+      ],
+    ],
+    [
+      "duplicate object",
+      [
+        ...validPreCanonicalOwnershipRows(),
+        validPreCanonicalOwnershipRows()[0],
+      ],
+    ],
+    [
+      "unexpected object kind",
+      validPreCanonicalOwnershipRows().map((row, index) =>
+        index === 0 ? { ...row, object_kind: "unexpected_relation" } : row
+      ),
+    ],
+    [
+      "unexpected executor-owned object",
+      [
+        ...validPreCanonicalOwnershipRows(),
+        {
+          object_kind: "function",
+          schema_name: "public",
+          object_name: "unexpected_executor_function",
+          function_identity: "",
+          owner_name: testMigrationExecutor,
+        },
+      ],
+    ],
+    [
+      "unexpected legacy-owned object",
+      [
+        ...validPreCanonicalOwnershipRows(),
+        {
+          object_kind: "sequence",
+          schema_name: "public",
+          object_name: "unexpected_legacy_sequence",
+          function_identity: null,
+          owner_name: testLegacyOwner,
+        },
+      ],
+    ],
+    [
+      "shared database ownership",
+      [
+        ...validPreCanonicalOwnershipRows(),
+        {
+          object_kind: "shared_database",
+          schema_name: null,
+          object_name: "current_database",
+          function_identity: null,
+          owner_name: testMigrationExecutor,
+        },
+      ],
+    ],
+    [
+      "owner mismatch",
+      validPreCanonicalOwnershipRows().map((row, index) =>
+        index === 0 ? { ...row, owner_name: testFixtureSessionRole } : row
+      ),
+    ],
+  ])("stops before owner changes when pre-canonical inventory has %s", async (_label, rows) => {
+    const canonical = createOwnershipCanonicalizationFakeClient({ preRows: rows });
+    const postflight = createPostflightBoundaryFakeClient();
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      client: canonical.client,
+      postflightClient: postflight.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_PRE_CANONICAL_INVENTORY_MISMATCH"
+    );
+    expect(canonical.state.ownerChanges).toEqual([]);
+    expect(postflight.state).toEqual({
+      connect: 0,
+      query: [],
+      end: 0,
+      destroy: 0,
+    });
+  });
+
+  it("does not start postflight after a finite canonicalization failure", async () => {
+    const canonical = createOwnershipCanonicalizationFakeClient({
+      rejectOwnerChangeAt: 5,
+    });
+    const postflight = createPostflightBoundaryFakeClient();
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      client: canonical.client,
+      postflightClient: postflight.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe("EXTERNAL_FIXTURE_VERIFICATION_FAILED");
+    expect(canonical.state.ownerChanges).toHaveLength(5);
+    expect(canonical.state.end).toBe(1);
+    expect(canonical.state.destroy).toBe(0);
+    expect(postflight.state.connect).toBe(0);
+  });
+
+  it.each([
+    ["missing object", validPostCanonicalOwnershipRows().slice(1)],
+    [
+      "duplicate object",
+      [
+        ...validPostCanonicalOwnershipRows(),
+        validPostCanonicalOwnershipRows()[0],
+      ],
+    ],
+    [
+      "executor residue",
+      validPostCanonicalOwnershipRows().map((row, index) =>
+        index === 1 ? { ...row, owner_name: testMigrationExecutor } : row
+      ),
+    ],
+    [
+      "legacy owner residue",
+      validPostCanonicalOwnershipRows().map((row, index) =>
+        index === 2 ? { ...row, owner_name: testLegacyOwner } : row
+      ),
+    ],
+    [
+      "unknown owner",
+      validPostCanonicalOwnershipRows().map((row, index) =>
+        index === 3 ? { ...row, owner_name: "unknown_fixture_owner" } : row
+      ),
+    ],
+    [
+      "session owner mismatch",
+      validPostCanonicalOwnershipRows().map((row, index) =>
+        index === 4 ? { ...row, owner_name: "wrong_session_owner" } : row
+      ),
+    ],
+  ])("does not start postflight when post-canonical snapshot has %s", async (_label, rows) => {
+    const canonical = createOwnershipCanonicalizationFakeClient({ postRows: rows });
+    const postflight = createPostflightBoundaryFakeClient();
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      client: canonical.client,
+      postflightClient: postflight.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_POST_CANONICAL_SNAPSHOT_MISMATCH"
+    );
+    expect(canonical.state.ownerChanges).toHaveLength(29);
+    expect(postflight.state.connect).toBe(0);
+  });
+
+  it.each([
+    ["owner change", { hangOwnerChangeAt: 5 }],
+    ["post-canonical snapshot", { hangOnSnapshot: true }],
+  ])("bounds a %s timeout and preserves an unrelated Client", async (_label, options) => {
+    const beforeUnhandled = process.listenerCount("unhandledRejection");
+    const canonical = createOwnershipCanonicalizationFakeClient(options);
+    const postflight = createPostflightBoundaryFakeClient();
+    const unrelated = createDeadlineFakeClient();
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      client: canonical.client,
+      postflightClient: postflight.client,
+      unrelatedClient: unrelated.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 100,
+        connectMilliseconds: 20,
+        queryMilliseconds: 10,
+        closeMilliseconds: 20,
+        phaseMilliseconds: 20,
+        migrationMilliseconds: 20,
+      },
+    });
+    expect(result).toMatchObject({
+      failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
+      timedOut: true,
+      activeClientCount: 0,
+    });
+    expect(canonical.state.destroy).toBe(1);
+    expect(canonical.state.queriesAtDestroy).toBe(canonical.state.query.length);
+    expect(postflight.state.connect).toBe(0);
+    expect(unrelated.counters).toEqual({
+      connect: 1,
+      query: [],
+      end: 1,
+      destroy: 0,
+    });
+    expect(process.listenerCount("unhandledRejection")).toBe(beforeUnhandled);
   });
 
   it.each([
