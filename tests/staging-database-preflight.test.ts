@@ -1021,6 +1021,12 @@ function createDeadlineFakeClient({
 const testLegacyOwner = "actustube_ci_usage_legacy_owner";
 const testMigrationExecutor = "actustube_ci_usage_migration_executor";
 const testFixtureSessionRole = "actustube_ci_fixture";
+const testCallerConfigurationRole = "actustube_ci_fixture";
+const testInitialObservedSessionRole = "actustube_ci_fixture";
+const testInitialObservedCurrentRole = "actustube_ci_fixture";
+const testCleanupObservedSessionRole = "actustube_ci_fixture";
+const testCleanupObservedCurrentRole = "actustube_ci_fixture";
+const testActualAclGrantorRole = "actustube_ci_fixture";
 const testLegacyOwnerOid = "81001";
 const testMigrationExecutorOid = "81002";
 const testUsageOwnerIdentities = [
@@ -1144,6 +1150,21 @@ function validInitialMigrationBoundaryRoles() {
   ];
 }
 
+function validObservedSessionIdentityRows({
+  sessionRole = testInitialObservedSessionRole,
+  effectiveRole = testInitialObservedCurrentRole,
+}: {
+  sessionRole?: unknown;
+  effectiveRole?: unknown;
+} = {}) {
+  return [
+    {
+      session_role: sessionRole,
+      effective_role: effectiveRole,
+    },
+  ];
+}
+
 function validUsageOwnerPostcondition(): Array<Record<string, any>> {
   return testUsageOwnerIdentities.map((functionIdentity, index) => ({
     function_identity: functionIdentity,
@@ -1169,6 +1190,12 @@ function ownerBoundaryQueryLabel(
   if (statement.includes("fixture_database_grant")) return "minimal-grants";
   if (statement.startsWith("SET ROLE")) return "set-migration-executor";
   if (statement === "RESET ROLE") return "reset-role";
+  if (
+    statement.replace(/\s+/g, " ").trim() ===
+    "SELECT session_user AS session_role, current_user AS effective_role"
+  ) {
+    return "observed-session-identity";
+  }
   if (statement.includes("WITH expected(role_name, ordinal)")) {
     return "initial-role-contract";
   }
@@ -1216,13 +1243,23 @@ function ownerBoundaryQueryLabel(
   return "unknown-fixed-query";
 }
 
+type MigrationOwnerFakeClientOptions = {
+  observedIdentityRows?: Array<Record<string, unknown>>;
+  initialRoleRows?: Array<Record<string, unknown>>;
+  preconditionRows?: Array<Record<string, unknown>>;
+  postconditionRows?: Array<Record<string, unknown>>;
+  hangOnLabel?: string | null;
+  rejectOnLabel?: string | null;
+};
+
 function createMigrationOwnerFakeClient({
+  observedIdentityRows = validObservedSessionIdentityRows(),
   initialRoleRows = validInitialMigrationBoundaryRoles(),
   preconditionRows = [validMigrationRolePrecondition()],
   postconditionRows = validUsageOwnerPostcondition(),
   hangOnLabel = null as string | null,
   rejectOnLabel = null as string | null,
-} = {}) {
+}: MigrationOwnerFakeClientOptions = {}) {
   const state = {
     query: [] as string[],
     parameters: [] as unknown[][],
@@ -1278,6 +1315,9 @@ function createMigrationOwnerFakeClient({
       if (label === "initial-role-contract") {
         return Promise.resolve({ rows: initialRoleRows });
       }
+      if (label === "observed-session-identity") {
+        return Promise.resolve({ rows: observedIdentityRows });
+      }
       if (label === "migration-executor-identity") {
         return Promise.resolve({
           rows: [
@@ -1301,6 +1341,53 @@ function createMigrationOwnerFakeClient({
     end() {
       state.end += 1;
       state.usable = false;
+      return Promise.resolve();
+    },
+  };
+  return { client, state };
+}
+
+function createObservedSessionIdentityFakeClient({
+  rows = validObservedSessionIdentityRows(),
+  reject = false,
+  hang = false,
+}: {
+  rows?: Array<Record<string, unknown>>;
+  reject?: boolean;
+  hang?: boolean;
+} = {}) {
+  const state = {
+    connect: 0,
+    query: [] as string[],
+    parameters: [] as unknown[][],
+    end: 0,
+    destroy: 0,
+    queriesAtDestroy: null as number | null,
+  };
+  const client = {
+    connection: {
+      stream: {
+        destroy() {
+          state.destroy += 1;
+          state.queriesAtDestroy = state.query.length;
+        },
+      },
+    },
+    connect() {
+      state.connect += 1;
+      return Promise.resolve();
+    },
+    query(statement: string, parameters: unknown[] = []) {
+      state.query.push(statement);
+      state.parameters.push(parameters);
+      if (hang) return new Promise(() => undefined);
+      if (reject) {
+        return Promise.reject(new Error("fixed-observed-identity-failure"));
+      }
+      return Promise.resolve({ rows });
+    },
+    end() {
+      state.end += 1;
       return Promise.resolve();
     },
   };
@@ -1494,7 +1581,7 @@ function testTemporaryAuthorityRow(
     authority_kind: authorityKind,
     role_name: roleName,
     role_relation: isExplicitAcl ? "grantee" : null,
-    grantor_name: isExplicitAcl ? testFixtureSessionRole : null,
+    grantor_name: isExplicitAcl ? testActualAclGrantorRole : null,
     grantee_name: isExplicitAcl ? roleName : null,
     object_kind: "schema",
     schema_name: null,
@@ -1720,6 +1807,12 @@ function validPostCanonicalOwnershipRows(): TestOwnershipRow[] {
 }
 
 type OwnershipCanonicalizationFakeClientOptions = {
+  initialIdentityRows?: Array<Record<string, unknown>>;
+  initialIdentityReject?: boolean;
+  initialIdentityHang?: boolean;
+  cleanupIdentityRows?: Array<Record<string, unknown>>;
+  cleanupIdentityReject?: boolean;
+  cleanupIdentityHang?: boolean;
   preRows?: TestOwnershipRow[];
   postRows?: TestOwnershipRow[];
   maintenanceRows?: TestOwnershipRow[];
@@ -1740,6 +1833,15 @@ type OwnershipCanonicalizationFakeClientOptions = {
 
 function createOwnershipCanonicalizationFakeClient(
   {
+    initialIdentityRows = validObservedSessionIdentityRows(),
+    initialIdentityReject = false,
+    initialIdentityHang = false,
+    cleanupIdentityRows = validObservedSessionIdentityRows({
+      sessionRole: testCleanupObservedSessionRole,
+      effectiveRole: testCleanupObservedCurrentRole,
+    }),
+    cleanupIdentityReject = false,
+    cleanupIdentityHang = false,
     preRows = validPreCanonicalOwnershipRows(),
     postRows = validPostCanonicalOwnershipRows(),
     maintenanceRows,
@@ -1760,6 +1862,11 @@ function createOwnershipCanonicalizationFakeClient(
     events = [] as string[],
   }: OwnershipCanonicalizationFakeClientOptions = {}
 ) {
+  const initialIdentity = createObservedSessionIdentityFakeClient({
+    rows: initialIdentityRows,
+    reject: initialIdentityReject,
+    hang: initialIdentityHang,
+  });
   const effectiveMaintenanceRows = maintenanceRows ?? postRows;
   const state = {
     connect: 0,
@@ -1769,6 +1876,7 @@ function createOwnershipCanonicalizationFakeClient(
     ownerChanges: [] as string[],
     cleanup: [] as string[],
     snapshotCount: 0,
+    cleanupIdentityCount: 0,
     authorityInventoryCount: 0,
     authorityRows: [...preAuthorityRows],
     end: 0,
@@ -1821,6 +1929,14 @@ function createOwnershipCanonicalizationFakeClient(
                   : effectiveMaintenanceRows,
             });
       }
+      if (label === "observed-session-identity") {
+        state.cleanupIdentityCount += 1;
+        if (cleanupIdentityHang) return new Promise(() => undefined);
+        if (cleanupIdentityReject) {
+          return Promise.reject(new Error("fixed-cleanup-identity-failure"));
+        }
+        return Promise.resolve({ rows: cleanupIdentityRows });
+      }
       if (label === "canonical-owner-change") {
         state.ownerChanges.push(executedStatement);
         if (state.ownerChanges.length === hangOwnerChangeAt) {
@@ -1855,7 +1971,7 @@ function createOwnershipCanonicalizationFakeClient(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
                 row.role_relation === "grantee" &&
-                row.grantor_name === testFixtureSessionRole &&
+                row.grantor_name === testActualAclGrantorRole &&
                 row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "database" &&
                 row.object_name === "actustube_ci_fixture" &&
@@ -1867,7 +1983,7 @@ function createOwnershipCanonicalizationFakeClient(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
                 row.role_relation === "grantee" &&
-                row.grantor_name === testFixtureSessionRole &&
+                row.grantor_name === testActualAclGrantorRole &&
                 row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "schema" &&
                 row.schema_name === "public" &&
@@ -1880,7 +1996,7 @@ function createOwnershipCanonicalizationFakeClient(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testLegacyOwner &&
                 row.role_relation === "grantee" &&
-                row.grantor_name === testFixtureSessionRole &&
+                row.grantor_name === testActualAclGrantorRole &&
                 row.grantee_name === testLegacyOwner &&
                 row.object_kind === "schema" &&
                 row.schema_name === "public" &&
@@ -1893,7 +2009,7 @@ function createOwnershipCanonicalizationFakeClient(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
                 row.role_relation === "grantee" &&
-                row.grantor_name === testFixtureSessionRole &&
+                row.grantor_name === testActualAclGrantorRole &&
                 row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "schema" &&
                 row.schema_name === "drizzle" &&
@@ -1906,7 +2022,7 @@ function createOwnershipCanonicalizationFakeClient(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
                 row.role_relation === "grantee" &&
-                row.grantor_name === testFixtureSessionRole &&
+                row.grantor_name === testActualAclGrantorRole &&
                 row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "table" &&
                 row.schema_name === "drizzle" &&
@@ -1919,7 +2035,7 @@ function createOwnershipCanonicalizationFakeClient(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
                 row.role_relation === "grantee" &&
-                row.grantor_name === testFixtureSessionRole &&
+                row.grantor_name === testActualAclGrantorRole &&
                 row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "sequence" &&
                 row.schema_name === "drizzle" &&
@@ -1947,7 +2063,12 @@ function createOwnershipCanonicalizationFakeClient(
       return Promise.resolve();
     },
   };
-  return { client, state };
+  return {
+    client,
+    state,
+    initialIdentityClient: initialIdentity.client,
+    initialIdentityState: initialIdentity.state,
+  };
 }
 
 function createPostflightBoundaryFakeClient(events: string[] = []) {
@@ -2137,7 +2258,7 @@ describe("connection-only external fixture boundary", () => {
     const fake = createMigrationOwnerFakeClient();
     const result = await runMigrationOwnerBoundaryProbeForTests({
       client: fake.client,
-      expectedSessionRole: testFixtureSessionRole,
+      expectedSessionRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 500,
         connectMilliseconds: 100,
@@ -2152,9 +2273,11 @@ describe("connection-only external fixture boundary", () => {
       failureMarker: null,
       timedOut: false,
       activeClientCount: 0,
+      observedIdentityFrozen: true,
     });
     expect(labels).toEqual([
       "create-fixed-roles",
+      "observed-session-identity",
       "initial-role-contract",
       "minimal-grants",
       "set-migration-executor",
@@ -2177,7 +2300,7 @@ describe("connection-only external fixture boundary", () => {
     ]);
     expect(result.operationStarts).toMatchObject({
       connect: 1,
-      query: 20,
+      query: 21,
       close: 1,
       migration: 3,
     });
@@ -2245,6 +2368,179 @@ describe("connection-only external fixture boundary", () => {
   });
 
   it.each([
+    [
+      "caller role differs from observed session role",
+      "actustube_ci_other_caller",
+      validObservedSessionIdentityRows(),
+    ],
+    [
+      "caller role differs from observed current role",
+      testCallerConfigurationRole,
+      validObservedSessionIdentityRows({
+        sessionRole: testInitialObservedSessionRole,
+        effectiveRole: "actustube_ci_other_current",
+      }),
+    ],
+    [
+      "observed session and current roles differ",
+      testCallerConfigurationRole,
+      validObservedSessionIdentityRows({
+        sessionRole: "actustube_ci_other_session",
+        effectiveRole: testInitialObservedCurrentRole,
+      }),
+    ],
+    ["missing row", testCallerConfigurationRole, []],
+    [
+      "duplicate row",
+      testCallerConfigurationRole,
+      [
+        ...validObservedSessionIdentityRows(),
+        ...validObservedSessionIdentityRows(),
+      ],
+    ],
+    [
+      "missing key",
+      testCallerConfigurationRole,
+      [{ session_role: testInitialObservedSessionRole }],
+    ],
+    [
+      "extra key",
+      testCallerConfigurationRole,
+      [
+        {
+          ...validObservedSessionIdentityRows()[0],
+          unexpected_key: true,
+        },
+      ],
+    ],
+    [
+      "null role",
+      testCallerConfigurationRole,
+      validObservedSessionIdentityRows({ sessionRole: null }),
+    ],
+    [
+      "non-string role",
+      testCallerConfigurationRole,
+      validObservedSessionIdentityRows({ sessionRole: 42 }),
+    ],
+    [
+      "empty role",
+      testCallerConfigurationRole,
+      validObservedSessionIdentityRows({ sessionRole: "" }),
+    ],
+    [
+      "invalid identifier",
+      testCallerConfigurationRole,
+      validObservedSessionIdentityRows({ sessionRole: "invalid role" }),
+    ],
+  ] as const)(
+    "rejects the initial DB-observed identity when %s",
+    async (_label, callerRole, observedIdentityRows) => {
+      const fake = createMigrationOwnerFakeClient({
+        observedIdentityRows: [...observedIdentityRows],
+      });
+      const result = await runMigrationOwnerBoundaryProbeForTests({
+        client: fake.client,
+        expectedSessionRole: callerRole,
+        deadlineLimits: {
+          totalMilliseconds: 500,
+          connectMilliseconds: 100,
+          queryMilliseconds: 100,
+          closeMilliseconds: 100,
+          phaseMilliseconds: 100,
+          migrationMilliseconds: 100,
+        },
+      });
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
+      );
+      expect(fake.state.labels).toEqual([
+        "create-fixed-roles",
+        "observed-session-identity",
+      ]);
+      expect(fake.state.labels).not.toContain("minimal-grants");
+      expect(fake.state.callbackObservations).toEqual([]);
+      expect(result.operationStarts.migration).toBe(0);
+      expect(result.observedIdentityFrozen).toBe(false);
+      expect(fake.state.destroy).toBe(0);
+      expect(fake.state.end).toBe(1);
+      const publicResult = JSON.stringify(result);
+      expect(publicResult).not.toContain(callerRole);
+      expect(publicResult).not.toContain(testInitialObservedSessionRole);
+    }
+  );
+
+  it("fails closed when the initial DB-observed identity query rejects", async () => {
+    const fake = createMigrationOwnerFakeClient({
+      rejectOnLabel: "observed-session-identity",
+    });
+    const result = await runMigrationOwnerBoundaryProbeForTests({
+      client: fake.client,
+      expectedSessionRole: testCallerConfigurationRole,
+      deadlineLimits: {
+        totalMilliseconds: 500,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe("EXTERNAL_FIXTURE_VERIFICATION_FAILED");
+    expect(fake.state.labels).toEqual([
+      "create-fixed-roles",
+      "observed-session-identity",
+    ]);
+    expect(fake.state.labels).not.toContain("minimal-grants");
+    expect(fake.state.callbackObservations).toEqual([]);
+    expect(result.operationStarts.migration).toBe(0);
+    expect(fake.state.end).toBe(1);
+    expect(fake.state.destroy).toBe(0);
+  });
+
+  it("bounds the initial DB-observed identity query timeout before grants", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = createMigrationOwnerFakeClient({
+        hangOnLabel: "observed-session-identity",
+      });
+      const pending = runMigrationOwnerBoundaryProbeForTests({
+        client: fake.client,
+        expectedSessionRole: testCallerConfigurationRole,
+        deadlineLimits: {
+          totalMilliseconds: 100,
+          connectMilliseconds: 20,
+          queryMilliseconds: 20,
+          closeMilliseconds: 20,
+          phaseMilliseconds: 20,
+          migrationMilliseconds: 20,
+        },
+      });
+      await vi.advanceTimersByTimeAsync(120);
+      const result = await pending;
+      expect(result).toMatchObject({
+        failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
+        timedOut: true,
+        destroyed: true,
+        observedIdentityFrozen: false,
+      });
+      expect(fake.state.labels).toEqual([
+        "create-fixed-roles",
+        "observed-session-identity",
+      ]);
+      expect(fake.state.labels).not.toContain("minimal-grants");
+      expect(fake.state.callbackObservations).toEqual([]);
+      expect(result.operationStarts.migration).toBe(0);
+      expect(fake.state.destroy).toBe(1);
+      expect(fake.state.end).toBe(0);
+      expect(fake.state.queriesAtDestroy).toBe(fake.state.query.length);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
     ["missing legacy owner", validInitialMigrationBoundaryRoles().slice(1)],
     [
       "duplicate role row",
@@ -2287,7 +2583,7 @@ describe("connection-only external fixture boundary", () => {
     const fake = createMigrationOwnerFakeClient({ initialRoleRows: rows });
     const result = await runMigrationOwnerBoundaryProbeForTests({
       client: fake.client,
-      expectedSessionRole: testFixtureSessionRole,
+      expectedSessionRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 500,
         connectMilliseconds: 100,
@@ -2302,6 +2598,7 @@ describe("connection-only external fixture boundary", () => {
     );
     expect(fake.state.labels).toEqual([
       "create-fixed-roles",
+      "observed-session-identity",
       "initial-role-contract",
     ]);
     expect(fake.state.callbackObservations).toEqual([]);
@@ -2314,7 +2611,7 @@ describe("connection-only external fixture boundary", () => {
     const fake = createMigrationOwnerFakeClient();
     const result = await runMigrationOwnerBoundaryProbeForTests({
       client: fake.client,
-      expectedSessionRole: testFixtureSessionRole,
+      expectedSessionRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 500,
         connectMilliseconds: 100,
@@ -2345,7 +2642,7 @@ describe("connection-only external fixture boundary", () => {
     const fake = createMigrationOwnerFakeClient();
     const result = await runMigrationOwnerBoundaryProbeForTests({
       client: fake.client,
-      expectedSessionRole: testFixtureSessionRole,
+      expectedSessionRole: testCallerConfigurationRole,
       callbackScenario: "replace-client",
       deadlineLimits: {
         totalMilliseconds: 500,
@@ -2372,7 +2669,7 @@ describe("connection-only external fixture boundary", () => {
     });
     const result = await runMigrationOwnerBoundaryProbeForTests({
       client: fake.client,
-      expectedSessionRole: testFixtureSessionRole,
+      expectedSessionRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 500,
         connectMilliseconds: 100,
@@ -2399,7 +2696,7 @@ describe("connection-only external fixture boundary", () => {
       });
       const pending = runMigrationOwnerBoundaryProbeForTests({
         client: fake.client,
-        expectedSessionRole: testFixtureSessionRole,
+        expectedSessionRole: testCallerConfigurationRole,
         deadlineLimits: {
           totalMilliseconds: 100,
           connectMilliseconds: 20,
@@ -2473,7 +2770,7 @@ describe("connection-only external fixture boundary", () => {
     const fake = createMigrationOwnerFakeClient({ preconditionRows: rows });
     const result = await runMigrationOwnerBoundaryProbeForTests({
       client: fake.client,
-      expectedSessionRole: testFixtureSessionRole,
+      expectedSessionRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 500,
         connectMilliseconds: 100,
@@ -2566,7 +2863,7 @@ describe("connection-only external fixture boundary", () => {
     const fake = createMigrationOwnerFakeClient({ postconditionRows: rows });
     const result = await runMigrationOwnerBoundaryProbeForTests({
       client: fake.client,
-      expectedSessionRole: testFixtureSessionRole,
+      expectedSessionRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 500,
         connectMilliseconds: 100,
@@ -2592,7 +2889,7 @@ describe("connection-only external fixture boundary", () => {
       });
       const pending = runMigrationOwnerBoundaryProbeForTests({
         client: fake.client,
-        expectedSessionRole: testFixtureSessionRole,
+        expectedSessionRole: testCallerConfigurationRole,
         deadlineLimits: {
           totalMilliseconds: 100,
           connectMilliseconds: 20,
@@ -2655,14 +2952,38 @@ describe("connection-only external fixture boundary", () => {
     expect(sql).toContain("dependency_entry.deptype = 'o'");
   });
 
+  it("binds the temporary-authority grantor to the propagated DB-observed identity", async () => {
+    const source = await readFile(postgresHarnessModule, "utf8");
+    expect(source).toContain("session_user AS session_role");
+    expect(source).toContain("current_user AS effective_role");
+    expect(source).toContain(
+      "const observedSessionIdentity = await assertInitialMigrationBoundaryRoles"
+    );
+    expect(source).toContain(
+      "return Object.freeze({ beforeFinalResult, observedSessionIdentity })"
+    );
+    expect(source).toContain(
+      "const observedSessionIdentity = await applyMigrationsAndRuntimeAcl"
+    );
+    expect(source).toContain("grantorName: observedSessionRole");
+    expect(source).not.toContain("grantorName: configuration.role");
+    expect(source).not.toMatch(
+      /observedSession(?:Identity|Role)\s*(?:\?\?|\|\|)\s*configuration\.role/
+    );
+    expect(source).toMatch(
+      /observeSessionIdentity\([\s\S]*?"EXTERNAL_FIXTURE_CLEANUP_SESSION_IDENTITY_MISMATCH"/
+    );
+  });
+
   it("canonicalizes only the fixed repository objects before starting postflight once", async () => {
     const events: string[] = [];
     const canonical = createOwnershipCanonicalizationFakeClient({ events });
     const postflight = createPostflightBoundaryFakeClient(events);
     const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
       client: canonical.client,
       postflightClient: postflight.client,
-      expectedSessionRole: testFixtureSessionRole,
+      callerConfigurationRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 1_000,
         connectMilliseconds: 100,
@@ -2680,7 +3001,20 @@ describe("connection-only external fixture boundary", () => {
     expect(canonical.state.labels[0]).toBe("pre-canonical-inventory");
     expect(canonical.state.labels.at(-1)).toBe("post-canonical-snapshot");
     expect(canonical.state.snapshotCount).toBe(2);
+    expect(canonical.state.cleanupIdentityCount).toBe(1);
     expect(canonical.state.authorityInventoryCount).toBe(2);
+    expect(canonical.initialIdentityState).toMatchObject({
+      connect: 1,
+      end: 1,
+      destroy: 0,
+    });
+    expect(canonical.initialIdentityState.query).toHaveLength(1);
+    expect(canonical.initialIdentityState.parameters).toEqual([[]]);
+    expect(
+      canonical.state.labels.indexOf("observed-session-identity")
+    ).toBeLessThan(
+      canonical.state.labels.indexOf("temporary-authority-inventory")
+    );
     expect(validTemporaryAuthorityRows()).toHaveLength(14);
     const expectedAclRows = validTemporaryAuthorityRows().filter(
       (row) => row.authority_kind === "explicit_acl"
@@ -2690,7 +3024,7 @@ describe("connection-only external fixture boundary", () => {
       expectedAclRows.every(
         (row) =>
           row.role_relation === "grantee" &&
-          row.grantor_name === testFixtureSessionRole &&
+          row.grantor_name === testActualAclGrantorRole &&
           row.grantee_name === row.role_name &&
           [testMigrationExecutor, testLegacyOwner].includes(row.role_name)
       )
@@ -2794,6 +3128,300 @@ describe("connection-only external fixture boundary", () => {
     expect(events.filter((event) => event === "postflight-boundary")).toHaveLength(
       1
     );
+  });
+
+  it.each([
+    [
+      "cleanup session role differs",
+      validObservedSessionIdentityRows({
+        sessionRole: "actustube_ci_cleanup_session_mismatch",
+        effectiveRole: testCleanupObservedCurrentRole,
+      }),
+    ],
+    [
+      "cleanup current role differs",
+      validObservedSessionIdentityRows({
+        sessionRole: testCleanupObservedSessionRole,
+        effectiveRole: "actustube_ci_cleanup_current_mismatch",
+      }),
+    ],
+    [
+      "cleanup session and current roles differ from each other",
+      validObservedSessionIdentityRows({
+        sessionRole: "actustube_ci_cleanup_session_other",
+        effectiveRole: "actustube_ci_cleanup_current_other",
+      }),
+    ],
+    ["cleanup row is missing", []],
+    [
+      "cleanup row is duplicated",
+      [
+        ...validObservedSessionIdentityRows(),
+        ...validObservedSessionIdentityRows(),
+      ],
+    ],
+    [
+      "cleanup row is missing a key",
+      [{ session_role: testCleanupObservedSessionRole }],
+    ],
+    [
+      "cleanup row has an extra key",
+      [
+        {
+          session_role: testCleanupObservedSessionRole,
+          effective_role: testCleanupObservedCurrentRole,
+          unexpected_key: true,
+        },
+      ],
+    ],
+    [
+      "cleanup row has a null role",
+      validObservedSessionIdentityRows({ sessionRole: null }),
+    ],
+    [
+      "cleanup row has a non-string role",
+      validObservedSessionIdentityRows({ sessionRole: 42 }),
+    ],
+    [
+      "cleanup row has an empty role",
+      validObservedSessionIdentityRows({ sessionRole: "" }),
+    ],
+    [
+      "cleanup row has an invalid identifier",
+      validObservedSessionIdentityRows({ sessionRole: "invalid role" }),
+    ],
+  ] as const)(
+    "stops before authority inventory when %s",
+    async (_label, cleanupIdentityRows) => {
+      const canonical = createOwnershipCanonicalizationFakeClient({
+        cleanupIdentityRows: [...cleanupIdentityRows],
+      });
+      const postflight = createPostflightBoundaryFakeClient();
+      const result = await runOwnershipCanonicalizationProbeForTests({
+        initialIdentityClient: canonical.initialIdentityClient,
+        client: canonical.client,
+        postflightClient: postflight.client,
+        callerConfigurationRole: testCallerConfigurationRole,
+        deadlineLimits: {
+          totalMilliseconds: 1_000,
+          connectMilliseconds: 100,
+          queryMilliseconds: 100,
+          closeMilliseconds: 100,
+          phaseMilliseconds: 100,
+          migrationMilliseconds: 100,
+        },
+      });
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_CLEANUP_SESSION_IDENTITY_MISMATCH"
+      );
+      expect(canonical.state.cleanupIdentityCount).toBe(1);
+      expect(canonical.state.authorityInventoryCount).toBe(0);
+      expect(canonical.state.cleanup).toEqual([]);
+      expect(canonical.state.snapshotCount).toBe(1);
+      expect(postflight.state.connect).toBe(0);
+      expect(canonical.state.end).toBe(1);
+      expect(canonical.state.destroy).toBe(0);
+      expect(JSON.stringify(result)).not.toMatch(
+        /actustube_ci_(?:fixture|cleanup)/i
+      );
+    }
+  );
+
+  it("rejects cleanup identity even when it matches a changed caller configuration value", async () => {
+    const changedCallerRole = "actustube_ci_changed_caller";
+    const canonical = createOwnershipCanonicalizationFakeClient({
+      cleanupIdentityRows: validObservedSessionIdentityRows({
+        sessionRole: changedCallerRole,
+        effectiveRole: changedCallerRole,
+      }),
+    });
+    const postflight = createPostflightBoundaryFakeClient();
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
+      client: canonical.client,
+      postflightClient: postflight.client,
+      callerConfigurationRole: testCallerConfigurationRole,
+      cleanupConfigurationRoleForTest: changedCallerRole,
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_CLEANUP_SESSION_IDENTITY_MISMATCH"
+    );
+    expect(canonical.state.cleanupIdentityCount).toBe(1);
+    expect(canonical.state.authorityInventoryCount).toBe(0);
+    expect(canonical.state.cleanup).toEqual([]);
+    expect(postflight.state.connect).toBe(0);
+  });
+
+  it("fails closed when the cleanup identity query rejects", async () => {
+    const canonical = createOwnershipCanonicalizationFakeClient({
+      cleanupIdentityReject: true,
+    });
+    const postflight = createPostflightBoundaryFakeClient();
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
+      client: canonical.client,
+      postflightClient: postflight.client,
+      callerConfigurationRole: testCallerConfigurationRole,
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe("EXTERNAL_FIXTURE_VERIFICATION_FAILED");
+    expect(canonical.state.cleanupIdentityCount).toBe(1);
+    expect(canonical.state.authorityInventoryCount).toBe(0);
+    expect(canonical.state.cleanup).toEqual([]);
+    expect(postflight.state.connect).toBe(0);
+    expect(canonical.state.end).toBe(1);
+    expect(canonical.state.destroy).toBe(0);
+  });
+
+  it("bounds the cleanup identity timeout and preserves an unrelated Client", async () => {
+    vi.useFakeTimers();
+    try {
+      const canonical = createOwnershipCanonicalizationFakeClient({
+        cleanupIdentityHang: true,
+      });
+      const postflight = createPostflightBoundaryFakeClient();
+      const unrelated = createDeadlineFakeClient();
+      const pending = runOwnershipCanonicalizationProbeForTests({
+        initialIdentityClient: canonical.initialIdentityClient,
+        client: canonical.client,
+        postflightClient: postflight.client,
+        unrelatedClient: unrelated.client,
+        callerConfigurationRole: testCallerConfigurationRole,
+        deadlineLimits: {
+          totalMilliseconds: 1_000,
+          connectMilliseconds: 20,
+          queryMilliseconds: 10,
+          closeMilliseconds: 20,
+          phaseMilliseconds: 20,
+          migrationMilliseconds: 20,
+        },
+      });
+      for (
+        let attempt = 0;
+        attempt < 500 && canonical.state.cleanupIdentityCount === 0;
+        attempt += 1
+      ) {
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      expect(canonical.state.cleanupIdentityCount).toBe(1);
+      await vi.advanceTimersByTimeAsync(20);
+      const result = await pending;
+      expect(result).toMatchObject({
+        failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
+        timedOut: true,
+        activeClientCount: 0,
+      });
+      expect(canonical.state.cleanupIdentityCount).toBe(1);
+      expect(canonical.state.authorityInventoryCount).toBe(0);
+      expect(canonical.state.cleanup).toEqual([]);
+      expect(canonical.state.destroy).toBe(1);
+      expect(canonical.state.end).toBe(0);
+      expect(canonical.state.queriesAtDestroy).toBe(canonical.state.query.length);
+      expect(postflight.state.connect).toBe(0);
+      expect(canonical.initialIdentityState).toMatchObject({
+        connect: 1,
+        end: 1,
+        destroy: 0,
+      });
+      expect(unrelated.counters).toEqual({
+        connect: 1,
+        query: [],
+        end: 1,
+        destroy: 0,
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops before canonicalization when caller and DB-observed identity differ", async () => {
+    const canonical = createOwnershipCanonicalizationFakeClient();
+    const postflight = createPostflightBoundaryFakeClient();
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
+      client: canonical.client,
+      postflightClient: postflight.client,
+      callerConfigurationRole: "actustube_ci_other_caller",
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
+    );
+    expect(canonical.state.connect).toBe(0);
+    expect(canonical.state.authorityInventoryCount).toBe(0);
+    expect(canonical.state.cleanup).toEqual([]);
+    expect(postflight.state.connect).toBe(0);
+  });
+
+  it("keeps fake ACL grantor state independent from observed identity propagation", async () => {
+    const independentObservedRole = "actustube_ci_independent_observed";
+    const postRows = validPostCanonicalOwnershipRows().map((row) => ({
+      ...row,
+      owner_name: independentObservedRole,
+    }));
+    const canonical = createOwnershipCanonicalizationFakeClient({
+      initialIdentityRows: validObservedSessionIdentityRows({
+        sessionRole: independentObservedRole,
+        effectiveRole: independentObservedRole,
+      }),
+      cleanupIdentityRows: validObservedSessionIdentityRows({
+        sessionRole: independentObservedRole,
+        effectiveRole: independentObservedRole,
+      }),
+      postRows,
+      maintenanceRows: postRows,
+    });
+    const postflight = createPostflightBoundaryFakeClient();
+    expect(
+      canonical.state.authorityRows
+        .filter((row) => row.authority_kind === "explicit_acl")
+        .every((row) => row.grantor_name === testActualAclGrantorRole)
+    ).toBe(true);
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
+      client: canonical.client,
+      postflightClient: postflight.client,
+      callerConfigurationRole: independentObservedRole,
+      cleanupConfigurationRoleForTest: independentObservedRole,
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_PRE_CLEANUP_AUTHORITY_MISMATCH"
+    );
+    expect(canonical.state.cleanupIdentityCount).toBe(1);
+    expect(canonical.state.authorityInventoryCount).toBe(1);
+    expect(canonical.state.cleanup).toEqual([]);
+    expect(postflight.state.connect).toBe(0);
   });
 
   it.each([
@@ -3117,9 +3745,10 @@ describe("connection-only external fixture boundary", () => {
       });
       const postflight = createPostflightBoundaryFakeClient();
       const result = await runOwnershipCanonicalizationProbeForTests({
+        initialIdentityClient: canonical.initialIdentityClient,
         client: canonical.client,
         postflightClient: postflight.client,
-        expectedSessionRole: testFixtureSessionRole,
+        callerConfigurationRole: testCallerConfigurationRole,
         deadlineLimits: {
           totalMilliseconds: 1_000,
           connectMilliseconds: 100,
@@ -3312,9 +3941,10 @@ describe("connection-only external fixture boundary", () => {
       });
       const postflight = createPostflightBoundaryFakeClient();
       const result = await runOwnershipCanonicalizationProbeForTests({
+        initialIdentityClient: canonical.initialIdentityClient,
         client: canonical.client,
         postflightClient: postflight.client,
-        expectedSessionRole: testFixtureSessionRole,
+        callerConfigurationRole: testCallerConfigurationRole,
         deadlineLimits: {
           totalMilliseconds: 1_000,
           connectMilliseconds: 100,
@@ -3353,9 +3983,10 @@ describe("connection-only external fixture boundary", () => {
       });
       const postflight = createPostflightBoundaryFakeClient();
       const result = await runOwnershipCanonicalizationProbeForTests({
+        initialIdentityClient: canonical.initialIdentityClient,
         client: canonical.client,
         postflightClient: postflight.client,
-        expectedSessionRole: testFixtureSessionRole,
+        callerConfigurationRole: testCallerConfigurationRole,
         deadlineLimits: {
           totalMilliseconds: 1_000,
           connectMilliseconds: 100,
@@ -3481,9 +4112,10 @@ describe("connection-only external fixture boundary", () => {
       });
       const postflight = createPostflightBoundaryFakeClient();
       const result = await runOwnershipCanonicalizationProbeForTests({
+        initialIdentityClient: canonical.initialIdentityClient,
         client: canonical.client,
         postflightClient: postflight.client,
-        expectedSessionRole: testFixtureSessionRole,
+        callerConfigurationRole: testCallerConfigurationRole,
         deadlineLimits: {
           totalMilliseconds: 1_000,
           connectMilliseconds: 100,
@@ -3514,9 +4146,10 @@ describe("connection-only external fixture boundary", () => {
     });
     const postflight = createPostflightBoundaryFakeClient();
     const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
       client: canonical.client,
       postflightClient: postflight.client,
-      expectedSessionRole: testFixtureSessionRole,
+      callerConfigurationRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 1_000,
         connectMilliseconds: 100,
@@ -3548,9 +4181,10 @@ describe("connection-only external fixture boundary", () => {
     });
     const postflight = createPostflightBoundaryFakeClient();
     const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
       client: canonical.client,
       postflightClient: postflight.client,
-      expectedSessionRole: testFixtureSessionRole,
+      callerConfigurationRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 1_000,
         connectMilliseconds: 100,
@@ -3580,9 +4214,10 @@ describe("connection-only external fixture boundary", () => {
     });
     const postflight = createPostflightBoundaryFakeClient();
     const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
       client: canonical.client,
       postflightClient: postflight.client,
-      expectedSessionRole: testFixtureSessionRole,
+      callerConfigurationRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 1_000,
         connectMilliseconds: 100,
@@ -3677,9 +4312,10 @@ describe("connection-only external fixture boundary", () => {
     const canonical = createOwnershipCanonicalizationFakeClient({ preRows: rows });
     const postflight = createPostflightBoundaryFakeClient();
     const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
       client: canonical.client,
       postflightClient: postflight.client,
-      expectedSessionRole: testFixtureSessionRole,
+      callerConfigurationRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 1_000,
         connectMilliseconds: 100,
@@ -3707,9 +4343,10 @@ describe("connection-only external fixture boundary", () => {
     });
     const postflight = createPostflightBoundaryFakeClient();
     const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
       client: canonical.client,
       postflightClient: postflight.client,
-      expectedSessionRole: testFixtureSessionRole,
+      callerConfigurationRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 1_000,
         connectMilliseconds: 100,
@@ -3763,9 +4400,10 @@ describe("connection-only external fixture boundary", () => {
     const canonical = createOwnershipCanonicalizationFakeClient({ postRows: rows });
     const postflight = createPostflightBoundaryFakeClient();
     const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
       client: canonical.client,
       postflightClient: postflight.client,
-      expectedSessionRole: testFixtureSessionRole,
+      callerConfigurationRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 1_000,
         connectMilliseconds: 100,
@@ -3798,10 +4436,11 @@ describe("connection-only external fixture boundary", () => {
     const postflight = createPostflightBoundaryFakeClient();
     const unrelated = createDeadlineFakeClient();
     const result = await runOwnershipCanonicalizationProbeForTests({
+      initialIdentityClient: canonical.initialIdentityClient,
       client: canonical.client,
       postflightClient: postflight.client,
       unrelatedClient: unrelated.client,
-      expectedSessionRole: testFixtureSessionRole,
+      callerConfigurationRole: testCallerConfigurationRole,
       deadlineLimits: {
         totalMilliseconds: 100,
         connectMilliseconds: 20,
