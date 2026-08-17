@@ -368,6 +368,454 @@ const POST_CANONICAL_OWNERSHIP_SNAPSHOT_SQL = `
     function_identity NULLS FIRST,
     owner_name
 `;
+const TEMPORARY_AUTHORITY_ROW_KEYS = Object.freeze([
+  "authority_kind",
+  "role_name",
+  "object_kind",
+  "schema_name",
+  "object_name",
+  "column_name",
+  "function_identity",
+  "privilege_type",
+  "grant_option",
+  "granted_role",
+  "inherit_option",
+  "set_option",
+]);
+const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
+  WITH target_roles AS (
+    SELECT role_entry.oid, role_entry.rolname
+    FROM pg_catalog.pg_roles AS role_entry
+    WHERE role_entry.rolname = ANY($1::text[])
+  ), authority_inventory AS (
+    SELECT
+      'explicit_acl'::text AS authority_kind,
+      target_role.rolname::text AS role_name,
+      'database'::text AS object_kind,
+      NULL::text AS schema_name,
+      database_entry.datname::text AS object_name,
+      NULL::text AS column_name,
+      NULL::text AS function_identity,
+      acl.privilege_type::text AS privilege_type,
+      acl.is_grantable AS grant_option,
+      NULL::text AS granted_role,
+      NULL::boolean AS inherit_option,
+      NULL::boolean AS set_option
+    FROM pg_catalog.pg_database AS database_entry
+    CROSS JOIN LATERAL pg_catalog.aclexplode(database_entry.datacl) AS acl
+    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+
+    UNION ALL
+
+    SELECT
+      'explicit_acl'::text,
+      target_role.rolname::text,
+      'schema'::text,
+      namespace_entry.nspname::text,
+      namespace_entry.nspname::text,
+      NULL::text,
+      NULL::text,
+      acl.privilege_type::text,
+      acl.is_grantable,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_namespace AS namespace_entry
+    CROSS JOIN LATERAL pg_catalog.aclexplode(namespace_entry.nspacl) AS acl
+    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+
+    UNION ALL
+
+    SELECT
+      'explicit_acl'::text,
+      target_role.rolname::text,
+      CASE relation_entry.relkind
+        WHEN 'r' THEN 'table'
+        WHEN 'p' THEN 'table'
+        WHEN 'S' THEN 'sequence'
+        WHEN 'v' THEN 'view'
+        WHEN 'm' THEN 'materialized_view'
+        WHEN 'f' THEN 'foreign_table'
+        ELSE 'unexpected_relation'
+      END::text,
+      namespace_entry.nspname::text,
+      relation_entry.relname::text,
+      NULL::text,
+      NULL::text,
+      acl.privilege_type::text,
+      acl.is_grantable,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_class AS relation_entry
+    INNER JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = relation_entry.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(relation_entry.relacl) AS acl
+    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+
+    UNION ALL
+
+    SELECT
+      'explicit_acl'::text,
+      target_role.rolname::text,
+      'column'::text,
+      namespace_entry.nspname::text,
+      relation_entry.relname::text,
+      attribute_entry.attname::text,
+      NULL::text,
+      acl.privilege_type::text,
+      acl.is_grantable,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_attribute AS attribute_entry
+    INNER JOIN pg_catalog.pg_class AS relation_entry
+      ON relation_entry.oid = attribute_entry.attrelid
+    INNER JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = relation_entry.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(attribute_entry.attacl) AS acl
+    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+    WHERE attribute_entry.attnum > 0
+      AND NOT attribute_entry.attisdropped
+
+    UNION ALL
+
+    SELECT
+      'explicit_acl'::text,
+      target_role.rolname::text,
+      CASE procedure_entry.prokind
+        WHEN 'f' THEN 'function'
+        WHEN 'p' THEN 'procedure'
+        ELSE 'unexpected_routine'
+      END::text,
+      namespace_entry.nspname::text,
+      procedure_entry.proname::text,
+      NULL::text,
+      pg_catalog.pg_get_function_identity_arguments(procedure_entry.oid)::text,
+      acl.privilege_type::text,
+      acl.is_grantable,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_proc AS procedure_entry
+    INNER JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = procedure_entry.pronamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(procedure_entry.proacl) AS acl
+    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+
+    UNION ALL
+
+    SELECT
+      'explicit_acl'::text,
+      target_role.rolname::text,
+      'type'::text,
+      namespace_entry.nspname::text,
+      type_entry.typname::text,
+      NULL::text,
+      NULL::text,
+      acl.privilege_type::text,
+      acl.is_grantable,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_type AS type_entry
+    INNER JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = type_entry.typnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(type_entry.typacl) AS acl
+    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+
+    UNION ALL
+
+    SELECT
+      'explicit_acl'::text,
+      target_role.rolname::text,
+      'default_acl'::text,
+      namespace_entry.nspname::text,
+      default_acl.defaclobjtype::text,
+      NULL::text,
+      NULL::text,
+      acl.privilege_type::text,
+      acl.is_grantable,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_default_acl AS default_acl
+    LEFT JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = default_acl.defaclnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) AS acl
+    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+
+    UNION ALL
+
+    SELECT
+      'direct_membership'::text,
+      member_role.rolname::text,
+      'role'::text,
+      NULL::text,
+      granted_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      'MEMBER'::text,
+      membership.admin_option,
+      granted_role.rolname::text,
+      membership.inherit_option,
+      membership.set_option
+    FROM pg_catalog.pg_auth_members AS membership
+    INNER JOIN pg_catalog.pg_roles AS member_role
+      ON member_role.oid = membership.member
+    INNER JOIN pg_catalog.pg_roles AS granted_role
+      ON granted_role.oid = membership.roleid
+    INNER JOIN pg_catalog.pg_roles AS grantor_role
+      ON grantor_role.oid = membership.grantor
+    WHERE member_role.oid IN (SELECT oid FROM target_roles)
+       OR granted_role.oid IN (SELECT oid FROM target_roles)
+       OR grantor_role.oid IN (SELECT oid FROM target_roles)
+
+    UNION ALL
+
+    SELECT
+      'recursive_membership'::text,
+      member_role.rolname::text,
+      'role'::text,
+      NULL::text,
+      granted_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      'MEMBER'::text,
+      false,
+      granted_role.rolname::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM target_roles AS member_role
+    CROSS JOIN pg_catalog.pg_roles AS granted_role
+    WHERE member_role.oid <> granted_role.oid
+      AND pg_catalog.pg_has_role(member_role.oid, granted_role.oid, 'MEMBER')
+
+    UNION ALL
+
+    SELECT
+      'effective_membership'::text,
+      member_role.rolname::text,
+      'role'::text,
+      NULL::text,
+      granted_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      'USAGE'::text,
+      false,
+      granted_role.rolname::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM target_roles AS member_role
+    CROSS JOIN pg_catalog.pg_roles AS granted_role
+    WHERE member_role.oid <> granted_role.oid
+      AND pg_catalog.pg_has_role(member_role.oid, granted_role.oid, 'USAGE')
+
+    UNION ALL
+
+    SELECT
+      'ownership'::text,
+      target_role.rolname::text,
+      'database'::text,
+      NULL::text,
+      database_entry.datname::text,
+      NULL::text,
+      NULL::text,
+      'OWNER'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_database AS database_entry
+    INNER JOIN target_roles AS target_role ON target_role.oid = database_entry.datdba
+
+    UNION ALL
+
+    SELECT
+      'ownership'::text,
+      target_role.rolname::text,
+      'schema'::text,
+      namespace_entry.nspname::text,
+      namespace_entry.nspname::text,
+      NULL::text,
+      NULL::text,
+      'OWNER'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_namespace AS namespace_entry
+    INNER JOIN target_roles AS target_role ON target_role.oid = namespace_entry.nspowner
+
+    UNION ALL
+
+    SELECT
+      'ownership'::text,
+      target_role.rolname::text,
+      CASE relation_entry.relkind
+        WHEN 'r' THEN 'table'
+        WHEN 'p' THEN 'table'
+        WHEN 'i' THEN 'index'
+        WHEN 'I' THEN 'index'
+        WHEN 'S' THEN 'sequence'
+        WHEN 'v' THEN 'view'
+        WHEN 'm' THEN 'materialized_view'
+        WHEN 'f' THEN 'foreign_table'
+        ELSE 'unexpected_relation'
+      END::text,
+      namespace_entry.nspname::text,
+      relation_entry.relname::text,
+      NULL::text,
+      NULL::text,
+      'OWNER'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_class AS relation_entry
+    INNER JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = relation_entry.relnamespace
+    INNER JOIN target_roles AS target_role ON target_role.oid = relation_entry.relowner
+
+    UNION ALL
+
+    SELECT
+      'ownership'::text,
+      target_role.rolname::text,
+      'type'::text,
+      namespace_entry.nspname::text,
+      type_entry.typname::text,
+      NULL::text,
+      NULL::text,
+      'OWNER'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_type AS type_entry
+    INNER JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = type_entry.typnamespace
+    INNER JOIN target_roles AS target_role ON target_role.oid = type_entry.typowner
+
+    UNION ALL
+
+    SELECT
+      'ownership'::text,
+      target_role.rolname::text,
+      CASE procedure_entry.prokind
+        WHEN 'f' THEN 'function'
+        WHEN 'p' THEN 'procedure'
+        ELSE 'unexpected_routine'
+      END::text,
+      namespace_entry.nspname::text,
+      procedure_entry.proname::text,
+      NULL::text,
+      pg_catalog.pg_get_function_identity_arguments(procedure_entry.oid)::text,
+      'OWNER'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_proc AS procedure_entry
+    INNER JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = procedure_entry.pronamespace
+    INNER JOIN target_roles AS target_role ON target_role.oid = procedure_entry.proowner
+
+    UNION ALL
+
+    SELECT
+      'ownership'::text,
+      target_role.rolname::text,
+      'default_acl'::text,
+      namespace_entry.nspname::text,
+      default_acl.defaclobjtype::text,
+      NULL::text,
+      NULL::text,
+      'OWNER'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_default_acl AS default_acl
+    LEFT JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.oid = default_acl.defaclnamespace
+    INNER JOIN target_roles AS target_role ON target_role.oid = default_acl.defaclrole
+
+    UNION ALL
+
+    SELECT
+      'ownership'::text,
+      target_role.rolname::text,
+      'tablespace'::text,
+      NULL::text,
+      tablespace_entry.spcname::text,
+      NULL::text,
+      NULL::text,
+      'OWNER'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_tablespace AS tablespace_entry
+    INNER JOIN target_roles AS target_role ON target_role.oid = tablespace_entry.spcowner
+
+    UNION ALL
+
+    SELECT
+      'ownership'::text,
+      target_role.rolname::text,
+      'unsupported_owned_object'::text,
+      NULL::text,
+      dependency_entry.classid::regclass::text,
+      NULL::text,
+      NULL::text,
+      'OWNER'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_shdepend AS dependency_entry
+    INNER JOIN target_roles AS target_role ON target_role.oid = dependency_entry.refobjid
+    WHERE dependency_entry.refclassid = 'pg_catalog.pg_authid'::regclass
+      AND dependency_entry.deptype = 'o'
+      AND dependency_entry.classid NOT IN (
+        'pg_catalog.pg_class'::regclass,
+        'pg_catalog.pg_proc'::regclass,
+        'pg_catalog.pg_type'::regclass,
+        'pg_catalog.pg_namespace'::regclass,
+        'pg_catalog.pg_database'::regclass,
+        'pg_catalog.pg_tablespace'::regclass,
+        'pg_catalog.pg_default_acl'::regclass
+      )
+  )
+  SELECT
+    authority_kind,
+    role_name,
+    object_kind,
+    schema_name,
+    object_name,
+    column_name,
+    function_identity,
+    privilege_type,
+    grant_option,
+    granted_role,
+    inherit_option,
+    set_option
+  FROM authority_inventory
+  ORDER BY
+    authority_kind,
+    role_name,
+    object_kind,
+    schema_name NULLS FIRST,
+    object_name,
+    column_name NULLS FIRST,
+    function_identity NULLS FIRST,
+    privilege_type,
+    grant_option,
+    granted_role NULLS FIRST,
+    inherit_option NULLS FIRST,
+    set_option NULLS FIRST
+`;
 const FIXTURE_EXTENSION_CONTRACT = Object.freeze([
   Object.freeze({ name: "plpgsql", schema: "pg_catalog", version: "1.0" }),
 ]);
@@ -1561,6 +2009,157 @@ function sortedOwnershipRows(rows) {
   return [...rows].sort(compareOwnershipRows);
 }
 
+function compareTemporaryAuthorityRows(left, right) {
+  for (const key of TEMPORARY_AUTHORITY_ROW_KEYS) {
+    const comparison = String(left[key] ?? "").localeCompare(
+      String(right[key] ?? "")
+    );
+    if (comparison !== 0) return comparison;
+  }
+  return 0;
+}
+
+function sortedTemporaryAuthorityRows(rows) {
+  return [...rows].sort(compareTemporaryAuthorityRows);
+}
+
+function temporaryAuthorityRow({
+  authorityKind,
+  roleName,
+  objectKind,
+  schemaName = null,
+  objectName,
+  columnName = null,
+  functionIdentity = null,
+  privilegeType,
+  grantOption = false,
+  grantedRole = null,
+  inheritOption = null,
+  setOption = null,
+}) {
+  return {
+    authority_kind: authorityKind,
+    role_name: roleName,
+    object_kind: objectKind,
+    schema_name: schemaName,
+    object_name: objectName,
+    column_name: columnName,
+    function_identity: functionIdentity,
+    privilege_type: privilegeType,
+    grant_option: grantOption,
+    granted_role: grantedRole,
+    inherit_option: inheritOption,
+    set_option: setOption,
+  };
+}
+
+function buildTemporaryAuthorityContract(configuration) {
+  const code = "EXTERNAL_FIXTURE_TEMPORARY_AUTHORITY_CONTRACT_INVALID";
+  requireHarness(
+    SAFE_IDENTIFIER.test(configuration?.database) &&
+      SAFE_IDENTIFIER.test(USAGE_MIGRATION_BOUNDARY_ROLES.legacyOwner) &&
+      SAFE_IDENTIFIER.test(USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor),
+    code
+  );
+  const { legacyOwner, migrationExecutor } = USAGE_MIGRATION_BOUNDARY_ROLES;
+  const rows = [
+    temporaryAuthorityRow({
+      authorityKind: "explicit_acl",
+      roleName: migrationExecutor,
+      objectKind: "database",
+      objectName: configuration.database,
+      privilegeType: "CREATE",
+    }),
+    ...["CREATE", "USAGE"].map((privilegeType) =>
+      temporaryAuthorityRow({
+        authorityKind: "explicit_acl",
+        roleName: migrationExecutor,
+        objectKind: "schema",
+        schemaName: "public",
+        objectName: "public",
+        privilegeType,
+      })
+    ),
+    ...["CREATE", "USAGE"].map((privilegeType) =>
+      temporaryAuthorityRow({
+        authorityKind: "explicit_acl",
+        roleName: legacyOwner,
+        objectKind: "schema",
+        schemaName: "public",
+        objectName: "public",
+        privilegeType,
+      })
+    ),
+    ...["CREATE", "USAGE"].map((privilegeType) =>
+      temporaryAuthorityRow({
+        authorityKind: "explicit_acl",
+        roleName: migrationExecutor,
+        objectKind: "schema",
+        schemaName: MIGRATION_LEDGER_CONTRACT.schema,
+        objectName: MIGRATION_LEDGER_CONTRACT.schema,
+        privilegeType,
+      })
+    ),
+    ...["INSERT", "SELECT"].map((privilegeType) =>
+      temporaryAuthorityRow({
+        authorityKind: "explicit_acl",
+        roleName: migrationExecutor,
+        objectKind: "table",
+        schemaName: MIGRATION_LEDGER_CONTRACT.schema,
+        objectName: MIGRATION_LEDGER_CONTRACT.table,
+        privilegeType,
+      })
+    ),
+    ...["SELECT", "USAGE"].map((privilegeType) =>
+      temporaryAuthorityRow({
+        authorityKind: "explicit_acl",
+        roleName: migrationExecutor,
+        objectKind: "sequence",
+        schemaName: MIGRATION_LEDGER_CONTRACT.schema,
+        objectName: MIGRATION_LEDGER_CONTRACT.sequence,
+        privilegeType,
+      })
+    ),
+    temporaryAuthorityRow({
+      authorityKind: "direct_membership",
+      roleName: migrationExecutor,
+      objectKind: "role",
+      objectName: legacyOwner,
+      privilegeType: "MEMBER",
+      grantedRole: legacyOwner,
+      inheritOption: true,
+      setOption: true,
+    }),
+    temporaryAuthorityRow({
+      authorityKind: "recursive_membership",
+      roleName: migrationExecutor,
+      objectKind: "role",
+      objectName: legacyOwner,
+      privilegeType: "MEMBER",
+      grantedRole: legacyOwner,
+    }),
+    temporaryAuthorityRow({
+      authorityKind: "effective_membership",
+      roleName: migrationExecutor,
+      objectKind: "role",
+      objectName: legacyOwner,
+      privilegeType: "USAGE",
+      grantedRole: legacyOwner,
+    }),
+  ];
+  const sortedRows = sortedTemporaryAuthorityRows(rows);
+  requireHarness(
+    sortedRows.length === 14 &&
+      new Set(
+        sortedRows.map((row) =>
+          JSON.stringify(TEMPORARY_AUTHORITY_ROW_KEYS.map((key) => row[key]))
+        )
+      ).size === sortedRows.length,
+    code
+  );
+  return Object.freeze(sortedRows.map((row) => Object.freeze(row)));
+}
+
 function ownershipRow({
   objectKind,
   schemaName,
@@ -1846,6 +2445,90 @@ async function assertPostCanonicalOwnershipSnapshot(client, contract) {
   );
 }
 
+function validateTemporaryAuthorityRows(actualRows, expectedRows, code) {
+  requireHarness(
+    Array.isArray(actualRows) && actualRows.length === expectedRows.length,
+    code
+  );
+  const observedSignatures = new Set();
+  for (const [index, actual] of actualRows.entries()) {
+    const expected = expectedRows[index];
+    requireHarness(
+      exactOwnKeys(actual, TEMPORARY_AUTHORITY_ROW_KEYS) &&
+        TEMPORARY_AUTHORITY_ROW_KEYS.every(
+          (key) => actual[key] === expected[key]
+        ),
+      code
+    );
+    const signature = JSON.stringify(
+      TEMPORARY_AUTHORITY_ROW_KEYS.map((key) => actual[key])
+    );
+    requireHarness(!observedSignatures.has(signature), code);
+    observedSignatures.add(signature);
+  }
+  requireHarness(observedSignatures.size === expectedRows.length, code);
+}
+
+async function readTemporaryAuthorityInventory(client) {
+  return await client.query(TEMPORARY_AUTHORITY_INVENTORY_SQL, [
+    [
+      USAGE_MIGRATION_BOUNDARY_ROLES.legacyOwner,
+      USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor,
+    ],
+  ]);
+}
+
+async function assertPreCleanupTemporaryAuthorityInventory(client, contract) {
+  const result = await readTemporaryAuthorityInventory(client);
+  validateTemporaryAuthorityRows(
+    result.rows,
+    contract,
+    "EXTERNAL_FIXTURE_PRE_CLEANUP_AUTHORITY_MISMATCH"
+  );
+}
+
+async function revokeTemporaryMigrationAuthorities(client) {
+  const { legacyOwner, migrationExecutor } = USAGE_MIGRATION_BOUNDARY_ROLES;
+  await client.query(`
+    DO $fixture_database_revoke$
+    BEGIN
+      EXECUTE pg_catalog.format(
+        'REVOKE CREATE ON DATABASE %I FROM %I',
+        pg_catalog.current_database(),
+        '${migrationExecutor}'
+      );
+    END;
+    $fixture_database_revoke$;
+  `);
+  await client.query(
+    `REVOKE USAGE, CREATE ON SCHEMA public FROM ${quoteIdentifier(migrationExecutor)}`
+  );
+  await client.query(
+    `REVOKE USAGE, CREATE ON SCHEMA public FROM ${quoteIdentifier(legacyOwner)}`
+  );
+  await client.query(
+    `REVOKE USAGE, CREATE ON SCHEMA drizzle FROM ${quoteIdentifier(migrationExecutor)}`
+  );
+  await client.query(
+    `REVOKE SELECT, INSERT ON TABLE drizzle.__drizzle_migrations FROM ${quoteIdentifier(migrationExecutor)}`
+  );
+  await client.query(
+    `REVOKE USAGE, SELECT ON SEQUENCE drizzle.__drizzle_migrations_id_seq FROM ${quoteIdentifier(migrationExecutor)}`
+  );
+  await client.query(
+    `REVOKE ${quoteIdentifier(legacyOwner)} FROM ${quoteIdentifier(migrationExecutor)}`
+  );
+}
+
+async function assertZeroTemporaryAuthorityResidue(client) {
+  const result = await readTemporaryAuthorityInventory(client);
+  validateTemporaryAuthorityRows(
+    result.rows,
+    [],
+    "EXTERNAL_FIXTURE_TEMPORARY_AUTHORITY_RESIDUE"
+  );
+}
+
 async function runCanonicalOwnershipBoundary({
   context,
   clientFactory,
@@ -1857,6 +2540,8 @@ async function runCanonicalOwnershipBoundary({
     specification,
     configuration.role
   );
+  const temporaryAuthorityContract =
+    buildTemporaryAuthorityContract(configuration);
   await withClient(
     context,
     clientFactory,
@@ -1864,6 +2549,13 @@ async function runCanonicalOwnershipBoundary({
     async (client) => {
       await assertPreCanonicalOwnershipInventory(client, contract);
       await canonicalizeFixtureOwnership(client, contract);
+      await assertPostCanonicalOwnershipSnapshot(client, contract);
+      await assertPreCleanupTemporaryAuthorityInventory(
+        client,
+        temporaryAuthorityContract
+      );
+      await revokeTemporaryMigrationAuthorities(client);
+      await assertZeroTemporaryAuthorityResidue(client);
       await assertPostCanonicalOwnershipSnapshot(client, contract);
     }
   );
@@ -2856,6 +3548,7 @@ function publicSuccessResult() {
     independentExtensionInventory: true,
     migrationOrderAndReplay: true,
     usageMigrationSemantics: true,
+    temporaryAuthorityCleanup: true,
     deadlineBounded: true,
     transactionRollback: true,
     postflight: true,

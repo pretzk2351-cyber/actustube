@@ -1,6 +1,6 @@
 # ActusTube Staging Database Preflight / Postflight Runbook
 
-最終更新日：2026-08-16
+最終更新日：2026-08-17
 
 ## 目的と適用範囲
 
@@ -118,7 +118,13 @@ owner切替とMigration callback配置はproductionとfake-client testで単一�
 
 distinct-owner inheritance、replay、owner / ACL / security / search-path / membership検証の完了後だけ、executorまたはlegacy ownerが所有するobjectを独立catalog queryで列挙します。期待値はrepository snapshot、固定function contract、migration ledgerから作るexact allowlistであり、query resultから自己生成しません。missing、extra、duplicate、unknown kind、unexpected owner、database / tablespace等のshared object ownershipがあれば、owner変更とpostflightを開始しません。合格時だけ、固定された`public` / `drizzle` schema、repository table、enum、exact function signature、migration ledger table / sequenceを`SESSION_USER`へtype-specificに変更します。table owner変更に従属するfixed index以外を変更せず、無条件の`REASSIGN OWNED`、role / schema / database削除は行いません。
 
-canonicalization後かつproduction postflight前に、別のcatalog snapshotでcurrent database、`public` / `drizzle` schema、repository table / index / enum / function、migration ledger table / primary-key index / sequenceのexact setを再取得します。全ownerがfixture session roleで、executor residue、legacy owner residue、unknown owner、missing、extra、duplicateが0の場合だけproduction postflightをexact 1回開始します。inventory不一致、owner変更失敗、timeout、snapshot不一致ではpostflight開始0です。local fake-client testはquery順序、same-client callback、固定allowlist、timeout後の停止、unrelated context非破壊を確認するだけで、actual PostgreSQLのDDL権限、owner cascade、Migrationまたはpostflight成功を証明しません。GitHub Actions PostgreSQL 18.6 gateはまだNOT RUNで、staging / Production / Neon / poolerのactual owner / ACLはNOT VERIFIEDです。advisory lockは引き続き未実装です。
+canonicalization後かつproduction postflight前に、別のcatalog snapshotでcurrent database、`public` / `drizzle` schema、repository table / index / enum / function、migration ledger table / primary-key index / sequenceのexact setを再取得します。全ownerがfixture session roleで、executor residue、legacy owner residue、unknown owner、missing、extra、duplicateが0であることを最初に確認します。
+
+続いてtemporary Migration executorとlegacy ownerだけを対象に、`pg_database.datacl`、schema / relation / column / function / type / default ACL、direct role membership、`pg_has_role`によるrecursive / effective membership、database / schema / relation / type / function / default ACL / tablespace ownership、未対応shared ownership dependencyを単一の独立inventoryで列挙します。cleanup前は、harness自身が付与したdatabase `CREATE`、`public` / `drizzle` schema、migration ledger table / sequenceのACL 11行とlegacy owner membershipのdirect / recursive / effective 3行、合計14行との完全一致を要求します。missing、extra、duplicate、unknown key / kind、grant option、column / function / type / default ACL、unexpected membership / ownership / shared dependencyが1件でもあればREVOKEとpostflightを開始しません。
+
+完全一致時だけ、current databaseのexecutor `CREATE`、`public` schemaのexecutor / legacy owner、`drizzle` schemaとmigration ledger table / sequenceのexecutor権限、legacy ownerからexecutorへのmembershipを、固定objectと固定roleへの7個のbounded REVOKEで除去します。`DROP OWNED`、`REASSIGN OWNED`、role / database / schema削除、broad cleanupは使用しません。REVOKE後は同じ独立inventoryがexact 0行であることと、同じcanonical owner snapshotが維持されることを再確認します。このClientがbounded closeまで正常終了した場合だけproduction postflightをexact 1回開始します。inventory不一致、owner変更失敗、各REVOKE失敗、権限またはmembership残存、owner drift、query / close timeoutではpostflight開始0です。
+
+local fake-client testはquery順序、same-client callback、固定allowlist、各REVOKEに連動した残存状態、timeout後の停止、unrelated context非破壊を確認するだけで、actual PostgreSQLのDDL / REVOKE権限、owner cascade、catalog completeness、Migrationまたはpostflight成功を証明しません。GitHub Actions PostgreSQL 18.6 gateはまだNOT RUNで、staging / Production / Neon / poolerのactual owner / ACLはNOT VERIFIEDです。advisory lockは引き続き未実装です。
 
 `pg_class`はtable / sequence / primary-key indexについてrelation kind、namespace、access method、persistence、replica identity、RLS、populated / partition / shared / rewrite / row-type / typed-table状態、tablespace、TOASTのzero / nonzeroと参照対応、ACL / option、owner関係、固定boolean / charを検証します。`relfilenode`、`relpages`、`reltuples`、`relallvisible`、`relallfrozen`、`relfrozenxid`、`relminmxid`はrewrite、planner統計、VACUUM、freeze、transaction状態で変動するためfield別理由をcoverage matrixへ記録してexact固定から除外します。その他のstable fieldに未検査を残しません。
 
