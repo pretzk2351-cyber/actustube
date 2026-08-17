@@ -23,6 +23,7 @@ import {
   EXTERNAL_FIXTURE_EXTENSION_CONTRACT_FOR_TESTS,
   HARNESS_DEADLINE_LIMITS_FOR_TESTS,
   INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS,
+  TEMPORARY_AUTHORITY_INVENTORY_SQL_FOR_TESTS,
   createIndependentDeadlineContextsForTests,
   externalFixtureSuccessResultForTests,
   harnessAuthorityBoundaryForTests,
@@ -1030,6 +1031,78 @@ const testUsageOwnerIdentities = [
   "public.get_usage_status_v1(uuid,integer,timestamp with time zone)",
 ] as const;
 
+const exactRevokeContracts = [
+  {
+    label: "revoke-database-create",
+    statement: `
+      DO $fixture_database_revoke$
+      BEGIN
+        EXECUTE pg_catalog.format(
+          'REVOKE CREATE ON DATABASE %I FROM %I',
+          pg_catalog.current_database(),
+          '${testMigrationExecutor}'
+        );
+      END;
+      $fixture_database_revoke$;
+    `,
+    parameters: [],
+  },
+  {
+    label: "revoke-public-executor",
+    statement: `REVOKE USAGE, CREATE ON SCHEMA public FROM "${testMigrationExecutor}"`,
+    parameters: [],
+  },
+  {
+    label: "revoke-public-legacy",
+    statement: `REVOKE USAGE, CREATE ON SCHEMA public FROM "${testLegacyOwner}"`,
+    parameters: [],
+  },
+  {
+    label: "revoke-drizzle-executor",
+    statement: `REVOKE USAGE, CREATE ON SCHEMA drizzle FROM "${testMigrationExecutor}"`,
+    parameters: [],
+  },
+  {
+    label: "revoke-ledger-table",
+    statement: `REVOKE SELECT, INSERT ON TABLE drizzle.__drizzle_migrations FROM "${testMigrationExecutor}"`,
+    parameters: [],
+  },
+  {
+    label: "revoke-ledger-sequence",
+    statement: `REVOKE USAGE, SELECT ON SEQUENCE drizzle.__drizzle_migrations_id_seq FROM "${testMigrationExecutor}"`,
+    parameters: [],
+  },
+  {
+    label: "revoke-legacy-membership",
+    statement: `REVOKE "${testLegacyOwner}" FROM "${testMigrationExecutor}"`,
+    parameters: [],
+  },
+] as const;
+
+type ExactRevokeLabel = (typeof exactRevokeContracts)[number]["label"];
+
+function normalizeExactRevokeSql(statement: string) {
+  return statement
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
+function exactRevokeQueryLabel(
+  statement: string,
+  parameters: unknown[]
+): ExactRevokeLabel | null {
+  const normalized = normalizeExactRevokeSql(statement);
+  const matches = exactRevokeContracts.filter(
+    (contract) =>
+      normalizeExactRevokeSql(contract.statement) === normalized &&
+      JSON.stringify(contract.parameters) === JSON.stringify(parameters)
+  );
+  return matches.length === 1 ? matches[0].label : null;
+}
+
 function validMigrationRolePrecondition(
   overrides: Record<string, unknown> = {}
 ) {
@@ -1088,6 +1161,8 @@ function ownerBoundaryQueryLabel(
   statement: string,
   parameters: unknown[] = []
 ) {
+  const exactRevokeLabel = exactRevokeQueryLabel(statement, parameters);
+  if (exactRevokeLabel) return exactRevokeLabel;
   if (statement.includes("CREATE ROLE") && statement.includes(testLegacyOwner)) {
     return "create-fixed-roles";
   }
@@ -1125,36 +1200,6 @@ function ownerBoundaryQueryLabel(
   }
   if (statement.includes("authority_inventory")) {
     return "temporary-authority-inventory";
-  }
-  if (statement.includes("fixture_database_revoke")) {
-    return "revoke-database-create";
-  }
-  if (
-    statement.startsWith("REVOKE USAGE, CREATE ON SCHEMA public FROM") &&
-    statement.includes(testMigrationExecutor)
-  ) {
-    return "revoke-public-executor";
-  }
-  if (
-    statement.startsWith("REVOKE USAGE, CREATE ON SCHEMA public FROM") &&
-    statement.includes(testLegacyOwner)
-  ) {
-    return "revoke-public-legacy";
-  }
-  if (statement.startsWith("REVOKE USAGE, CREATE ON SCHEMA drizzle FROM")) {
-    return "revoke-drizzle-executor";
-  }
-  if (statement.startsWith("REVOKE SELECT, INSERT ON TABLE drizzle.")) {
-    return "revoke-ledger-table";
-  }
-  if (statement.startsWith("REVOKE USAGE, SELECT ON SEQUENCE drizzle.")) {
-    return "revoke-ledger-sequence";
-  }
-  if (
-    statement.startsWith(`REVOKE "${testLegacyOwner}" FROM`) &&
-    statement.includes(testMigrationExecutor)
-  ) {
-    return "revoke-legacy-membership";
   }
   if (statement.includes("unsupported_owned_object")) {
     return "pre-canonical-inventory";
@@ -1376,6 +1421,9 @@ type TestOwnershipRow = {
 type TestTemporaryAuthorityRow = {
   authority_kind: string;
   role_name: string;
+  role_relation: string | null;
+  grantor_name: string | null;
+  grantee_name: string | null;
   object_kind: string;
   schema_name: string | null;
   object_name: string;
@@ -1411,6 +1459,9 @@ function sortTestTemporaryAuthorityRows(rows: TestTemporaryAuthorityRow[]) {
   const keys = [
     "authority_kind",
     "role_name",
+    "role_relation",
+    "grantor_name",
+    "grantee_name",
     "object_kind",
     "schema_name",
     "object_name",
@@ -1436,9 +1487,15 @@ function sortTestTemporaryAuthorityRows(rows: TestTemporaryAuthorityRow[]) {
 function testTemporaryAuthorityRow(
   overrides: Partial<TestTemporaryAuthorityRow>
 ): TestTemporaryAuthorityRow {
+  const authorityKind = overrides.authority_kind ?? "explicit_acl";
+  const roleName = overrides.role_name ?? testMigrationExecutor;
+  const isExplicitAcl = authorityKind === "explicit_acl";
   return {
-    authority_kind: "explicit_acl",
-    role_name: testMigrationExecutor,
+    authority_kind: authorityKind,
+    role_name: roleName,
+    role_relation: isExplicitAcl ? "grantee" : null,
+    grantor_name: isExplicitAcl ? testFixtureSessionRole : null,
+    grantee_name: isExplicitAcl ? roleName : null,
     object_kind: "schema",
     schema_name: null,
     object_name: "fixed_object",
@@ -1522,6 +1579,41 @@ function validTemporaryAuthorityRows(): TestTemporaryAuthorityRow[] {
       granted_role: testLegacyOwner,
     }),
   ]);
+}
+
+function grantorSideTemporaryAuthorityRow(
+  overrides: Partial<TestTemporaryAuthorityRow>
+): TestTemporaryAuthorityRow {
+  return testTemporaryAuthorityRow({
+    role_name: testMigrationExecutor,
+    role_relation: "grantor",
+    grantor_name: testMigrationExecutor,
+    grantee_name: "unexpected_fixture_grantee",
+    ...overrides,
+  });
+}
+
+function uncoveredAclDependencyRow(
+  overrides: Partial<TestTemporaryAuthorityRow> = {}
+): TestTemporaryAuthorityRow {
+  return testTemporaryAuthorityRow({
+    authority_kind: "uncovered_acl_dependency",
+    role_name: testMigrationExecutor,
+    role_relation: null,
+    grantor_name: null,
+    grantee_name: null,
+    object_kind: "unsupported_acl_dependency",
+    schema_name: null,
+    object_name: "pg_catalog.pg_class",
+    column_name: null,
+    function_identity: null,
+    privilege_type: "ACL_DEPENDENCY",
+    grant_option: false,
+    granted_role: null,
+    inherit_option: null,
+    set_option: null,
+    ...overrides,
+  });
 }
 
 function validPreCanonicalOwnershipRows(): TestOwnershipRow[] {
@@ -1640,6 +1732,8 @@ type OwnershipCanonicalizationFakeClientOptions = {
   rejectOnCleanupLabel?: string | null;
   hangOnCleanupLabel?: string | null;
   skipCleanupLabel?: string | null;
+  cleanupStatementOverrides?: Partial<Record<ExactRevokeLabel, string>>;
+  cleanupParameterOverrides?: Partial<Record<ExactRevokeLabel, unknown[]>>;
   hangOnAuthorityInventoryAt?: number | null;
   events?: string[];
 };
@@ -1658,6 +1752,10 @@ function createOwnershipCanonicalizationFakeClient(
     rejectOnCleanupLabel = null as string | null,
     hangOnCleanupLabel = null as string | null,
     skipCleanupLabel = null as string | null,
+    cleanupStatementOverrides = {} as Partial<Record<ExactRevokeLabel, string>>,
+    cleanupParameterOverrides = {} as Partial<
+      Record<ExactRevokeLabel, unknown[]>
+    >,
     hangOnAuthorityInventoryAt = null as number | null,
     events = [] as string[],
   }: OwnershipCanonicalizationFakeClientOptions = {}
@@ -1691,9 +1789,19 @@ function createOwnershipCanonicalizationFakeClient(
       return Promise.resolve();
     },
     query(statement: string, parameters: unknown[] = []) {
-      state.query.push(statement);
-      state.parameters.push(parameters);
-      const label = ownerBoundaryQueryLabel(statement, parameters);
+      const originalRevokeLabel = exactRevokeQueryLabel(statement, parameters);
+      const executedStatement = originalRevokeLabel
+        ? cleanupStatementOverrides[originalRevokeLabel] ?? statement
+        : statement;
+      const executedParameters = originalRevokeLabel
+        ? cleanupParameterOverrides[originalRevokeLabel] ?? parameters
+        : parameters;
+      state.query.push(executedStatement);
+      state.parameters.push(executedParameters);
+      const label = ownerBoundaryQueryLabel(
+        executedStatement,
+        executedParameters
+      );
       state.labels.push(label);
       events.push(label);
       if (label === "pre-canonical-inventory") {
@@ -1714,7 +1822,7 @@ function createOwnershipCanonicalizationFakeClient(
             });
       }
       if (label === "canonical-owner-change") {
-        state.ownerChanges.push(statement);
+        state.ownerChanges.push(executedStatement);
         if (state.ownerChanges.length === hangOwnerChangeAt) {
           return new Promise(() => undefined);
         }
@@ -1746,7 +1854,11 @@ function createOwnershipCanonicalizationFakeClient(
               return !(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
+                row.role_relation === "grantee" &&
+                row.grantor_name === testFixtureSessionRole &&
+                row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "database" &&
+                row.object_name === "actustube_ci_fixture" &&
                 row.privilege_type === "CREATE"
               );
             }
@@ -1754,40 +1866,65 @@ function createOwnershipCanonicalizationFakeClient(
               return !(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
+                row.role_relation === "grantee" &&
+                row.grantor_name === testFixtureSessionRole &&
+                row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "schema" &&
-                row.schema_name === "public"
+                row.schema_name === "public" &&
+                row.object_name === "public" &&
+                ["CREATE", "USAGE"].includes(row.privilege_type)
               );
             }
             if (label === "revoke-public-legacy") {
               return !(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testLegacyOwner &&
+                row.role_relation === "grantee" &&
+                row.grantor_name === testFixtureSessionRole &&
+                row.grantee_name === testLegacyOwner &&
                 row.object_kind === "schema" &&
-                row.schema_name === "public"
+                row.schema_name === "public" &&
+                row.object_name === "public" &&
+                ["CREATE", "USAGE"].includes(row.privilege_type)
               );
             }
             if (label === "revoke-drizzle-executor") {
               return !(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
+                row.role_relation === "grantee" &&
+                row.grantor_name === testFixtureSessionRole &&
+                row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "schema" &&
-                row.schema_name === "drizzle"
+                row.schema_name === "drizzle" &&
+                row.object_name === "drizzle" &&
+                ["CREATE", "USAGE"].includes(row.privilege_type)
               );
             }
             if (label === "revoke-ledger-table") {
               return !(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
+                row.role_relation === "grantee" &&
+                row.grantor_name === testFixtureSessionRole &&
+                row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "table" &&
-                row.schema_name === "drizzle"
+                row.schema_name === "drizzle" &&
+                row.object_name === "__drizzle_migrations" &&
+                ["INSERT", "SELECT"].includes(row.privilege_type)
               );
             }
             if (label === "revoke-ledger-sequence") {
               return !(
                 row.authority_kind === "explicit_acl" &&
                 row.role_name === testMigrationExecutor &&
+                row.role_relation === "grantee" &&
+                row.grantor_name === testFixtureSessionRole &&
+                row.grantee_name === testMigrationExecutor &&
                 row.object_kind === "sequence" &&
-                row.schema_name === "drizzle"
+                row.schema_name === "drizzle" &&
+                row.object_name === "__drizzle_migrations_id_seq" &&
+                ["SELECT", "USAGE"].includes(row.privilege_type)
               );
             }
             if (label === "revoke-legacy-membership") {
@@ -1932,6 +2069,7 @@ describe("connection-only external fixture boundary", () => {
         "EXTERNAL_FIXTURE_EXTENSION_CONTRACT_FOR_TESTS",
         "HARNESS_DEADLINE_LIMITS_FOR_TESTS",
         "INDEPENDENT_EXTENSION_INVENTORY_SQL_FOR_TESTS",
+        "TEMPORARY_AUTHORITY_INVENTORY_SQL_FOR_TESTS",
         "createIndependentDeadlineContextsForTests",
         "externalFixtureSuccessResultForTests",
         "harnessAuthorityBoundaryForTests",
@@ -2485,6 +2623,38 @@ describe("connection-only external fixture boundary", () => {
     }
   });
 
+  it("binds every explicit ACL catalog branch to grantor and grantee coverage with a shared-dependency backstop", () => {
+    const sql = TEMPORARY_AUTHORITY_INVENTORY_SQL_FOR_TESTS;
+    const aclSources = [
+      "database_entry.datacl",
+      "namespace_entry.nspacl",
+      "relation_entry.relacl",
+      "attribute_entry.attacl",
+      "procedure_entry.proacl",
+      "type_entry.typacl",
+      "default_acl.defaclacl",
+    ];
+    for (const source of aclSources) {
+      expect(sql).toContain(`aclexplode(${source})`);
+    }
+    expect(
+      sql.match(
+        /target_role\.oid = acl\.grantee OR target_role\.oid = acl\.grantor/g
+      )
+    ).toHaveLength(14);
+    expect(sql).toContain("dependency_entry.deptype = 'a'");
+    expect(sql).toContain("coverage.dbid = dependency_entry.dbid");
+    expect(sql).toContain("coverage.classid = dependency_entry.classid");
+    expect(sql).toContain("coverage.objid = dependency_entry.objid");
+    expect(sql).toContain("coverage.objsubid = dependency_entry.objsubid");
+    expect(sql).toContain(
+      "coverage.target_role_oid = dependency_entry.refobjid"
+    );
+    expect(sql).toContain("attribute_entry.attrelid");
+    expect(sql).toContain("attribute_entry.attnum::integer");
+    expect(sql).toContain("dependency_entry.deptype = 'o'");
+  });
+
   it("canonicalizes only the fixed repository objects before starting postflight once", async () => {
     const events: string[] = [];
     const canonical = createOwnershipCanonicalizationFakeClient({ events });
@@ -2512,6 +2682,19 @@ describe("connection-only external fixture boundary", () => {
     expect(canonical.state.snapshotCount).toBe(2);
     expect(canonical.state.authorityInventoryCount).toBe(2);
     expect(validTemporaryAuthorityRows()).toHaveLength(14);
+    const expectedAclRows = validTemporaryAuthorityRows().filter(
+      (row) => row.authority_kind === "explicit_acl"
+    );
+    expect(expectedAclRows).toHaveLength(11);
+    expect(
+      expectedAclRows.every(
+        (row) =>
+          row.role_relation === "grantee" &&
+          row.grantor_name === testFixtureSessionRole &&
+          row.grantee_name === row.role_name &&
+          [testMigrationExecutor, testLegacyOwner].includes(row.role_name)
+      )
+    ).toBe(true);
     expect(canonical.state.cleanup).toEqual([
       "revoke-database-create",
       "revoke-public-executor",
@@ -2521,6 +2704,32 @@ describe("connection-only external fixture boundary", () => {
       "revoke-ledger-sequence",
       "revoke-legacy-membership",
     ]);
+    const observedRevokeQueries = canonical.state.labels.flatMap(
+      (label, index) =>
+        label.startsWith("revoke-")
+          ? [
+              {
+                label,
+                statement: canonical.state.query[index],
+                parameters: canonical.state.parameters[index],
+              },
+            ]
+          : []
+    );
+    expect(observedRevokeQueries).toHaveLength(7);
+    expect(
+      observedRevokeQueries.map(({ label, statement, parameters }) => ({
+        label,
+        statement: normalizeExactRevokeSql(statement),
+        parameters,
+      }))
+    ).toEqual(
+      exactRevokeContracts.map(({ label, statement, parameters }) => ({
+        label,
+        statement: normalizeExactRevokeSql(statement),
+        parameters: [...parameters],
+      }))
+    );
     expect(canonical.state.authorityRows).toEqual([]);
     expect(canonical.state.end).toBe(1);
     expect(canonical.state.destroy).toBe(0);
@@ -2635,9 +2844,162 @@ describe("connection-only external fixture boundary", () => {
       "wrong grantee",
       sortTestTemporaryAuthorityRows(
         validTemporaryAuthorityRows().map((row, index) =>
-          index === 0 ? { ...row, role_name: testLegacyOwner } : row
+          index === 0 ? { ...row, grantee_name: testLegacyOwner } : row
         )
       ),
+    ],
+    [
+      "wrong grantor",
+      sortTestTemporaryAuthorityRows(
+        validTemporaryAuthorityRows().map((row, index) =>
+          index === 0 ? { ...row, grantor_name: testMigrationExecutor } : row
+        )
+      ),
+    ],
+    [
+      "unknown ACL relation",
+      sortTestTemporaryAuthorityRows(
+        validTemporaryAuthorityRows().map((row, index) =>
+          index === 0 ? { ...row, role_relation: "unknown" } : row
+        )
+      ),
+    ],
+    ...([
+      [
+        "grantor-only database ACL",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "database",
+          object_name: "actustube_ci_fixture",
+          privilege_type: "CREATE",
+        }),
+      ],
+      [
+        "grantor-only schema ACL",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "schema",
+          schema_name: "public",
+          object_name: "public",
+        }),
+      ],
+      [
+        "grantor-only relation ACL",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "table",
+          schema_name: "drizzle",
+          object_name: "__drizzle_migrations",
+          privilege_type: "SELECT",
+        }),
+      ],
+      [
+        "grantor-only column ACL",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "column",
+          schema_name: "public",
+          object_name: "users",
+          column_name: "email",
+          privilege_type: "SELECT",
+        }),
+      ],
+      [
+        "grantor-only function ACL",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "function",
+          schema_name: "public",
+          object_name: "reserve_usage_limits",
+          function_identity:
+            "uuid,integer,usage_metric,timestamp with time zone",
+          privilege_type: "EXECUTE",
+        }),
+      ],
+      [
+        "grantor-only type ACL",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "type",
+          schema_name: "public",
+          object_name: "usage_metric",
+        }),
+      ],
+      [
+        "grantor-only default ACL",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "default_acl",
+          schema_name: "public",
+          object_name: "r",
+          privilege_type: "SELECT",
+        }),
+      ],
+      [
+        "grantor-only ACL to PUBLIC",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "schema",
+          schema_name: "public",
+          object_name: "public",
+          grantee_name: "PUBLIC",
+        }),
+      ],
+      [
+        "grantor-and-grantee ACL",
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "schema",
+          schema_name: "public",
+          object_name: "public",
+          role_relation: "both",
+          grantee_name: testMigrationExecutor,
+        }),
+      ],
+    ] as Array<[string, TestTemporaryAuthorityRow]>).map(
+      ([label, row]): [string, TestTemporaryAuthorityRow[]] => [
+        label,
+        sortTestTemporaryAuthorityRows([
+          ...validTemporaryAuthorityRows(),
+          row,
+        ]),
+      ]
+    ),
+    [
+      "duplicate grantor row",
+      sortTestTemporaryAuthorityRows([
+        ...validTemporaryAuthorityRows(),
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "schema",
+          schema_name: "public",
+          object_name: "public",
+        }),
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "schema",
+          schema_name: "public",
+          object_name: "public",
+        }),
+      ]),
+    ],
+    [
+      "uncovered ACL dependency",
+      sortTestTemporaryAuthorityRows([
+        ...validTemporaryAuthorityRows(),
+        uncoveredAclDependencyRow(),
+      ]),
+    ],
+    [
+      "unknown catalog ACL dependency",
+      sortTestTemporaryAuthorityRows([
+        ...validTemporaryAuthorityRows(),
+        uncoveredAclDependencyRow({ object_name: "pg_catalog.pg_unknown" }),
+      ]),
+    ],
+    [
+      "column ACL dependency",
+      sortTestTemporaryAuthorityRows([
+        ...validTemporaryAuthorityRows(),
+        uncoveredAclDependencyRow({ column_name: "column" }),
+      ]),
+    ],
+    [
+      "duplicate ACL dependency",
+      sortTestTemporaryAuthorityRows([
+        ...validTemporaryAuthorityRows(),
+        uncoveredAclDependencyRow(),
+        uncoveredAclDependencyRow(),
+      ]),
     ],
     [
       "column ACL",
@@ -2909,6 +3271,21 @@ describe("connection-only external fixture boundary", () => {
       ],
     ],
     [
+      "grantor-side ACL residue",
+      [
+        grantorSideTemporaryAuthorityRow({
+          object_kind: "schema",
+          schema_name: "public",
+          object_name: "public",
+        }),
+      ],
+    ],
+    ["uncovered ACL dependency", [uncoveredAclDependencyRow()]],
+    [
+      "column ACL dependency",
+      [uncoveredAclDependencyRow({ column_name: "column" })],
+    ],
+    [
       "unknown row key",
       [
         {
@@ -2995,6 +3372,167 @@ describe("connection-only external fixture boundary", () => {
       expect(postflight.state.connect).toBe(0);
     }
   );
+
+  it.each([
+    [
+      "wrong database DO body",
+      "revoke-database-create",
+      exactRevokeContracts[0].statement.replace(
+        "REVOKE CREATE",
+        "REVOKE CONNECT"
+      ),
+    ],
+    [
+      "wrong database role",
+      "revoke-database-create",
+      exactRevokeContracts[0].statement.replace(
+        testMigrationExecutor,
+        "wrong_fixture_role"
+      ),
+    ],
+    [
+      "missing current_database()",
+      "revoke-database-create",
+      exactRevokeContracts[0].statement.replace(
+        "pg_catalog.current_database()",
+        "'actustube_ci_fixture'"
+      ),
+    ],
+    [
+      "wrong schema",
+      "revoke-public-executor",
+      `REVOKE USAGE, CREATE ON SCHEMA private FROM "${testMigrationExecutor}"`,
+    ],
+    [
+      "wrong public-schema role",
+      "revoke-public-executor",
+      'REVOKE USAGE, CREATE ON SCHEMA public FROM "wrong_fixture_role"',
+    ],
+    [
+      "wrong drizzle-schema role",
+      "revoke-drizzle-executor",
+      'REVOKE USAGE, CREATE ON SCHEMA drizzle FROM "wrong_fixture_role"',
+    ],
+    [
+      "wrong table",
+      "revoke-ledger-table",
+      `REVOKE SELECT, INSERT ON TABLE drizzle.wrong_ledger FROM "${testMigrationExecutor}"`,
+    ],
+    [
+      "wrong table role",
+      "revoke-ledger-table",
+      'REVOKE SELECT, INSERT ON TABLE drizzle.__drizzle_migrations FROM "wrong_fixture_role"',
+    ],
+    [
+      "wrong sequence",
+      "revoke-ledger-sequence",
+      `REVOKE USAGE, SELECT ON SEQUENCE drizzle.wrong_sequence FROM "${testMigrationExecutor}"`,
+    ],
+    [
+      "wrong sequence role",
+      "revoke-ledger-sequence",
+      'REVOKE USAGE, SELECT ON SEQUENCE drizzle.__drizzle_migrations_id_seq FROM "wrong_fixture_role"',
+    ],
+    [
+      "wrong privilege",
+      "revoke-ledger-table",
+      `REVOKE SELECT, UPDATE ON TABLE drizzle.__drizzle_migrations FROM "${testMigrationExecutor}"`,
+    ],
+    [
+      "wrong privilege order",
+      "revoke-ledger-table",
+      `REVOKE INSERT, SELECT ON TABLE drizzle.__drizzle_migrations FROM "${testMigrationExecutor}"`,
+    ],
+    [
+      "wrong membership granted role",
+      "revoke-legacy-membership",
+      `REVOKE "wrong_granted_role" FROM "${testMigrationExecutor}"`,
+    ],
+    [
+      "wrong membership member role",
+      "revoke-legacy-membership",
+      `REVOKE "${testLegacyOwner}" FROM "wrong_member_role"`,
+    ],
+    [
+      "reversed membership direction",
+      "revoke-legacy-membership",
+      `REVOKE "${testMigrationExecutor}" FROM "${testLegacyOwner}"`,
+    ],
+    [
+      "marker only",
+      "revoke-database-create",
+      "SELECT 'fixture_database_revoke'::text",
+    ],
+    [
+      "prefix only",
+      "revoke-ledger-table",
+      "REVOKE SELECT, INSERT ON TABLE drizzle.",
+    ],
+    [
+      "extra trailing executable SQL",
+      "revoke-ledger-sequence",
+      `REVOKE USAGE, SELECT ON SEQUENCE drizzle.__drizzle_migrations_id_seq FROM "${testMigrationExecutor}"; SELECT 1`,
+    ],
+  ] as const)(
+    "keeps authority residue and blocks postflight for %s",
+    async (_caseName, label, wrongStatement) => {
+      const canonical = createOwnershipCanonicalizationFakeClient({
+        cleanupStatementOverrides: { [label]: wrongStatement },
+      });
+      const postflight = createPostflightBoundaryFakeClient();
+      const result = await runOwnershipCanonicalizationProbeForTests({
+        client: canonical.client,
+        postflightClient: postflight.client,
+        expectedSessionRole: testFixtureSessionRole,
+        deadlineLimits: {
+          totalMilliseconds: 1_000,
+          connectMilliseconds: 100,
+          queryMilliseconds: 100,
+          closeMilliseconds: 100,
+          phaseMilliseconds: 100,
+          migrationMilliseconds: 100,
+        },
+      });
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_TEMPORARY_AUTHORITY_RESIDUE"
+      );
+      expect(canonical.state.cleanup).not.toContain(label);
+      expect(canonical.state.authorityRows.length).toBeGreaterThan(0);
+      expect(postflight.state.connect).toBe(0);
+      expect(result).not.toHaveProperty("temporaryAuthorityCleanup");
+      const publicResult = JSON.stringify(result);
+      expect(publicResult).not.toContain("REVOKE");
+      expect(publicResult).not.toContain(testFixtureSessionRole);
+      expect(publicResult).not.toContain(testMigrationExecutor);
+      expect(publicResult).not.toContain(testLegacyOwner);
+    }
+  );
+
+  it("requires the exact empty parameter contract before mutating fake authority state", async () => {
+    const canonical = createOwnershipCanonicalizationFakeClient({
+      cleanupParameterOverrides: { "revoke-ledger-table": ["unexpected"] },
+    });
+    const postflight = createPostflightBoundaryFakeClient();
+    const result = await runOwnershipCanonicalizationProbeForTests({
+      client: canonical.client,
+      postflightClient: postflight.client,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits: {
+        totalMilliseconds: 1_000,
+        connectMilliseconds: 100,
+        queryMilliseconds: 100,
+        closeMilliseconds: 100,
+        phaseMilliseconds: 100,
+        migrationMilliseconds: 100,
+      },
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_TEMPORARY_AUTHORITY_RESIDUE"
+    );
+    expect(canonical.state.cleanup).not.toContain("revoke-ledger-table");
+    expect(canonical.state.authorityRows).toHaveLength(2);
+    expect(postflight.state.connect).toBe(0);
+  });
 
   it.each([
     "revoke-database-create",

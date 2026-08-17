@@ -371,6 +371,9 @@ const POST_CANONICAL_OWNERSHIP_SNAPSHOT_SQL = `
 const TEMPORARY_AUTHORITY_ROW_KEYS = Object.freeze([
   "authority_kind",
   "role_name",
+  "role_relation",
+  "grantor_name",
+  "grantee_name",
   "object_kind",
   "schema_name",
   "object_name",
@@ -387,10 +390,122 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT role_entry.oid, role_entry.rolname
     FROM pg_catalog.pg_roles AS role_entry
     WHERE role_entry.rolname = ANY($1::text[])
+  ), current_database_identity AS (
+    SELECT database_entry.oid
+    FROM pg_catalog.pg_database AS database_entry
+    WHERE database_entry.datname = pg_catalog.current_database()
+  ), explicit_acl_coverage AS (
+    SELECT DISTINCT
+      0::oid AS dbid,
+      'pg_catalog.pg_database'::regclass AS classid,
+      database_entry.oid AS objid,
+      0::integer AS objsubid,
+      target_role.oid AS target_role_oid
+    FROM pg_catalog.pg_database AS database_entry
+    CROSS JOIN LATERAL pg_catalog.aclexplode(database_entry.datacl) AS acl
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+
+    UNION
+
+    SELECT DISTINCT
+      current_database_identity.oid,
+      'pg_catalog.pg_namespace'::regclass,
+      namespace_entry.oid,
+      0::integer,
+      target_role.oid
+    FROM pg_catalog.pg_namespace AS namespace_entry
+    CROSS JOIN current_database_identity
+    CROSS JOIN LATERAL pg_catalog.aclexplode(namespace_entry.nspacl) AS acl
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+
+    UNION
+
+    SELECT DISTINCT
+      current_database_identity.oid,
+      'pg_catalog.pg_class'::regclass,
+      relation_entry.oid,
+      0::integer,
+      target_role.oid
+    FROM pg_catalog.pg_class AS relation_entry
+    CROSS JOIN current_database_identity
+    CROSS JOIN LATERAL pg_catalog.aclexplode(relation_entry.relacl) AS acl
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+
+    UNION
+
+    SELECT DISTINCT
+      current_database_identity.oid,
+      'pg_catalog.pg_class'::regclass,
+      attribute_entry.attrelid,
+      attribute_entry.attnum::integer,
+      target_role.oid
+    FROM pg_catalog.pg_attribute AS attribute_entry
+    CROSS JOIN current_database_identity
+    CROSS JOIN LATERAL pg_catalog.aclexplode(attribute_entry.attacl) AS acl
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+    WHERE attribute_entry.attnum > 0
+      AND NOT attribute_entry.attisdropped
+
+    UNION
+
+    SELECT DISTINCT
+      current_database_identity.oid,
+      'pg_catalog.pg_proc'::regclass,
+      procedure_entry.oid,
+      0::integer,
+      target_role.oid
+    FROM pg_catalog.pg_proc AS procedure_entry
+    CROSS JOIN current_database_identity
+    CROSS JOIN LATERAL pg_catalog.aclexplode(procedure_entry.proacl) AS acl
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+
+    UNION
+
+    SELECT DISTINCT
+      current_database_identity.oid,
+      'pg_catalog.pg_type'::regclass,
+      type_entry.oid,
+      0::integer,
+      target_role.oid
+    FROM pg_catalog.pg_type AS type_entry
+    CROSS JOIN current_database_identity
+    CROSS JOIN LATERAL pg_catalog.aclexplode(type_entry.typacl) AS acl
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+
+    UNION
+
+    SELECT DISTINCT
+      current_database_identity.oid,
+      'pg_catalog.pg_default_acl'::regclass,
+      default_acl.oid,
+      0::integer,
+      target_role.oid
+    FROM pg_catalog.pg_default_acl AS default_acl
+    CROSS JOIN current_database_identity
+    CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) AS acl
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
   ), authority_inventory AS (
     SELECT
       'explicit_acl'::text AS authority_kind,
       target_role.rolname::text AS role_name,
+      CASE
+        WHEN target_role.oid = acl.grantee AND target_role.oid = acl.grantor THEN 'both'
+        WHEN target_role.oid = acl.grantee THEN 'grantee'
+        WHEN target_role.oid = acl.grantor THEN 'grantor'
+        ELSE 'unknown'
+      END::text AS role_relation,
+      COALESCE(grantor_identity.rolname, 'UNRESOLVED')::text AS grantor_name,
+      CASE
+        WHEN acl.grantee = 0 THEN 'PUBLIC'
+        ELSE COALESCE(grantee_identity.rolname, 'UNRESOLVED')
+      END::text AS grantee_name,
       'database'::text AS object_kind,
       NULL::text AS schema_name,
       database_entry.datname::text AS object_name,
@@ -403,13 +518,29 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
       NULL::boolean AS set_option
     FROM pg_catalog.pg_database AS database_entry
     CROSS JOIN LATERAL pg_catalog.aclexplode(database_entry.datacl) AS acl
-    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantor_identity
+      ON grantor_identity.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantee_identity
+      ON grantee_identity.oid = acl.grantee
 
     UNION ALL
 
     SELECT
       'explicit_acl'::text,
       target_role.rolname::text,
+      CASE
+        WHEN target_role.oid = acl.grantee AND target_role.oid = acl.grantor THEN 'both'
+        WHEN target_role.oid = acl.grantee THEN 'grantee'
+        WHEN target_role.oid = acl.grantor THEN 'grantor'
+        ELSE 'unknown'
+      END::text,
+      COALESCE(grantor_identity.rolname, 'UNRESOLVED')::text,
+      CASE
+        WHEN acl.grantee = 0 THEN 'PUBLIC'
+        ELSE COALESCE(grantee_identity.rolname, 'UNRESOLVED')
+      END::text,
       'schema'::text,
       namespace_entry.nspname::text,
       namespace_entry.nspname::text,
@@ -422,13 +553,29 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
       NULL::boolean
     FROM pg_catalog.pg_namespace AS namespace_entry
     CROSS JOIN LATERAL pg_catalog.aclexplode(namespace_entry.nspacl) AS acl
-    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantor_identity
+      ON grantor_identity.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantee_identity
+      ON grantee_identity.oid = acl.grantee
 
     UNION ALL
 
     SELECT
       'explicit_acl'::text,
       target_role.rolname::text,
+      CASE
+        WHEN target_role.oid = acl.grantee AND target_role.oid = acl.grantor THEN 'both'
+        WHEN target_role.oid = acl.grantee THEN 'grantee'
+        WHEN target_role.oid = acl.grantor THEN 'grantor'
+        ELSE 'unknown'
+      END::text,
+      COALESCE(grantor_identity.rolname, 'UNRESOLVED')::text,
+      CASE
+        WHEN acl.grantee = 0 THEN 'PUBLIC'
+        ELSE COALESCE(grantee_identity.rolname, 'UNRESOLVED')
+      END::text,
       CASE relation_entry.relkind
         WHEN 'r' THEN 'table'
         WHEN 'p' THEN 'table'
@@ -451,13 +598,29 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     INNER JOIN pg_catalog.pg_namespace AS namespace_entry
       ON namespace_entry.oid = relation_entry.relnamespace
     CROSS JOIN LATERAL pg_catalog.aclexplode(relation_entry.relacl) AS acl
-    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantor_identity
+      ON grantor_identity.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantee_identity
+      ON grantee_identity.oid = acl.grantee
 
     UNION ALL
 
     SELECT
       'explicit_acl'::text,
       target_role.rolname::text,
+      CASE
+        WHEN target_role.oid = acl.grantee AND target_role.oid = acl.grantor THEN 'both'
+        WHEN target_role.oid = acl.grantee THEN 'grantee'
+        WHEN target_role.oid = acl.grantor THEN 'grantor'
+        ELSE 'unknown'
+      END::text,
+      COALESCE(grantor_identity.rolname, 'UNRESOLVED')::text,
+      CASE
+        WHEN acl.grantee = 0 THEN 'PUBLIC'
+        ELSE COALESCE(grantee_identity.rolname, 'UNRESOLVED')
+      END::text,
       'column'::text,
       namespace_entry.nspname::text,
       relation_entry.relname::text,
@@ -474,7 +637,12 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     INNER JOIN pg_catalog.pg_namespace AS namespace_entry
       ON namespace_entry.oid = relation_entry.relnamespace
     CROSS JOIN LATERAL pg_catalog.aclexplode(attribute_entry.attacl) AS acl
-    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantor_identity
+      ON grantor_identity.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantee_identity
+      ON grantee_identity.oid = acl.grantee
     WHERE attribute_entry.attnum > 0
       AND NOT attribute_entry.attisdropped
 
@@ -483,6 +651,17 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'explicit_acl'::text,
       target_role.rolname::text,
+      CASE
+        WHEN target_role.oid = acl.grantee AND target_role.oid = acl.grantor THEN 'both'
+        WHEN target_role.oid = acl.grantee THEN 'grantee'
+        WHEN target_role.oid = acl.grantor THEN 'grantor'
+        ELSE 'unknown'
+      END::text,
+      COALESCE(grantor_identity.rolname, 'UNRESOLVED')::text,
+      CASE
+        WHEN acl.grantee = 0 THEN 'PUBLIC'
+        ELSE COALESCE(grantee_identity.rolname, 'UNRESOLVED')
+      END::text,
       CASE procedure_entry.prokind
         WHEN 'f' THEN 'function'
         WHEN 'p' THEN 'procedure'
@@ -501,13 +680,29 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     INNER JOIN pg_catalog.pg_namespace AS namespace_entry
       ON namespace_entry.oid = procedure_entry.pronamespace
     CROSS JOIN LATERAL pg_catalog.aclexplode(procedure_entry.proacl) AS acl
-    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantor_identity
+      ON grantor_identity.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantee_identity
+      ON grantee_identity.oid = acl.grantee
 
     UNION ALL
 
     SELECT
       'explicit_acl'::text,
       target_role.rolname::text,
+      CASE
+        WHEN target_role.oid = acl.grantee AND target_role.oid = acl.grantor THEN 'both'
+        WHEN target_role.oid = acl.grantee THEN 'grantee'
+        WHEN target_role.oid = acl.grantor THEN 'grantor'
+        ELSE 'unknown'
+      END::text,
+      COALESCE(grantor_identity.rolname, 'UNRESOLVED')::text,
+      CASE
+        WHEN acl.grantee = 0 THEN 'PUBLIC'
+        ELSE COALESCE(grantee_identity.rolname, 'UNRESOLVED')
+      END::text,
       'type'::text,
       namespace_entry.nspname::text,
       type_entry.typname::text,
@@ -522,13 +717,29 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     INNER JOIN pg_catalog.pg_namespace AS namespace_entry
       ON namespace_entry.oid = type_entry.typnamespace
     CROSS JOIN LATERAL pg_catalog.aclexplode(type_entry.typacl) AS acl
-    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantor_identity
+      ON grantor_identity.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantee_identity
+      ON grantee_identity.oid = acl.grantee
 
     UNION ALL
 
     SELECT
       'explicit_acl'::text,
       target_role.rolname::text,
+      CASE
+        WHEN target_role.oid = acl.grantee AND target_role.oid = acl.grantor THEN 'both'
+        WHEN target_role.oid = acl.grantee THEN 'grantee'
+        WHEN target_role.oid = acl.grantor THEN 'grantor'
+        ELSE 'unknown'
+      END::text,
+      COALESCE(grantor_identity.rolname, 'UNRESOLVED')::text,
+      CASE
+        WHEN acl.grantee = 0 THEN 'PUBLIC'
+        ELSE COALESCE(grantee_identity.rolname, 'UNRESOLVED')
+      END::text,
       'default_acl'::text,
       namespace_entry.nspname::text,
       default_acl.defaclobjtype::text,
@@ -543,13 +754,21 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     LEFT JOIN pg_catalog.pg_namespace AS namespace_entry
       ON namespace_entry.oid = default_acl.defaclnamespace
     CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) AS acl
-    INNER JOIN target_roles AS target_role ON target_role.oid = acl.grantee
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = acl.grantee OR target_role.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantor_identity
+      ON grantor_identity.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantee_identity
+      ON grantee_identity.oid = acl.grantee
 
     UNION ALL
 
     SELECT
       'direct_membership'::text,
       member_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'role'::text,
       NULL::text,
       granted_role.rolname::text,
@@ -576,6 +795,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'recursive_membership'::text,
       member_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'role'::text,
       NULL::text,
       granted_role.rolname::text,
@@ -596,6 +818,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'effective_membership'::text,
       member_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'role'::text,
       NULL::text,
       granted_role.rolname::text,
@@ -616,6 +841,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'ownership'::text,
       target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'database'::text,
       NULL::text,
       database_entry.datname::text,
@@ -634,6 +862,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'ownership'::text,
       target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'schema'::text,
       namespace_entry.nspname::text,
       namespace_entry.nspname::text,
@@ -652,6 +883,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'ownership'::text,
       target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       CASE relation_entry.relkind
         WHEN 'r' THEN 'table'
         WHEN 'p' THEN 'table'
@@ -682,6 +916,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'ownership'::text,
       target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'type'::text,
       namespace_entry.nspname::text,
       type_entry.typname::text,
@@ -702,6 +939,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'ownership'::text,
       target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       CASE procedure_entry.prokind
         WHEN 'f' THEN 'function'
         WHEN 'p' THEN 'procedure'
@@ -726,6 +966,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'ownership'::text,
       target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'default_acl'::text,
       namespace_entry.nspname::text,
       default_acl.defaclobjtype::text,
@@ -746,6 +989,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     SELECT
       'ownership'::text,
       target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'tablespace'::text,
       NULL::text,
       tablespace_entry.spcname::text,
@@ -762,8 +1008,46 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     UNION ALL
 
     SELECT
+      'uncovered_acl_dependency'::text,
+      target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
+      'unsupported_acl_dependency'::text,
+      NULL::text,
+      dependency_entry.classid::regclass::text,
+      CASE
+        WHEN dependency_entry.objsubid = 0 THEN NULL::text
+        ELSE 'column'::text
+      END,
+      NULL::text,
+      'ACL_DEPENDENCY'::text,
+      false,
+      NULL::text,
+      NULL::boolean,
+      NULL::boolean
+    FROM pg_catalog.pg_shdepend AS dependency_entry
+    INNER JOIN target_roles AS target_role ON target_role.oid = dependency_entry.refobjid
+    WHERE dependency_entry.refclassid = 'pg_catalog.pg_authid'::regclass
+      AND dependency_entry.deptype = 'a'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM explicit_acl_coverage AS coverage
+        WHERE coverage.dbid = dependency_entry.dbid
+          AND coverage.classid = dependency_entry.classid
+          AND coverage.objid = dependency_entry.objid
+          AND coverage.objsubid = dependency_entry.objsubid
+          AND coverage.target_role_oid = dependency_entry.refobjid
+      )
+
+    UNION ALL
+
+    SELECT
       'ownership'::text,
       target_role.rolname::text,
+      NULL::text,
+      NULL::text,
+      NULL::text,
       'unsupported_owned_object'::text,
       NULL::text,
       dependency_entry.classid::regclass::text,
@@ -791,6 +1075,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
   SELECT
     authority_kind,
     role_name,
+    role_relation,
+    grantor_name,
+    grantee_name,
     object_kind,
     schema_name,
     object_name,
@@ -805,6 +1092,9 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
   ORDER BY
     authority_kind,
     role_name,
+    role_relation NULLS FIRST,
+    grantor_name NULLS FIRST,
+    grantee_name NULLS FIRST,
     object_kind,
     schema_name NULLS FIRST,
     object_name,
@@ -816,6 +1106,8 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
     inherit_option NULLS FIRST,
     set_option NULLS FIRST
 `;
+export const TEMPORARY_AUTHORITY_INVENTORY_SQL_FOR_TESTS =
+  TEMPORARY_AUTHORITY_INVENTORY_SQL;
 const FIXTURE_EXTENSION_CONTRACT = Object.freeze([
   Object.freeze({ name: "plpgsql", schema: "pg_catalog", version: "1.0" }),
 ]);
@@ -2026,6 +2318,9 @@ function sortedTemporaryAuthorityRows(rows) {
 function temporaryAuthorityRow({
   authorityKind,
   roleName,
+  roleRelation = null,
+  grantorName = null,
+  granteeName = null,
   objectKind,
   schemaName = null,
   objectName,
@@ -2040,6 +2335,9 @@ function temporaryAuthorityRow({
   return {
     authority_kind: authorityKind,
     role_name: roleName,
+    role_relation: roleRelation,
+    grantor_name: grantorName,
+    grantee_name: granteeName,
     object_kind: objectKind,
     schema_name: schemaName,
     object_name: objectName,
@@ -2057,22 +2355,29 @@ function buildTemporaryAuthorityContract(configuration) {
   const code = "EXTERNAL_FIXTURE_TEMPORARY_AUTHORITY_CONTRACT_INVALID";
   requireHarness(
     SAFE_IDENTIFIER.test(configuration?.database) &&
+      SAFE_IDENTIFIER.test(configuration?.role) &&
       SAFE_IDENTIFIER.test(USAGE_MIGRATION_BOUNDARY_ROLES.legacyOwner) &&
       SAFE_IDENTIFIER.test(USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor),
     code
   );
   const { legacyOwner, migrationExecutor } = USAGE_MIGRATION_BOUNDARY_ROLES;
-  const rows = [
+  const temporaryAclAuthorityRow = (row) =>
     temporaryAuthorityRow({
+      ...row,
       authorityKind: "explicit_acl",
+      roleRelation: "grantee",
+      grantorName: configuration.role,
+      granteeName: row.roleName,
+    });
+  const rows = [
+    temporaryAclAuthorityRow({
       roleName: migrationExecutor,
       objectKind: "database",
       objectName: configuration.database,
       privilegeType: "CREATE",
     }),
     ...["CREATE", "USAGE"].map((privilegeType) =>
-      temporaryAuthorityRow({
-        authorityKind: "explicit_acl",
+      temporaryAclAuthorityRow({
         roleName: migrationExecutor,
         objectKind: "schema",
         schemaName: "public",
@@ -2081,8 +2386,7 @@ function buildTemporaryAuthorityContract(configuration) {
       })
     ),
     ...["CREATE", "USAGE"].map((privilegeType) =>
-      temporaryAuthorityRow({
-        authorityKind: "explicit_acl",
+      temporaryAclAuthorityRow({
         roleName: legacyOwner,
         objectKind: "schema",
         schemaName: "public",
@@ -2091,8 +2395,7 @@ function buildTemporaryAuthorityContract(configuration) {
       })
     ),
     ...["CREATE", "USAGE"].map((privilegeType) =>
-      temporaryAuthorityRow({
-        authorityKind: "explicit_acl",
+      temporaryAclAuthorityRow({
         roleName: migrationExecutor,
         objectKind: "schema",
         schemaName: MIGRATION_LEDGER_CONTRACT.schema,
@@ -2101,8 +2404,7 @@ function buildTemporaryAuthorityContract(configuration) {
       })
     ),
     ...["INSERT", "SELECT"].map((privilegeType) =>
-      temporaryAuthorityRow({
-        authorityKind: "explicit_acl",
+      temporaryAclAuthorityRow({
         roleName: migrationExecutor,
         objectKind: "table",
         schemaName: MIGRATION_LEDGER_CONTRACT.schema,
@@ -2111,8 +2413,7 @@ function buildTemporaryAuthorityContract(configuration) {
       })
     ),
     ...["SELECT", "USAGE"].map((privilegeType) =>
-      temporaryAuthorityRow({
-        authorityKind: "explicit_acl",
+      temporaryAclAuthorityRow({
         roleName: migrationExecutor,
         objectKind: "sequence",
         schemaName: MIGRATION_LEDGER_CONTRACT.schema,
