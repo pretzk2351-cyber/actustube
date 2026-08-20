@@ -1161,6 +1161,9 @@ describe("usage denial HTTP mapping", () => {
     async (denialReason, code, retryAfter) => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-07-18T23:00:00.000Z"));
+      if (!jwtState.token) throw new Error("JWT test token is missing.");
+      jwtState.token.accessTokenExpiresAt =
+        Math.floor(Date.now() / 1_000) + 3_600;
       installChannelFetchMock();
       usageState.reserve.mockResolvedValue({
         allowed: false,

@@ -1983,6 +1983,69 @@ async function observeSessionIdentity(client, expectedSessionRole, code) {
   return Object.freeze({ sessionRole: row.session_role });
 }
 
+function createObservedSessionIdentityAuthority(observedSessionIdentity) {
+  validateObservedSessionIdentity(
+    observedSessionIdentity,
+    "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_INVALID"
+  );
+  return Object.freeze({ observedSessionIdentity });
+}
+
+function requireOriginalObservedSessionIdentity(
+  identityAuthority,
+  observedSessionIdentity
+) {
+  requireHarness(
+    identityAuthority !== null &&
+      typeof identityAuthority === "object" &&
+      Object.isFrozen(identityAuthority) &&
+      exactOwnKeys(identityAuthority, ["observedSessionIdentity"]) &&
+      identityAuthority.observedSessionIdentity === observedSessionIdentity,
+    "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_REFERENCE_MISMATCH"
+  );
+  return validateObservedSessionIdentity(
+    observedSessionIdentity,
+    "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_INVALID"
+  );
+}
+
+async function runPreMutationSessionIdentityBoundary({
+  context,
+  clientFactory,
+  credentials,
+  expectedSessionRole,
+  operation,
+}) {
+  requireHarness(
+    typeof operation === "function",
+    "EXTERNAL_FIXTURE_PRE_MUTATION_BOUNDARY_INVALID"
+  );
+  return await withClient(
+    context,
+    clientFactory,
+    credentials,
+    async (client) => {
+      const observedSessionIdentity = await observeSessionIdentity(
+        client,
+        expectedSessionRole,
+        "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
+      );
+      const identityAuthority =
+        createObservedSessionIdentityAuthority(observedSessionIdentity);
+      const operationResult = await operation(
+        client,
+        observedSessionIdentity,
+        identityAuthority
+      );
+      requireOriginalObservedSessionIdentity(
+        identityAuthority,
+        observedSessionIdentity
+      );
+      return Object.freeze({ identityAuthority, operationResult });
+    }
+  );
+}
+
 function validateInitialMigrationBoundaryRoles(result, expectedSessionRole) {
   const code = "EXTERNAL_FIXTURE_INITIAL_ROLE_CONTRACT_MISMATCH";
   const boundary = USAGE_MIGRATION_BOUNDARY_ROLES;
@@ -2026,10 +2089,26 @@ function validateInitialMigrationBoundaryRoles(result, expectedSessionRole) {
   );
 }
 
-async function assertInitialMigrationBoundaryRoles(client, expectedSessionRole) {
-  const observedSessionIdentity = await observeSessionIdentity(
+async function assertInitialMigrationBoundaryRoles(
+  client,
+  expectedSessionRole,
+  identityAuthority,
+  preMutationObservedIdentity
+) {
+  const observedSessionRole = requireOriginalObservedSessionIdentity(
+    identityAuthority,
+    preMutationObservedIdentity
+  );
+  const boundaryObservedIdentity = await observeSessionIdentity(
     client,
     expectedSessionRole,
+    "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
+  );
+  requireHarness(
+    validateObservedSessionIdentity(
+      boundaryObservedIdentity,
+      "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_INVALID"
+    ) === observedSessionRole,
     "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
   );
   const boundary = USAGE_MIGRATION_BOUNDARY_ROLES;
@@ -2076,7 +2155,7 @@ async function assertInitialMigrationBoundaryRoles(client, expectedSessionRole) 
     ]
   );
   validateInitialMigrationBoundaryRoles(result, expectedSessionRole);
-  return observedSessionIdentity;
+  return boundaryObservedIdentity;
 }
 
 async function assertMigrationExecutorIdentity(client, expectedSessionRole) {
@@ -2894,14 +2973,22 @@ async function runCanonicalOwnershipBoundary({
   context,
   clientFactory,
   configuration,
+  identityAuthority,
   observedSessionIdentity,
   specification,
   postflightOperation,
+  identityReferenceObserver = null,
 }) {
-  const observedSessionRole = validateObservedSessionIdentity(
-    observedSessionIdentity,
-    "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_INVALID"
+  const observedSessionRole = requireOriginalObservedSessionIdentity(
+    identityAuthority,
+    observedSessionIdentity
   );
+  requireHarness(
+    identityReferenceObserver === null ||
+      typeof identityReferenceObserver === "function",
+    "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_REFERENCE_MISMATCH"
+  );
+  identityReferenceObserver?.(observedSessionIdentity);
   const contract = buildRepositoryOwnershipContract(
     specification,
     observedSessionRole
@@ -2915,14 +3002,14 @@ async function runCanonicalOwnershipBoundary({
     clientFactory,
     fixtureCredentials(configuration),
     async (client) => {
-      await assertPreCanonicalOwnershipInventory(client, contract);
-      await canonicalizeFixtureOwnership(client, contract);
-      await assertPostCanonicalOwnershipSnapshot(client, contract);
       await observeSessionIdentity(
         client,
         observedSessionRole,
         "EXTERNAL_FIXTURE_CLEANUP_SESSION_IDENTITY_MISMATCH"
       );
+      await assertPreCanonicalOwnershipInventory(client, contract);
+      await canonicalizeFixtureOwnership(client, contract);
+      await assertPostCanonicalOwnershipSnapshot(client, contract);
       await assertPreCleanupTemporaryAuthorityInventory(
         client,
         temporaryAuthorityContract
@@ -3019,20 +3106,37 @@ async function orchestrateUsageMigrationOwnerBoundary({
   context,
   client,
   expectedSessionRole,
+  identityAuthority,
+  observedSessionIdentity,
   baselineMigration,
   finalMigration,
   replayMigration,
   beforeFinalMigration,
+  identityReferenceObserver = null,
 }) {
   requireHarness(
-    typeof beforeFinalMigration === "function",
+    typeof beforeFinalMigration === "function" &&
+      (identityReferenceObserver === null ||
+        typeof identityReferenceObserver === "function"),
     "EXTERNAL_FIXTURE_MIGRATION_CALLBACK_INVALID"
   );
-  await createUsageFixtureRoles(client);
-  const observedSessionIdentity = await assertInitialMigrationBoundaryRoles(
-    client,
-    expectedSessionRole
+  requireOriginalObservedSessionIdentity(
+    identityAuthority,
+    observedSessionIdentity
   );
+  await createUsageFixtureRoles(client);
+  const boundaryObservedIdentity = await assertInitialMigrationBoundaryRoles(
+    client,
+    expectedSessionRole,
+    identityAuthority,
+    observedSessionIdentity
+  );
+  identityReferenceObserver?.({
+    preMutationObservedIdentity:
+      identityAuthority.observedSessionIdentity,
+    downstreamObservedIdentity: observedSessionIdentity,
+    boundaryObservedIdentity,
+  });
   await grantUsageMigrationPrivileges(client);
   await withMigrationExecutorRole(context, client, async () => {
     await assertMigrationExecutorIdentity(client, expectedSessionRole);
@@ -3056,7 +3160,7 @@ async function orchestrateUsageMigrationOwnerBoundary({
     await runMigrationCallback(context, client, "replay", replayMigration);
   });
   await assertUsageOwnerPostcondition(client, expectedSessionRole);
-  return Object.freeze({ beforeFinalResult, observedSessionIdentity });
+  return Object.freeze({ beforeFinalResult });
 }
 
 async function applyMigrationsAndRuntimeAcl(
@@ -3071,18 +3175,16 @@ async function applyMigrationsAndRuntimeAcl(
       specification.migrations.at(-1)?.tag.startsWith("0006_"),
     "EXTERNAL_FIXTURE_MIGRATION_CONTRACT_MISMATCH"
   );
-  let legacyAclHash;
-  let observedSessionIdentity;
-  await withClient(
+  const preMutationBoundary = await runPreMutationSessionIdentityBoundary({
     context,
     clientFactory,
-    fixtureCredentials(configuration),
-    async (client) => {
-      const preMutationObservedIdentity = await observeSessionIdentity(
-        client,
-        configuration.role,
-        "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
-      );
+    credentials: fixtureCredentials(configuration),
+    expectedSessionRole: configuration.role,
+    async operation(
+      client,
+      preMutationObservedIdentity,
+      identityAuthority
+    ) {
       await client.query(
         "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
       );
@@ -3090,6 +3192,8 @@ async function applyMigrationsAndRuntimeAcl(
         context,
         client,
         expectedSessionRole: configuration.role,
+        identityAuthority,
+        observedSessionIdentity: preMutationObservedIdentity,
         async baselineMigration(callbackClient) {
           await applyMigrationCountWithinBoundary(
             callbackClient,
@@ -3133,21 +3237,11 @@ async function applyMigrationsAndRuntimeAcl(
           await assertMigrationLedger(callbackClient, EXPECTED_MIGRATION_COUNT);
         },
       });
-      requireHarness(
-        validateObservedSessionIdentity(
-          boundaryResult.observedSessionIdentity,
-          "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_INVALID"
-        ) ===
-          validateObservedSessionIdentity(
-            preMutationObservedIdentity,
-            "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_INVALID"
-          ),
-        "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
-      );
-      legacyAclHash = boundaryResult.beforeFinalResult;
-      observedSessionIdentity = boundaryResult.observedSessionIdentity;
-    }
-  );
+      return boundaryResult.beforeFinalResult;
+    },
+  });
+  const { identityAuthority, operationResult: legacyAclHash } =
+    preMutationBoundary;
   await verifyUsageAclInheritance(
     context,
     clientFactory,
@@ -3163,11 +3257,11 @@ async function applyMigrationsAndRuntimeAcl(
     fixtureCredentials(configuration),
     (client) => configureRuntimeAcl(client, configuration)
   );
-  validateObservedSessionIdentity(
-    observedSessionIdentity,
-    "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_INVALID"
+  requireOriginalObservedSessionIdentity(
+    identityAuthority,
+    identityAuthority.observedSessionIdentity
   );
-  return observedSessionIdentity;
+  return identityAuthority;
 }
 
 function usageSignatureArraySql() {
@@ -3978,6 +4072,7 @@ export async function runMigrationOwnerBoundaryProbeForTests({
   expectedSessionRole,
   deadlineLimits,
   callbackScenario = "normal",
+  replaceObservedIdentityForTest = false,
 }) {
   assertUsageFixtureRoleSeparation(expectedSessionRole);
   requireHarness(
@@ -3987,8 +4082,26 @@ export async function runMigrationOwnerBoundaryProbeForTests({
   const context = createDeadlineContext(deadlineLimits);
   let failureMarker = null;
   let observedIdentityFrozen = false;
+  let initialObservedIdentityReference = null;
+  let downstreamObservedIdentityReference = null;
+  let boundaryObservedIdentityReference = null;
   try {
-    await withClient(context, () => client, {}, async (ownedClient) => {
+    const preMutationBoundary = await runPreMutationSessionIdentityBoundary({
+      context,
+      clientFactory: () => client,
+      credentials: {},
+      expectedSessionRole,
+      async operation(
+        ownedClient,
+        preMutationObservedIdentity,
+        identityAuthority
+      ) {
+        initialObservedIdentityReference = preMutationObservedIdentity;
+        downstreamObservedIdentityReference = replaceObservedIdentityForTest
+          ? Object.freeze({
+              sessionRole: preMutationObservedIdentity.sessionRole,
+            })
+          : preMutationObservedIdentity;
       const observableMigrationCallback = async (
         callbackClient,
         callbackKind
@@ -4009,6 +4122,8 @@ export async function runMigrationOwnerBoundaryProbeForTests({
         context,
         client: ownedClient,
         expectedSessionRole,
+        identityAuthority,
+        observedSessionIdentity: downstreamObservedIdentityReference,
         baselineMigration: observableMigrationCallback,
         finalMigration: observableMigrationCallback,
         replayMigration: observableMigrationCallback,
@@ -4017,11 +4132,24 @@ export async function runMigrationOwnerBoundaryProbeForTests({
             "SELECT 'fixed_before_final_boundary'::text AS fixed_boundary_probe"
           );
         },
+        identityReferenceObserver(references) {
+          downstreamObservedIdentityReference =
+            references.downstreamObservedIdentity;
+          boundaryObservedIdentityReference =
+            references.boundaryObservedIdentity;
+        },
       });
-      observedIdentityFrozen =
-        Object.isFrozen(boundaryResult.observedSessionIdentity) &&
-        exactOwnKeys(boundaryResult.observedSessionIdentity, ["sessionRole"]);
+        return boundaryResult;
+      },
     });
+    observedIdentityFrozen =
+      Object.isFrozen(
+        preMutationBoundary.identityAuthority.observedSessionIdentity
+      ) &&
+      exactOwnKeys(
+        preMutationBoundary.identityAuthority.observedSessionIdentity,
+        ["sessionRole"]
+      );
   } catch (error) {
     failureMarker =
       error instanceof HarnessIssue
@@ -4036,6 +4164,12 @@ export async function runMigrationOwnerBoundaryProbeForTests({
     usable: ownedClient?.usable === true,
     destroyed: ownedClient?.destroyed === true,
     observedIdentityFrozen,
+    observedIdentityReferencePreserved:
+      initialObservedIdentityReference !== null &&
+      initialObservedIdentityReference === downstreamObservedIdentityReference,
+    boundaryReobservationDistinct:
+      boundaryObservedIdentityReference !== null &&
+      boundaryObservedIdentityReference !== initialObservedIdentityReference,
     operationStarts: Object.freeze({ ...context.operationStarts }),
   });
 }
@@ -4048,6 +4182,7 @@ export async function runMigrationOwnerBoundaryProbeForTests({
  *   unrelatedClient?: object | null,
  *   callerConfigurationRole: string,
  *   cleanupConfigurationRoleForTest?: string,
+ *   replaceObservedIdentityForTest?: boolean,
  *   deadlineLimits?: object,
  * }} options
  */
@@ -4058,16 +4193,20 @@ export async function runOwnershipCanonicalizationProbeForTests({
   unrelatedClient = null,
   callerConfigurationRole,
   cleanupConfigurationRoleForTest = callerConfigurationRole,
+  replaceObservedIdentityForTest = false,
   deadlineLimits,
 }) {
   assertUsageFixtureRoleSeparation(callerConfigurationRole);
   assertUsageFixtureRoleSeparation(cleanupConfigurationRoleForTest);
+  const specification = await loadRepositorySpecification(repositoryRoot);
   const context = createDeadlineContext(deadlineLimits);
   const unrelatedContext = unrelatedClient
     ? createDeadlineContext(deadlineLimits)
     : null;
   let unrelatedOwnedClient = null;
   let failureMarker = null;
+  let initialObservedIdentityReference = null;
+  let downstreamObservedIdentityReference = null;
   try {
     if (unrelatedContext) {
       unrelatedOwnedClient = await openClient(
@@ -4076,18 +4215,21 @@ export async function runOwnershipCanonicalizationProbeForTests({
         {}
       );
     }
-    const observedSessionIdentity = await withClient(
+    const preMutationBoundary = await runPreMutationSessionIdentityBoundary({
       context,
-      () => initialIdentityClient,
-      {},
-      (ownedClient) =>
-        observeSessionIdentity(
-          ownedClient,
-          callerConfigurationRole,
-          "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
-        )
-    );
-    const specification = await loadRepositorySpecification(repositoryRoot);
+      clientFactory: () => initialIdentityClient,
+      credentials: {},
+      expectedSessionRole: callerConfigurationRole,
+      operation(_client, observedSessionIdentity) {
+        initialObservedIdentityReference = observedSessionIdentity;
+      },
+    });
+    const { identityAuthority } = preMutationBoundary;
+    const observedSessionIdentity = replaceObservedIdentityForTest
+      ? Object.freeze({
+          sessionRole: identityAuthority.observedSessionIdentity.sessionRole,
+        })
+      : identityAuthority.observedSessionIdentity;
     const configuration = Object.freeze({
       host: "127.0.0.1",
       port: 5432,
@@ -4099,8 +4241,12 @@ export async function runOwnershipCanonicalizationProbeForTests({
       context,
       clientFactory: () => client,
       configuration,
+      identityAuthority,
       observedSessionIdentity,
       specification,
+      identityReferenceObserver(identity) {
+        downstreamObservedIdentityReference = identity;
+      },
       postflightOperation: () =>
         withClient(context, () => postflightClient, {}, (ownedClient) =>
           ownedClient.query(
@@ -4122,6 +4268,9 @@ export async function runOwnershipCanonicalizationProbeForTests({
     failureMarker,
     timedOut: context.timedOut,
     activeClientCount: context.activeClients.size,
+    observedIdentityReferencePreserved:
+      initialObservedIdentityReference !== null &&
+      initialObservedIdentityReference === downstreamObservedIdentityReference,
     operationStarts: Object.freeze({ ...context.operationStarts }),
   });
 }
@@ -4248,7 +4397,7 @@ export async function runConnectionOnlyHarness(options = {}) {
     resolvedClientFactory,
     configuration
   );
-  const observedSessionIdentity = await applyMigrationsAndRuntimeAcl(
+  const identityAuthority = await applyMigrationsAndRuntimeAcl(
     context,
     resolvedClientFactory,
     configuration,
@@ -4260,7 +4409,8 @@ export async function runConnectionOnlyHarness(options = {}) {
     context,
     clientFactory: resolvedClientFactory,
     configuration,
-    observedSessionIdentity,
+    identityAuthority,
+    observedSessionIdentity: identityAuthority.observedSessionIdentity,
     specification,
     postflightOperation: () =>
       runPostflight(context, resolvedClientFactory, configuration),
