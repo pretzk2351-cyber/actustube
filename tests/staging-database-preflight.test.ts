@@ -1037,6 +1037,12 @@ const testUsageOwnerIdentities = [
   "public.get_usage_status_v1(uuid,integer,timestamp with time zone)",
 ] as const;
 
+const exactProductionDefaultPrivilegeContract = {
+  statement:
+    "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+  parameters: [],
+} as const;
+
 const exactRevokeContracts = [
   {
     label: "revoke-database-create",
@@ -1107,6 +1113,20 @@ function exactRevokeQueryLabel(
       JSON.stringify(contract.parameters) === JSON.stringify(parameters)
   );
   return matches.length === 1 ? matches[0].label : null;
+}
+
+function isExactProductionDefaultPrivilegeQuery(
+  statement: string,
+  parameters: unknown[]
+) {
+  return (
+    normalizeExactRevokeSql(statement) ===
+      normalizeExactRevokeSql(
+        exactProductionDefaultPrivilegeContract.statement
+      ) &&
+    Array.isArray(parameters) &&
+    parameters.length === exactProductionDefaultPrivilegeContract.parameters.length
+  );
 }
 
 function validMigrationRolePrecondition(
@@ -1182,6 +1202,9 @@ function ownerBoundaryQueryLabel(
   statement: string,
   parameters: unknown[] = []
 ) {
+  if (isExactProductionDefaultPrivilegeQuery(statement, parameters)) {
+    return "production-alter-default-privileges";
+  }
   const exactRevokeLabel = exactRevokeQueryLabel(statement, parameters);
   if (exactRevokeLabel) return exactRevokeLabel;
   if (statement.includes("CREATE ROLE") && statement.includes(testLegacyOwner)) {
@@ -1204,9 +1227,8 @@ function ownerBoundaryQueryLabel(
     return "migration-executor-identity";
   }
   if (
-    statement.includes("ALTER FUNCTION") &&
-    statement.includes("OWNER TO") &&
-    !statement.includes("OWNER TO SESSION_USER")
+    statement.includes(`ALTER FUNCTION ${testUsageOwnerIdentities[0]}`) &&
+    statement.includes(`OWNER TO "${testLegacyOwner}"`)
   ) {
     return "legacy-owner-baseline";
   }
@@ -1219,11 +1241,84 @@ function ownerBoundaryQueryLabel(
   if (statement.includes("WITH expected(function_identity, ordinal)")) {
     return "owner-postcondition";
   }
-  if (statement.includes("fixed_migration_callback_probe")) {
-    return `migration-callback-${String(parameters[0] ?? "unknown")}`;
+  const compactStatement = statement.replace(/\s+/g, " ").trim();
+  if (compactStatement.startsWith('CREATE SCHEMA IF NOT EXISTS "drizzle"')) {
+    return "drizzle-migration-start";
   }
-  if (statement.includes("fixed_before_final_boundary")) {
+  if (
+    compactStatement.startsWith(
+      'CREATE TABLE IF NOT EXISTS "drizzle"."__drizzle_migrations"'
+    )
+  ) {
+    return "drizzle-migration-table";
+  }
+  if (
+    compactStatement ===
+    'select id, hash, created_at from "drizzle"."__drizzle_migrations" order by created_at desc limit 1'
+  ) {
+    return "drizzle-migration-last";
+  }
+  if (
+    compactStatement.startsWith(
+      'insert into "drizzle"."__drizzle_migrations" ("hash", "created_at") values('
+    )
+  ) {
+    return "drizzle-migration-insert";
+  }
+  if (
+    statement.includes("count(DISTINCT hash)::integer") &&
+    statement.includes("FROM drizzle.__drizzle_migrations")
+  ) {
+    return "migration-ledger-count";
+  }
+  if (
+    statement.includes("'assignments'") &&
+    statement.includes("public.user_usage_buckets")
+  ) {
+    return "old-migration-state";
+  }
+  if (
+    statement.includes("AS compatible") &&
+    statement.includes("reserve_usage_limits_v2")
+  ) {
+    return "old-migration-compatible";
+  }
+  if (statement.includes("SELECT * FROM public.reserve_usage_limits_v2(")) {
+    return "old-migration-versioned-call";
+  }
+  if (
+    compactStatement.startsWith("GRANT EXECUTE ON FUNCTION") &&
+    compactStatement.endsWith("TO PUBLIC")
+  ) {
     return "before-final-boundary";
+  }
+  if (statement.includes("AS versioned_function_absent")) {
+    return "public-acl-failure-state";
+  }
+  if (
+    compactStatement.startsWith("REVOKE ALL PRIVILEGES ON FUNCTION") &&
+    compactStatement.endsWith("FROM PUBLIC")
+  ) {
+    return "public-acl-failure-reset";
+  }
+  if (statement.includes("pg_catalog.md5(proacl::text) AS acl_hash")) {
+    return "legacy-acl-hash";
+  }
+  if (compactStatement === "BEGIN" || compactStatement === "begin") {
+    return "begin";
+  }
+  if (compactStatement === "COMMIT" || compactStatement === "commit") {
+    return "commit";
+  }
+  if (compactStatement === "ROLLBACK" || compactStatement === "rollback") {
+    return "rollback";
+  }
+  if (compactStatement.startsWith("SAVEPOINT ")) return "savepoint";
+  if (compactStatement.startsWith("ROLLBACK TO SAVEPOINT ")) {
+    return "rollback-savepoint";
+  }
+  if (compactStatement.startsWith("RELEASE SAVEPOINT ")) {
+    return "release-savepoint";
   }
   if (statement.includes("authority_inventory")) {
     return "temporary-authority-inventory";
@@ -1273,7 +1368,14 @@ function createMigrationOwnerFakeClient({
       client: unknown;
       activeRole: string;
     }>,
+    defaultPrivilegeAttemptCount: 0,
+    defaultPrivilegeMutationCount: 0,
     identityQueryCount: 0,
+    migrationRunCount: 0,
+    migrationLedger: [] as Array<{ hash: string; created_at: number }>,
+    awaitingDrizzleTransaction: false,
+    inDrizzleTransaction: false,
+    publicAclFailureArmed: false,
     connect: 0,
     end: 0,
     destroy: 0,
@@ -1294,11 +1396,62 @@ function createMigrationOwnerFakeClient({
       state.connect += 1;
       return Promise.resolve();
     },
-    query(statement: string, parameters: unknown[] = []) {
+    query(
+      statementOrConfiguration: string | { text: string; values?: unknown[] },
+      parameters: unknown[] = []
+    ) {
+      const configurationHasValues =
+        typeof statementOrConfiguration !== "string" &&
+        Object.prototype.hasOwnProperty.call(
+          statementOrConfiguration,
+          "values"
+        );
+      const separateParameters = Array.isArray(parameters)
+        ? parameters
+        : ["invalid-fixed-query-parameter-contract"];
+      const effectiveParameters =
+        typeof statementOrConfiguration === "string" ||
+        !configurationHasValues
+          ? separateParameters
+          : Array.isArray(statementOrConfiguration.values) &&
+              separateParameters.length === 0
+            ? statementOrConfiguration.values
+            : ["invalid-fixed-query-parameter-contract"];
+      const statement =
+        typeof statementOrConfiguration === "string"
+          ? statementOrConfiguration
+          : statementOrConfiguration.text;
       state.query.push(statement);
-      state.parameters.push(parameters);
-      const label = ownerBoundaryQueryLabel(statement, parameters);
+      state.parameters.push(effectiveParameters);
+      const baseLabel = ownerBoundaryQueryLabel(
+        statement,
+        effectiveParameters
+      );
+      let label = baseLabel;
+      if (baseLabel === "drizzle-migration-start") {
+        state.migrationRunCount += 1;
+        label =
+          state.migrationRunCount === 1
+            ? "migration-callback-baseline"
+            : state.migrationRunCount === 2
+              ? "public-acl-failure-migration"
+              : state.migrationRunCount === 3
+                ? "migration-callback-final"
+                : state.migrationRunCount === 4
+                  ? "migration-callback-replay"
+                  : "unexpected-migration-run";
+      }
       state.labels.push(label);
+      if (
+        normalizeExactRevokeSql(statement).startsWith(
+          "ALTER DEFAULT PRIVILEGES"
+        )
+      ) {
+        state.defaultPrivilegeAttemptCount += 1;
+      }
+      if (label === "production-alter-default-privileges") {
+        state.defaultPrivilegeMutationCount += 1;
+      }
       if (label === "set-migration-executor") {
         state.activeRole = testMigrationExecutor;
       } else if (label === "reset-role") {
@@ -1344,6 +1497,85 @@ function createMigrationOwnerFakeClient({
       }
       if (label === "owner-postcondition") {
         return Promise.resolve({ rows: postconditionRows });
+      }
+      if (label === "drizzle-migration-last") {
+        state.awaitingDrizzleTransaction = true;
+        return Promise.resolve({
+          rows:
+            state.migrationLedger.length === 0
+              ? []
+              : [state.migrationLedger.at(-1)],
+        });
+      }
+      if (label === "begin" && state.awaitingDrizzleTransaction) {
+        state.awaitingDrizzleTransaction = false;
+        state.inDrizzleTransaction = true;
+        return Promise.resolve({ rows: [] });
+      }
+      if (label === "drizzle-migration-insert") {
+        const [hash, createdAt] = effectiveParameters;
+        if (typeof hash === "string" && typeof createdAt === "number") {
+          state.migrationLedger.push({ hash, created_at: createdAt });
+        }
+        return Promise.resolve({ rows: [] });
+      }
+      if (label === "commit" || label === "rollback") {
+        state.inDrizzleTransaction = false;
+        state.awaitingDrizzleTransaction = false;
+        return Promise.resolve({ rows: [] });
+      }
+      if (label === "migration-ledger-count") {
+        const rowCount = state.migrationLedger.length;
+        return Promise.resolve({
+          rows: [
+            {
+              row_count: rowCount,
+              distinct_hash_count: rowCount,
+              distinct_created_at_count: rowCount,
+            },
+          ],
+        });
+      }
+      if (label === "old-migration-state") {
+        return Promise.resolve({
+          rows: [{ state: { fixed_old_migration_state: 0 } }],
+        });
+      }
+      if (label === "old-migration-compatible") {
+        return Promise.resolve({ rows: [{ compatible: true }] });
+      }
+      if (label === "old-migration-versioned-call") {
+        return Promise.reject({ code: "42883" });
+      }
+      if (label === "before-final-boundary") {
+        state.publicAclFailureArmed = true;
+        return Promise.resolve({ rows: [] });
+      }
+      if (label === "public-acl-failure-state") {
+        return Promise.resolve({
+          rows: [
+            {
+              versioned_function_absent: true,
+              public_execute_retained: true,
+            },
+          ],
+        });
+      }
+      if (label === "public-acl-failure-reset") {
+        state.publicAclFailureArmed = false;
+        return Promise.resolve({ rows: [] });
+      }
+      if (label === "legacy-acl-hash") {
+        return Promise.resolve({ rows: [{ acl_hash: "fixed_acl_hash" }] });
+      }
+      if (
+        label === "unknown-fixed-query" &&
+        state.inDrizzleTransaction &&
+        state.migrationRunCount === 2 &&
+        state.publicAclFailureArmed &&
+        state.migrationLedger.length === 6
+      ) {
+        return Promise.reject({ code: "P0001" });
       }
       return Promise.resolve({ rows: [] });
     },
@@ -2265,6 +2497,59 @@ describe("connection-only external fixture boundary", () => {
     ).toBeLessThanOrEqual(HARNESS_DEADLINE_LIMITS_FOR_TESTS.totalMilliseconds);
   });
 
+  it.each([
+    [
+      "wrong privilege",
+      "ALTER DEFAULT PRIVILEGES REVOKE USAGE ON FUNCTIONS FROM PUBLIC",
+      [],
+    ],
+    [
+      "wrong object category",
+      "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON TABLES FROM PUBLIC",
+      [],
+    ],
+    [
+      "wrong grantee",
+      'ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM "actustube_ci_other_role"',
+      [],
+    ],
+    [
+      "unexpected parameter",
+      exactProductionDefaultPrivilegeContract.statement,
+      ["unexpected"],
+    ],
+    [
+      "trailing executable SQL",
+      `${exactProductionDefaultPrivilegeContract.statement}; SELECT 1`,
+      [],
+    ],
+    ["prefix only", "ALTER DEFAULT PRIVILEGES", []],
+  ] as const)(
+    "rejects a non-exact ALTER DEFAULT PRIVILEGES oracle for %s",
+    async (_label, statement, parameters) => {
+      const fake = createMigrationOwnerFakeClient();
+      await fake.client.query(statement, [...parameters]);
+      expect(fake.state.labels).toEqual(["unknown-fixed-query"]);
+      expect(fake.state.defaultPrivilegeAttemptCount).toBe(1);
+      expect(fake.state.defaultPrivilegeMutationCount).toBe(0);
+    }
+  );
+
+  it("rejects ALTER DEFAULT PRIVILEGES QueryConfig values outside the exact empty parameter contract", async () => {
+    const fake = createMigrationOwnerFakeClient();
+    await fake.client.query({
+      text: exactProductionDefaultPrivilegeContract.statement,
+      values: ["unexpected"],
+    });
+    expect(fake.state.labels).toEqual(["unknown-fixed-query"]);
+    expect(fake.state.parameters).toEqual([["unexpected"]]);
+    expect(fake.state.defaultPrivilegeAttemptCount).toBe(1);
+    expect(fake.state.defaultPrivilegeMutationCount).toBe(0);
+  });
+
+  describe(
+    "production pre-mutation wrapper ALTER DEFAULT PRIVILEGES production mutation order",
+    () => {
   it("exercises the distinct owner boundary in the fixed production order", async () => {
     const fake = createMigrationOwnerFakeClient();
     const result = await runMigrationOwnerBoundaryProbeForTests({
@@ -2284,16 +2569,36 @@ describe("connection-only external fixture boundary", () => {
       failureMarker: null,
       timedOut: false,
       activeClientCount: 0,
+      productionApplyInvocations: 1,
+      migrationCallbackInvocations: 3,
+      laterVerificationStubInvocations: 1,
       observedIdentityFrozen: true,
       observedIdentityReferencePreserved: true,
       boundaryReobservationDistinct: true,
     });
-    expect(labels).toEqual([
+    expect(labels.slice(0, 6)).toEqual([
       "observed-session-identity",
+      "production-alter-default-privileges",
       "create-fixed-roles",
       "observed-session-identity",
       "initial-role-contract",
       "minimal-grants",
+    ]);
+    expect(
+      labels.filter((label) => label === "observed-session-identity")
+    ).toHaveLength(2);
+    expect(
+      labels.filter(
+        (label) => label === "production-alter-default-privileges"
+      )
+    ).toHaveLength(1);
+    expect(
+      labels.filter((label) => label === "create-fixed-roles")
+    ).toHaveLength(1);
+    expect(
+      labels.filter((label) => label === "minimal-grants")
+    ).toHaveLength(1);
+    const semanticMilestones = [
       "set-migration-executor",
       "migration-executor-identity",
       "migration-callback-baseline",
@@ -2301,6 +2606,11 @@ describe("connection-only external fixture boundary", () => {
       "legacy-owner-baseline",
       "legacy-owner-membership",
       "before-final-boundary",
+      "set-migration-executor",
+      "role-precondition",
+      "public-acl-failure-migration",
+      "reset-role",
+      "legacy-acl-hash",
       "set-migration-executor",
       "role-precondition",
       "migration-callback-final",
@@ -2311,19 +2621,44 @@ describe("connection-only external fixture boundary", () => {
       "migration-callback-replay",
       "reset-role",
       "owner-postcondition",
-    ]);
+    ];
+    let previousMilestoneIndex = 5;
+    for (const milestone of semanticMilestones) {
+      const milestoneIndex = labels.indexOf(
+        milestone,
+        previousMilestoneIndex + 1
+      );
+      expect(milestoneIndex).toBeGreaterThan(previousMilestoneIndex);
+      previousMilestoneIndex = milestoneIndex;
+    }
     expect(result.operationStarts).toMatchObject({
       connect: 1,
-      query: 22,
       close: 1,
-      migration: 3,
+      migration: 4,
     });
+    expect(result.operationStarts.query).toBe(fake.state.query.length);
+    expect(result.operationStarts.query).toBeGreaterThan(23);
     expect(fake.state).toMatchObject({
       connect: 1,
       end: 1,
       destroy: 0,
       usable: false,
+      identityQueryCount: 2,
+      defaultPrivilegeAttemptCount: 1,
+      defaultPrivilegeMutationCount: 1,
+      migrationRunCount: 4,
     });
+    expect(fake.state.migrationLedger).toHaveLength(7);
+    expect(
+      normalizeExactRevokeSql(fake.state.query[1])
+    ).toBe(
+      normalizeExactRevokeSql(
+        exactProductionDefaultPrivilegeContract.statement
+      )
+    );
+    expect(fake.state.parameters[1]).toEqual(
+      exactProductionDefaultPrivilegeContract.parameters
+    );
     expect(fake.state.callbackObservations).toHaveLength(3);
     expect(fake.state.callbackObservations.map((entry) => entry.kind)).toEqual([
       "baseline",
@@ -2351,7 +2686,7 @@ describe("connection-only external fixture boundary", () => {
     const preconditionParameterIndexes = labels
       .map((label, index) => (label === "role-precondition" ? index : -1))
       .filter((index) => index >= 0);
-    expect(preconditionParameterIndexes).toHaveLength(2);
+    expect(preconditionParameterIndexes).toHaveLength(3);
     for (const index of preconditionParameterIndexes) {
       expect(fake.state.parameters[index]).toEqual([
         testUsageOwnerIdentities[0],
@@ -2379,7 +2714,44 @@ describe("connection-only external fixture boundary", () => {
       source.match(/async function orchestrateUsageMigrationOwnerBoundary/g)
     ).toHaveLength(1);
     expect(source).not.toContain("() => Promise.resolve()");
+    const probeBody = source.slice(
+      source.indexOf(
+        "export async function runMigrationOwnerBoundaryProbeForTests"
+      ),
+      source.indexOf(
+        "export async function runOwnershipCanonicalizationProbeForTests"
+      )
+    );
+    expect(probeBody).toContain("applyMigrationsAndRuntimeAcl(");
+    expect(probeBody).not.toContain(
+      "runPreMutationSessionIdentityBoundary("
+    );
+    expect(probeBody).not.toContain(
+      "orchestrateUsageMigrationOwnerBoundary("
+    );
+    const applyBody = source.slice(
+      source.indexOf("async function applyMigrationsAndRuntimeAcl"),
+      source.indexOf("function usageSignatureArraySql")
+    );
+    const identityBoundaryIndex = applyBody.indexOf(
+      "runPreMutationSessionIdentityBoundary("
+    );
+    const defaultPrivilegeIndex = applyBody.indexOf(
+      exactProductionDefaultPrivilegeContract.statement
+    );
+    const ownerBoundaryIndex = applyBody.indexOf(
+      "orchestrateUsageMigrationOwnerBoundary("
+    );
+    expect(identityBoundaryIndex).toBeGreaterThanOrEqual(0);
+    expect(defaultPrivilegeIndex).toBeGreaterThan(identityBoundaryIndex);
+    expect(ownerBoundaryIndex).toBeGreaterThan(defaultPrivilegeIndex);
+    expect(applyBody).toContain("applyMigrationCountWithinBoundary(");
+    expect(applyBody).toContain("verifyPublicAclMigrationFailure(");
+    expect(applyBody).not.toContain("fixed_migration_callback_probe");
+    expect(applyBody).not.toContain("fixed_before_final_boundary");
   });
+    }
+  );
 
   it("rejects a same-value replacement of the original pre-mutation identity reference", async () => {
     const fake = createMigrationOwnerFakeClient();
@@ -2399,6 +2771,9 @@ describe("connection-only external fixture boundary", () => {
     expect(result).toMatchObject({
       failureMarker:
         "EXTERNAL_FIXTURE_OBSERVED_SESSION_IDENTITY_REFERENCE_MISMATCH",
+      productionApplyInvocations: 1,
+      migrationCallbackInvocations: 0,
+      laterVerificationStubInvocations: 0,
       observedIdentityReferencePreserved: false,
       boundaryReobservationDistinct: false,
       timedOut: false,
@@ -2407,6 +2782,8 @@ describe("connection-only external fixture boundary", () => {
     expect(fake.state.labels).not.toContain("create-fixed-roles");
     expect(fake.state.labels).not.toContain("minimal-grants");
     expect(fake.state.callbackObservations).toEqual([]);
+    expect(fake.state.defaultPrivilegeAttemptCount).toBe(0);
+    expect(fake.state.defaultPrivilegeMutationCount).toBe(0);
     expect(result.operationStarts.migration).toBe(0);
     expect(JSON.stringify(result)).not.toContain(testFixtureSessionRole);
   });
@@ -2435,15 +2812,23 @@ describe("connection-only external fixture boundary", () => {
     );
     expect(fake.state.labels).toEqual([
       "observed-session-identity",
+      "production-alter-default-privileges",
       "create-fixed-roles",
       "observed-session-identity",
     ]);
     expect(result.observedIdentityReferencePreserved).toBe(true);
+    expect(result).toMatchObject({
+      productionApplyInvocations: 1,
+      migrationCallbackInvocations: 0,
+      laterVerificationStubInvocations: 0,
+    });
+    expect(fake.state.defaultPrivilegeMutationCount).toBe(1);
     expect(fake.state.labels).not.toContain("minimal-grants");
     expect(fake.state.callbackObservations).toEqual([]);
     expect(result.operationStarts.migration).toBe(0);
   });
 
+  describe("production wrapper identity failure", () => {
   it.each([
     [
       "caller role differs from observed session role",
@@ -2531,10 +2916,17 @@ describe("connection-only external fixture boundary", () => {
       expect(result.failureMarker).toBe(
         "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
       );
+      expect(result).toMatchObject({
+        productionApplyInvocations: 1,
+        migrationCallbackInvocations: 0,
+        laterVerificationStubInvocations: 0,
+      });
       expect(fake.state.labels).toEqual(["observed-session-identity"]);
       expect(fake.state.labels).not.toContain("create-fixed-roles");
       expect(fake.state.labels).not.toContain("minimal-grants");
       expect(fake.state.callbackObservations).toEqual([]);
+      expect(fake.state.defaultPrivilegeAttemptCount).toBe(0);
+      expect(fake.state.defaultPrivilegeMutationCount).toBe(0);
       expect(result.operationStarts.migration).toBe(0);
       expect(result.observedIdentityFrozen).toBe(false);
       expect(fake.state.destroy).toBe(0);
@@ -2562,23 +2954,37 @@ describe("connection-only external fixture boundary", () => {
       },
     });
     expect(result.failureMarker).toBe("EXTERNAL_FIXTURE_VERIFICATION_FAILED");
+    expect(result).toMatchObject({
+      productionApplyInvocations: 1,
+      migrationCallbackInvocations: 0,
+      laterVerificationStubInvocations: 0,
+    });
     expect(fake.state.labels).toEqual(["observed-session-identity"]);
     expect(fake.state.labels).not.toContain("create-fixed-roles");
     expect(fake.state.labels).not.toContain("minimal-grants");
     expect(fake.state.callbackObservations).toEqual([]);
+    expect(fake.state.defaultPrivilegeAttemptCount).toBe(0);
+    expect(fake.state.defaultPrivilegeMutationCount).toBe(0);
     expect(result.operationStarts.migration).toBe(0);
     expect(fake.state.end).toBe(1);
     expect(fake.state.destroy).toBe(0);
   });
+  });
 
+  describe("production wrapper timeout", () => {
   it("bounds the initial DB-observed identity query timeout before grants", async () => {
     vi.useFakeTimers();
     try {
       const fake = createMigrationOwnerFakeClient({
         hangOnLabel: "observed-session-identity",
       });
+      const unrelated = createMigrationOwnerFakeClient();
+      const unhandledRejectionListeners = process.listenerCount(
+        "unhandledRejection"
+      );
       const pending = runMigrationOwnerBoundaryProbeForTests({
         client: fake.client,
+        unrelatedClient: unrelated.client,
         expectedSessionRole: testCallerConfigurationRole,
         deadlineLimits: {
           totalMilliseconds: 100,
@@ -2595,20 +3001,39 @@ describe("connection-only external fixture boundary", () => {
         failureMarker: "EXTERNAL_FIXTURE_OPERATION_TIMEOUT",
         timedOut: true,
         destroyed: true,
+        productionApplyInvocations: 1,
+        migrationCallbackInvocations: 0,
+        laterVerificationStubInvocations: 0,
+        unrelatedActiveClientCount: 0,
+        unrelatedUsable: false,
+        unrelatedDestroyed: false,
         observedIdentityFrozen: false,
       });
       expect(fake.state.labels).toEqual(["observed-session-identity"]);
       expect(fake.state.labels).not.toContain("create-fixed-roles");
       expect(fake.state.labels).not.toContain("minimal-grants");
       expect(fake.state.callbackObservations).toEqual([]);
+      expect(fake.state.defaultPrivilegeAttemptCount).toBe(0);
+      expect(fake.state.defaultPrivilegeMutationCount).toBe(0);
       expect(result.operationStarts.migration).toBe(0);
       expect(fake.state.destroy).toBe(1);
       expect(fake.state.end).toBe(0);
       expect(fake.state.queriesAtDestroy).toBe(fake.state.query.length);
+      expect(unrelated.state).toMatchObject({
+        connect: 1,
+        query: [],
+        end: 1,
+        destroy: 0,
+        usable: false,
+      });
       expect(vi.getTimerCount()).toBe(0);
+      expect(process.listenerCount("unhandledRejection")).toBe(
+        unhandledRejectionListeners
+      );
     } finally {
       vi.useRealTimers();
     }
+  });
   });
 
   it.each([
@@ -2669,11 +3094,18 @@ describe("connection-only external fixture boundary", () => {
     );
     expect(fake.state.labels).toEqual([
       "observed-session-identity",
+      "production-alter-default-privileges",
       "create-fixed-roles",
       "observed-session-identity",
       "initial-role-contract",
     ]);
     expect(fake.state.callbackObservations).toEqual([]);
+    expect(fake.state.defaultPrivilegeMutationCount).toBe(1);
+    expect(result).toMatchObject({
+      productionApplyInvocations: 1,
+      migrationCallbackInvocations: 0,
+      laterVerificationStubInvocations: 0,
+    });
     expect(result.operationStarts.migration).toBe(0);
     expect(fake.state.destroy).toBe(0);
     expect(fake.state.end).toBe(1);
