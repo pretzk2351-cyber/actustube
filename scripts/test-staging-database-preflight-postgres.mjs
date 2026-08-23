@@ -1140,17 +1140,161 @@ const INTERNAL_PRODUCTION_WRAPPER_PROBE_SPECIFICATION = Object.freeze({
     )
   ),
 });
+const EXTERNAL_FIXTURE_PHASES = Object.freeze({
+  fixtureClientConnect: "FIXTURE_CLIENT_CONNECT",
+  fixtureIdentity: "FIXTURE_IDENTITY",
+  fixtureLedgerSetup: "FIXTURE_LEDGER_SETUP",
+  extensionInventory: "EXTENSION_INVENTORY",
+  fixtureClientClose: "FIXTURE_CLIENT_CLOSE",
+  preflightStability: "PREFLIGHT_STABILITY",
+  snapshotDriftControl: "SNAPSHOT_DRIFT_CONTROL",
+  extensionClassification: "EXTENSION_CLASSIFICATION",
+  preMutationClientConnect: "PRE_MUTATION_CLIENT_CONNECT",
+  preMutationIdentity: "PRE_MUTATION_IDENTITY",
+  defaultPrivilegeRevoke: "DEFAULT_PRIVILEGE_REVOKE",
+  fixtureRoleSetup: "FIXTURE_ROLE_SETUP",
+  migrationBoundaryIdentity: "MIGRATION_BOUNDARY_IDENTITY",
+  migrationBaseline: "MIGRATION_BASELINE",
+  migrationPublicAclNegativeControl: "MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL",
+  migrationFinal: "MIGRATION_FINAL",
+  migrationReplay: "MIGRATION_REPLAY",
+  migrationPostconditions: "MIGRATION_POSTCONDITIONS",
+  migrationClientClose: "MIGRATION_CLIENT_CLOSE",
+  transactionRollbackControl: "TRANSACTION_ROLLBACK_CONTROL",
+  cleanupClientConnect: "CLEANUP_CLIENT_CONNECT",
+  cleanupIdentity: "CLEANUP_IDENTITY",
+  ownershipPreInventory: "OWNERSHIP_PRE_INVENTORY",
+  ownershipCanonicalization: "OWNERSHIP_CANONICALIZATION",
+  ownershipPostSnapshot: "OWNERSHIP_POST_SNAPSHOT",
+  authorityPreInventory: "AUTHORITY_PRE_INVENTORY",
+  boundedRevoke: "BOUNDED_REVOKE",
+  authorityZeroResidue: "AUTHORITY_ZERO_RESIDUE",
+  maintenanceOwnerSnapshot: "MAINTENANCE_OWNER_SNAPSHOT",
+  canonicalClientClose: "CANONICAL_CLIENT_CLOSE",
+  postflight: "POSTFLIGHT",
+  postflightDrift: "POSTFLIGHT_DRIFT",
+  unknown: "UNKNOWN",
+});
+const EXTERNAL_FIXTURE_PHASE_MARKERS = Object.freeze({
+  FIXTURE_CLIENT_CONNECT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_CLIENT_CONNECT",
+  FIXTURE_IDENTITY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_IDENTITY",
+  FIXTURE_LEDGER_SETUP:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_LEDGER_SETUP",
+  EXTENSION_INVENTORY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_EXTENSION_INVENTORY",
+  FIXTURE_CLIENT_CLOSE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_CLIENT_CLOSE",
+  PREFLIGHT_STABILITY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_PREFLIGHT_STABILITY",
+  SNAPSHOT_DRIFT_CONTROL:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_SNAPSHOT_DRIFT_CONTROL",
+  EXTENSION_CLASSIFICATION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_EXTENSION_CLASSIFICATION",
+  PRE_MUTATION_CLIENT_CONNECT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_PRE_MUTATION_CLIENT_CONNECT",
+  PRE_MUTATION_IDENTITY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_PRE_MUTATION_IDENTITY",
+  DEFAULT_PRIVILEGE_REVOKE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_DEFAULT_PRIVILEGE_REVOKE",
+  FIXTURE_ROLE_SETUP:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_ROLE_SETUP",
+  MIGRATION_BOUNDARY_IDENTITY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_BOUNDARY_IDENTITY",
+  MIGRATION_BASELINE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_BASELINE",
+  MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL",
+  MIGRATION_FINAL:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
+  MIGRATION_REPLAY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY",
+  MIGRATION_POSTCONDITIONS:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS",
+  MIGRATION_CLIENT_CLOSE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_CLIENT_CLOSE",
+  TRANSACTION_ROLLBACK_CONTROL:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_TRANSACTION_ROLLBACK_CONTROL",
+  CLEANUP_CLIENT_CONNECT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_CLEANUP_CLIENT_CONNECT",
+  CLEANUP_IDENTITY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_CLEANUP_IDENTITY",
+  OWNERSHIP_PRE_INVENTORY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_OWNERSHIP_PRE_INVENTORY",
+  OWNERSHIP_CANONICALIZATION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_OWNERSHIP_CANONICALIZATION",
+  OWNERSHIP_POST_SNAPSHOT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_OWNERSHIP_POST_SNAPSHOT",
+  AUTHORITY_PRE_INVENTORY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_AUTHORITY_PRE_INVENTORY",
+  BOUNDED_REVOKE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_BOUNDED_REVOKE",
+  AUTHORITY_ZERO_RESIDUE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_AUTHORITY_ZERO_RESIDUE",
+  MAINTENANCE_OWNER_SNAPSHOT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MAINTENANCE_OWNER_SNAPSHOT",
+  CANONICAL_CLIENT_CLOSE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_CANONICAL_CLIENT_CLOSE",
+  POSTFLIGHT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_POSTFLIGHT",
+  POSTFLIGHT_DRIFT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_POSTFLIGHT_DRIFT",
+  UNKNOWN: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
+});
+const EXTERNAL_FIXTURE_PHASE_FAILURES = new WeakMap();
+const EXTERNAL_FIXTURE_NOT_CONFIGURED_FAILURES = new WeakSet();
+const EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS = new WeakSet();
+const INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES = new WeakMap();
+const INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_OPTIONS = new WeakMap();
+const INITIAL_FIXTURE_CLIENT_LIFECYCLE = Symbol("initial-fixture-client-lifecycle");
+const MIGRATION_CLIENT_LIFECYCLE = Symbol("migration-client-lifecycle");
+const CANONICAL_CLEANUP_CLIENT_LIFECYCLE = Symbol(
+  "canonical-cleanup-client-lifecycle"
+);
+const INTERNAL_PHASE_PROBE_FAILURE = Object.freeze(Object.create(null));
 
 class HarnessIssue extends Error {
   constructor(code) {
     super(code);
     this.name = "HarnessIssue";
     this.code = code;
+    if (code === "EXTERNAL_FIXTURE_NOT_CONFIGURED") {
+      EXTERNAL_FIXTURE_NOT_CONFIGURED_FAILURES.add(this);
+    }
   }
 }
 
 function requireHarness(condition, code) {
   if (!condition) throw new HarnessIssue(code);
+}
+
+function fixedExternalFixturePhase(phase) {
+  return Object.prototype.hasOwnProperty.call(
+    EXTERNAL_FIXTURE_PHASE_MARKERS,
+    phase
+  )
+    ? phase
+    : EXTERNAL_FIXTURE_PHASES.unknown;
+}
+
+function createExternalFixturePhaseFailure(context, phase) {
+  const failure = Object.freeze(Object.create(null));
+  EXTERNAL_FIXTURE_PHASE_FAILURES.set(
+    failure,
+    Object.freeze({ context, phase: fixedExternalFixturePhase(phase) })
+  );
+  return failure;
+}
+
+function externalFixtureFailureMarker(error) {
+  if (EXTERNAL_FIXTURE_NOT_CONFIGURED_FAILURES.has(error)) {
+    return "EXTERNAL_FIXTURE_NOT_CONFIGURED";
+  }
+  const brand = EXTERNAL_FIXTURE_PHASE_FAILURES.get(error);
+  return EXTERNAL_FIXTURE_PHASE_MARKERS[
+    brand?.phase ?? EXTERNAL_FIXTURE_PHASES.unknown
+  ];
 }
 
 function requiredEnvironmentValue(environment, key) {
@@ -1453,6 +1597,337 @@ async function runBoundedPhase(context, category, maximumMilliseconds, operation
   );
 }
 
+async function runExternalFixturePhase(context, phase, operation) {
+  const fixedPhase = fixedExternalFixturePhase(phase);
+  const probeState = INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.get(context);
+  const observable =
+    EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.has(context) || probeState !== undefined;
+  if (!observable) return await operation();
+
+  let injectFixedProbeFailure = false;
+  if (probeState) {
+    probeState.phaseTrace.push(fixedPhase);
+    if (
+      probeState.targetPhase === fixedPhase &&
+      probeState.targetHitCount === 0
+    ) {
+      probeState.targetHitCount += 1;
+      injectFixedProbeFailure = !(
+        probeState.productionGraph === true &&
+        [
+          EXTERNAL_FIXTURE_PHASES.fixtureClientConnect,
+          EXTERNAL_FIXTURE_PHASES.fixtureClientClose,
+          EXTERNAL_FIXTURE_PHASES.preMutationClientConnect,
+          EXTERNAL_FIXTURE_PHASES.migrationClientClose,
+          EXTERNAL_FIXTURE_PHASES.cleanupClientConnect,
+          EXTERNAL_FIXTURE_PHASES.canonicalClientClose,
+        ].includes(fixedPhase)
+      );
+    }
+    if (
+      fixedPhase === EXTERNAL_FIXTURE_PHASES.postflight ||
+      fixedPhase === EXTERNAL_FIXTURE_PHASES.postflightDrift
+    ) {
+      probeState.postflightStartCount += 1;
+    }
+  }
+
+  try {
+    if (injectFixedProbeFailure) throw INTERNAL_PHASE_PROBE_FAILURE;
+    if (
+      probeState?.productionGraph === true &&
+      ![
+        EXTERNAL_FIXTURE_PHASES.fixtureClientConnect,
+        EXTERNAL_FIXTURE_PHASES.fixtureClientClose,
+        EXTERNAL_FIXTURE_PHASES.preMutationClientConnect,
+        EXTERNAL_FIXTURE_PHASES.migrationClientClose,
+        EXTERNAL_FIXTURE_PHASES.cleanupClientConnect,
+        EXTERNAL_FIXTURE_PHASES.canonicalClientClose,
+      ].includes(fixedPhase)
+    ) {
+      probeState.skippedOperationCount += 1;
+      if (fixedPhase === EXTERNAL_FIXTURE_PHASES.extensionInventory) {
+        return fixedExpectedExtensionInventory();
+      }
+      if (
+        fixedPhase === EXTERNAL_FIXTURE_PHASES.preMutationIdentity ||
+        fixedPhase === EXTERNAL_FIXTURE_PHASES.migrationBoundaryIdentity
+      ) {
+        return Object.freeze({ sessionRole: "actustube_ci_fixture" });
+      }
+      if (
+        fixedPhase ===
+        EXTERNAL_FIXTURE_PHASES.migrationPublicAclNegativeControl
+      ) {
+        return "fixed_phase_probe_acl_hash";
+      }
+      return undefined;
+    }
+    if (probeState) probeState.operationStartCount += 1;
+    return await operation();
+  } catch (error) {
+    const existingBrand = EXTERNAL_FIXTURE_PHASE_FAILURES.get(error);
+    if (existingBrand?.context === context) throw error;
+    throw createExternalFixturePhaseFailure(context, fixedPhase);
+  }
+}
+
+function runFixtureClientConnectPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.fixtureClientConnect,
+    operation
+  );
+}
+
+function runFixtureIdentityPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.fixtureIdentity,
+    operation
+  );
+}
+
+function runFixtureLedgerSetupPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.fixtureLedgerSetup,
+    operation
+  );
+}
+
+function runExtensionInventoryPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.extensionInventory,
+    operation
+  );
+}
+
+function runFixtureClientClosePhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.fixtureClientClose,
+    operation
+  );
+}
+
+function runPreflightStabilityPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.preflightStability,
+    operation
+  );
+}
+
+function runSnapshotDriftControlPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.snapshotDriftControl,
+    operation
+  );
+}
+
+function runExtensionClassificationPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.extensionClassification,
+    operation
+  );
+}
+
+function runPreMutationClientConnectPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.preMutationClientConnect,
+    operation
+  );
+}
+
+function runPreMutationIdentityPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.preMutationIdentity,
+    operation
+  );
+}
+
+function runDefaultPrivilegeRevokePhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.defaultPrivilegeRevoke,
+    operation
+  );
+}
+
+function runFixtureRoleSetupPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.fixtureRoleSetup,
+    operation
+  );
+}
+
+function runMigrationBoundaryIdentityPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationBoundaryIdentity,
+    operation
+  );
+}
+
+function runMigrationBaselinePhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationBaseline,
+    operation
+  );
+}
+
+function runMigrationPublicAclNegativeControlPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationPublicAclNegativeControl,
+    operation
+  );
+}
+
+function runMigrationFinalPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationFinal,
+    operation
+  );
+}
+
+function runMigrationReplayPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReplay,
+    operation
+  );
+}
+
+function runMigrationPostconditionsPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationPostconditions,
+    operation
+  );
+}
+
+function runMigrationClientClosePhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationClientClose,
+    operation
+  );
+}
+
+function runTransactionRollbackControlPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.transactionRollbackControl,
+    operation
+  );
+}
+
+function runCleanupClientConnectPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.cleanupClientConnect,
+    operation
+  );
+}
+
+function runCleanupIdentityPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.cleanupIdentity,
+    operation
+  );
+}
+
+function runOwnershipPreInventoryPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.ownershipPreInventory,
+    operation
+  );
+}
+
+function runOwnershipCanonicalizationPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.ownershipCanonicalization,
+    operation
+  );
+}
+
+function runOwnershipPostSnapshotPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.ownershipPostSnapshot,
+    operation
+  );
+}
+
+function runAuthorityPreInventoryPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.authorityPreInventory,
+    operation
+  );
+}
+
+function runBoundedRevokePhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.boundedRevoke,
+    operation
+  );
+}
+
+function runAuthorityZeroResiduePhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.authorityZeroResidue,
+    operation
+  );
+}
+
+function runMaintenanceOwnerSnapshotPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.maintenanceOwnerSnapshot,
+    operation
+  );
+}
+
+function runCanonicalClientClosePhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.canonicalClientClose,
+    operation
+  );
+}
+
+function runPostflightPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.postflight,
+    operation
+  );
+}
+
+function runPostflightDriftPhase(context, operation) {
+  return runExternalFixturePhase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.postflightDrift,
+    operation
+  );
+}
+
 function createPgClientFactory(deadlineLimits = HARNESS_DEADLINE_LIMITS) {
   return ({ host, port, database, role, password }) =>
     new Client({
@@ -1500,13 +1975,58 @@ async function openClient(context, clientFactory, credentials) {
   }
 }
 
-async function withClient(context, clientFactory, credentials, operation) {
-  const ownedClient = await openClient(context, clientFactory, credentials);
+async function withClient(
+  context,
+  clientFactory,
+  credentials,
+  operation,
+  lifecycle = null
+) {
+  const openOperation = () => openClient(context, clientFactory, credentials);
+  const ownedClient =
+    lifecycle === INITIAL_FIXTURE_CLIENT_LIFECYCLE
+      ? await runFixtureClientConnectPhase(context, openOperation)
+      : lifecycle === MIGRATION_CLIENT_LIFECYCLE
+        ? await runPreMutationClientConnectPhase(context, openOperation)
+      : lifecycle === CANONICAL_CLEANUP_CLIENT_LIFECYCLE
+        ? await runCleanupClientConnectPhase(context, openOperation)
+        : await openOperation();
+  let operationResult;
+  let primaryFailure;
+  let primaryFailed = false;
   try {
-    return await operation(ownedClient.proxy, ownedClient);
-  } finally {
-    await closeOwnedClient(context, ownedClient);
+    operationResult = await operation(ownedClient.proxy, ownedClient);
+  } catch (error) {
+    primaryFailed = true;
+    primaryFailure = error;
   }
+
+  let closeFailure;
+  let closeFailed = false;
+  try {
+    if (lifecycle === INITIAL_FIXTURE_CLIENT_LIFECYCLE) {
+      await runFixtureClientClosePhase(context, () =>
+        closeOwnedClient(context, ownedClient)
+      );
+    } else if (lifecycle === MIGRATION_CLIENT_LIFECYCLE) {
+      await runMigrationClientClosePhase(context, () =>
+        closeOwnedClient(context, ownedClient)
+      );
+    } else if (lifecycle === CANONICAL_CLEANUP_CLIENT_LIFECYCLE) {
+      await runCanonicalClientClosePhase(context, () =>
+        closeOwnedClient(context, ownedClient)
+      );
+    } else {
+      await closeOwnedClient(context, ownedClient);
+    }
+  } catch (error) {
+    closeFailed = true;
+    closeFailure = error;
+  }
+
+  if (primaryFailed) throw primaryFailure;
+  if (closeFailed) throw closeFailure;
+  return operationResult;
 }
 
 function fixtureCredentials(configuration, overrides = {}) {
@@ -2033,10 +2553,14 @@ async function runPreMutationSessionIdentityBoundary({
     clientFactory,
     credentials,
     async (client) => {
-      const observedSessionIdentity = await observeSessionIdentity(
-        client,
-        expectedSessionRole,
-        "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
+      const observedSessionIdentity = await runPreMutationIdentityPhase(
+        context,
+        () =>
+          observeSessionIdentity(
+            client,
+            expectedSessionRole,
+            "EXTERNAL_FIXTURE_INITIAL_SESSION_IDENTITY_MISMATCH"
+          )
       );
       const identityAuthority =
         createObservedSessionIdentityAuthority(observedSessionIdentity);
@@ -2050,7 +2574,8 @@ async function runPreMutationSessionIdentityBoundary({
         observedSessionIdentity
       );
       return Object.freeze({ identityAuthority, operationResult });
-    }
+    },
+    MIGRATION_CLIENT_LIFECYCLE
   );
 }
 
@@ -3010,28 +3535,45 @@ async function runCanonicalOwnershipBoundary({
     clientFactory,
     fixtureCredentials(configuration),
     async (client) => {
-      await observeSessionIdentity(
-        client,
-        observedSessionRole,
-        "EXTERNAL_FIXTURE_CLEANUP_SESSION_IDENTITY_MISMATCH"
+      await runCleanupIdentityPhase(context, () =>
+        observeSessionIdentity(
+          client,
+          observedSessionRole,
+          "EXTERNAL_FIXTURE_CLEANUP_SESSION_IDENTITY_MISMATCH"
+        )
       );
-      await assertPreCanonicalOwnershipInventory(client, contract);
-      await canonicalizeFixtureOwnership(client, contract);
-      await assertPostCanonicalOwnershipSnapshot(client, contract);
-      await assertPreCleanupTemporaryAuthorityInventory(
-        client,
-        temporaryAuthorityContract
+      await runOwnershipPreInventoryPhase(context, () =>
+        assertPreCanonicalOwnershipInventory(client, contract)
       );
-      await revokeTemporaryMigrationAuthorities(client);
-      await assertZeroTemporaryAuthorityResidue(client);
-      await assertPostCanonicalOwnershipSnapshot(client, contract);
-    }
+      await runOwnershipCanonicalizationPhase(context, () =>
+        canonicalizeFixtureOwnership(client, contract)
+      );
+      await runOwnershipPostSnapshotPhase(context, () =>
+        assertPostCanonicalOwnershipSnapshot(client, contract)
+      );
+      await runAuthorityPreInventoryPhase(context, () =>
+        assertPreCleanupTemporaryAuthorityInventory(
+          client,
+          temporaryAuthorityContract
+        )
+      );
+      await runBoundedRevokePhase(context, () =>
+        revokeTemporaryMigrationAuthorities(client)
+      );
+      await runAuthorityZeroResiduePhase(context, () =>
+        assertZeroTemporaryAuthorityResidue(client)
+      );
+      await runMaintenanceOwnerSnapshotPhase(context, () =>
+        assertPostCanonicalOwnershipSnapshot(client, contract)
+      );
+    },
+    CANONICAL_CLEANUP_CLIENT_LIFECYCLE
   );
   requireHarness(
     typeof postflightOperation === "function",
     "EXTERNAL_FIXTURE_POSTFLIGHT_BOUNDARY_INVALID"
   );
-  return await postflightOperation();
+  return await runPostflightPhase(context, postflightOperation);
 }
 
 async function configureRuntimeAcl(client, configuration) {
@@ -3137,12 +3679,16 @@ async function orchestrateUsageMigrationOwnerBoundary({
     identityAuthority,
     observedSessionIdentity
   );
-  await createUsageFixtureRoles(client);
-  const boundaryObservedIdentity = await assertInitialMigrationBoundaryRoles(
-    client,
-    expectedSessionRole,
-    identityAuthority,
-    observedSessionIdentity
+  await runFixtureRoleSetupPhase(context, () => createUsageFixtureRoles(client));
+  const boundaryObservedIdentity = await runMigrationBoundaryIdentityPhase(
+    context,
+    () =>
+      assertInitialMigrationBoundaryRoles(
+        client,
+        expectedSessionRole,
+        identityAuthority,
+        observedSessionIdentity
+      )
   );
   identityReferenceObserver?.({
     preMutationObservedIdentity:
@@ -3150,29 +3696,44 @@ async function orchestrateUsageMigrationOwnerBoundary({
     downstreamObservedIdentity: observedSessionIdentity,
     boundaryObservedIdentity,
   });
-  await grantUsageMigrationPrivileges(client);
-  await withMigrationExecutorRole(context, client, async () => {
-    await assertMigrationExecutorIdentity(client, expectedSessionRole);
-    await runMigrationCallback(
-      context,
-      client,
-      "baseline",
-      baselineMigration
-    );
+  await runFixtureRoleSetupPhase(context, () =>
+    grantUsageMigrationPrivileges(client)
+  );
+  await runMigrationBaselinePhase(context, async () => {
+    await withMigrationExecutorRole(context, client, async () => {
+      await assertMigrationExecutorIdentity(client, expectedSessionRole);
+      await runMigrationCallback(
+        context,
+        client,
+        "baseline",
+        baselineMigration
+      );
+    });
+    await configureUsageMigrationBaseline(client);
+    await grantLegacyOwnerMembership(client);
   });
-  await configureUsageMigrationBaseline(client);
-  await grantLegacyOwnerMembership(client);
-  const beforeFinalResult = await beforeFinalMigration(client);
-  await withMigrationExecutorRole(context, client, async () => {
-    await assertMigrationRolePrecondition(client, expectedSessionRole);
-    await runMigrationCallback(context, client, "final", finalMigration);
-  });
-  await assertUsageOwnerPostcondition(client, expectedSessionRole);
-  await withMigrationExecutorRole(context, client, async () => {
-    await assertMigrationRolePrecondition(client, expectedSessionRole);
-    await runMigrationCallback(context, client, "replay", replayMigration);
-  });
-  await assertUsageOwnerPostcondition(client, expectedSessionRole);
+  const beforeFinalResult = await runMigrationPublicAclNegativeControlPhase(
+    context,
+    () => beforeFinalMigration(client)
+  );
+  await runMigrationFinalPhase(context, () =>
+    withMigrationExecutorRole(context, client, async () => {
+      await assertMigrationRolePrecondition(client, expectedSessionRole);
+      await runMigrationCallback(context, client, "final", finalMigration);
+    })
+  );
+  await runMigrationPostconditionsPhase(context, () =>
+    assertUsageOwnerPostcondition(client, expectedSessionRole)
+  );
+  await runMigrationReplayPhase(context, () =>
+    withMigrationExecutorRole(context, client, async () => {
+      await assertMigrationRolePrecondition(client, expectedSessionRole);
+      await runMigrationCallback(context, client, "replay", replayMigration);
+    })
+  );
+  await runMigrationPostconditionsPhase(context, () =>
+    assertUsageOwnerPostcondition(client, expectedSessionRole)
+  );
   return Object.freeze({ beforeFinalResult });
 }
 
@@ -3219,8 +3780,10 @@ async function applyMigrationsAndRuntimeAcl(
         identityAuthority,
         downstreamObservedIdentity
       );
-      await client.query(
-        "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
+      await runDefaultPrivilegeRevokePhase(context, () =>
+        client.query(
+          "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
+        )
       );
       const boundaryResult = await orchestrateUsageMigrationOwnerBoundary({
         context,
@@ -3290,21 +3853,23 @@ async function applyMigrationsAndRuntimeAcl(
   if (internalProbeState) {
     internalProbeState.laterVerificationStubInvocations += 1;
   } else {
-    await verifyUsageAclInheritance(
-      context,
-      clientFactory,
-      configuration,
-      legacyAclHash,
-      configuration.role
-    );
-    await verifyPlanResolution(context, clientFactory, configuration);
-    await verifyReservationLifecycle(context, clientFactory, configuration);
-    await withClient(
-      context,
-      clientFactory,
-      fixtureCredentials(configuration),
-      (client) => configureRuntimeAcl(client, configuration)
-    );
+    await runMigrationPostconditionsPhase(context, async () => {
+      await verifyUsageAclInheritance(
+        context,
+        clientFactory,
+        configuration,
+        legacyAclHash,
+        configuration.role
+      );
+      await verifyPlanResolution(context, clientFactory, configuration);
+      await verifyReservationLifecycle(context, clientFactory, configuration);
+      await withClient(
+        context,
+        clientFactory,
+        fixtureCredentials(configuration),
+        (client) => configureRuntimeAcl(client, configuration)
+      );
+    });
   }
   requireOriginalObservedSessionIdentity(
     identityAuthority,
@@ -4330,13 +4895,11 @@ export async function runOwnershipCanonicalizationProbeForTests({
  *   deadlineLimits?: object,
  * }} [options]
  */
-export async function runConnectionOnlyHarness(options = {}) {
+async function runConnectionOnlyHarnessWithinContext(options, context) {
   const {
     environment = process.env,
     clientFactory,
-    deadlineLimits,
   } = options;
-  const context = createDeadlineContext(deadlineLimits);
   const configuration = validateExternalFixtureConfiguration(environment);
   const resolvedClientFactory =
     clientFactory ?? createPgClientFactory(context.limits);
@@ -4355,95 +4918,108 @@ export async function runConnectionOnlyHarness(options = {}) {
     resolvedClientFactory,
     fixtureCredentials(configuration),
     async (client) => {
-      await assertFixtureIdentity(client, configuration);
-      await createEmptyMigrationLedger(client);
-      return await verifyIndependentExtensionInventory(client);
-    }
+      await runFixtureIdentityPhase(context, () =>
+        assertFixtureIdentity(client, configuration)
+      );
+      await runFixtureLedgerSetupPhase(context, () =>
+        createEmptyMigrationLedger(client)
+      );
+      return await runExtensionInventoryPhase(context, () =>
+        verifyIndependentExtensionInventory(client)
+      );
+    },
+    INITIAL_FIXTURE_CLIENT_LIFECYCLE
   );
 
-  const stable = await runStablePreflight(
-    context,
-    configuration,
-    resolvedClientFactory,
-    extensions
-  );
-  requireHarness(
-    stable.report.exitCode === 0 &&
-      stable.report.overallStatus === "pass" &&
-      stable.report.initialState === "empty_migration_table" &&
-      stable.report.beforeAfterComparison === "match" &&
-      stable.report.extensionInventory === "match",
-    "EXTERNAL_FIXTURE_STABLE_PREFLIGHT_FAILED"
-  );
-  for (const key of [
-    "serverVersion",
-    "identity",
-    "roleIdentity",
-    "extensionInventory",
-    "migrationCatalog",
-    "migrationColumns",
-    "migrationColumnExact",
-    "migrationPrimaryKey",
-    "migrationHistory",
-    "migrationExact",
-    "userDefinedObjects",
-  ]) {
-    requireHarness(
-      stable.statements.filter((statement) =>
-        sameSql(statement, PREFLIGHT_SQL_FOR_TESTS[key])
-      ).length === 4,
-      "EXTERNAL_FIXTURE_PREFLIGHT_QUERY_COUNT_MISMATCH"
+  await runPreflightStabilityPhase(context, async () => {
+    const stable = await runStablePreflight(
+      context,
+      configuration,
+      resolvedClientFactory,
+      extensions
     );
-  }
-  requireHarness(
-    stable.statements.filter((statement) =>
-      sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.begin)
-    ).length === 4 &&
-      stable.statements.filter((statement) =>
-        sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.rollback)
-      ).length === 4,
-    "EXTERNAL_FIXTURE_PREFLIGHT_TRANSACTION_MISMATCH"
-  );
-
-  let driftWrites = 0;
-  const drift = await runStablePreflight(
-    context,
-    configuration,
-    resolvedClientFactory,
-    extensions,
-    async () => {
-      await withClient(
-        context,
-        resolvedClientFactory,
-        fixtureCredentials(configuration),
-        async (client) => {
-          await client.query(
-            "CREATE TABLE public.external_fixture_snapshot_drift (id integer)"
-          );
-          driftWrites += 1;
-        }
+    requireHarness(
+      stable.report.exitCode === 0 &&
+        stable.report.overallStatus === "pass" &&
+        stable.report.initialState === "empty_migration_table" &&
+        stable.report.beforeAfterComparison === "match" &&
+        stable.report.extensionInventory === "match",
+      "EXTERNAL_FIXTURE_STABLE_PREFLIGHT_FAILED"
+    );
+    for (const key of [
+      "serverVersion",
+      "identity",
+      "roleIdentity",
+      "extensionInventory",
+      "migrationCatalog",
+      "migrationColumns",
+      "migrationColumnExact",
+      "migrationPrimaryKey",
+      "migrationHistory",
+      "migrationExact",
+      "userDefinedObjects",
+    ]) {
+      requireHarness(
+        stable.statements.filter((statement) =>
+          sameSql(statement, PREFLIGHT_SQL_FOR_TESTS[key])
+        ).length === 4,
+        "EXTERNAL_FIXTURE_PREFLIGHT_QUERY_COUNT_MISMATCH"
       );
     }
-  );
-  requireHarness(
-    driftWrites === 1 &&
-      drift.report.exitCode === 1 &&
-      drift.report.overallStatus === "fail" &&
-      drift.report.beforeAfterComparison === "fail" &&
-      drift.report.failure?.checkId === "READ_ONLY_INVARIANT_MISMATCH",
-    "EXTERNAL_FIXTURE_SNAPSHOT_DRIFT_NOT_REJECTED"
-  );
-  await withClient(
-    context,
-    resolvedClientFactory,
-    fixtureCredentials(configuration),
-    (client) => client.query("DROP TABLE public.external_fixture_snapshot_drift")
-  );
+    requireHarness(
+      stable.statements.filter((statement) =>
+        sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.begin)
+      ).length === 4 &&
+        stable.statements.filter((statement) =>
+          sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.rollback)
+        ).length === 4,
+      "EXTERNAL_FIXTURE_PREFLIGHT_TRANSACTION_MISMATCH"
+    );
+  });
 
-  await verifyExtensionClassificationMatrix(
-    context,
-    resolvedClientFactory,
-    configuration
+  await runSnapshotDriftControlPhase(context, async () => {
+    let driftWrites = 0;
+    const drift = await runStablePreflight(
+      context,
+      configuration,
+      resolvedClientFactory,
+      extensions,
+      async () => {
+        await withClient(
+          context,
+          resolvedClientFactory,
+          fixtureCredentials(configuration),
+          async (client) => {
+            await client.query(
+              "CREATE TABLE public.external_fixture_snapshot_drift (id integer)"
+            );
+            driftWrites += 1;
+          }
+        );
+      }
+    );
+    requireHarness(
+      driftWrites === 1 &&
+        drift.report.exitCode === 1 &&
+        drift.report.overallStatus === "fail" &&
+        drift.report.beforeAfterComparison === "fail" &&
+        drift.report.failure?.checkId === "READ_ONLY_INVARIANT_MISMATCH",
+      "EXTERNAL_FIXTURE_SNAPSHOT_DRIFT_NOT_REJECTED"
+    );
+    await withClient(
+      context,
+      resolvedClientFactory,
+      fixtureCredentials(configuration),
+      (client) => client.query("DROP TABLE public.external_fixture_snapshot_drift")
+    );
+  });
+
+  await runExtensionClassificationPhase(context, () =>
+    verifyExtensionClassificationMatrix(
+      context,
+      resolvedClientFactory,
+      configuration
+    )
   );
   const identityAuthority = await applyMigrationsAndRuntimeAcl(
     context,
@@ -4451,55 +5027,581 @@ export async function runConnectionOnlyHarness(options = {}) {
     configuration,
     specification
   );
-  await verifyTransactionRollback(context, resolvedClientFactory, configuration);
+  await runTransactionRollbackControlPhase(context, () =>
+    verifyTransactionRollback(context, resolvedClientFactory, configuration)
+  );
 
-  const postflight = await runCanonicalOwnershipBoundary({
+  await runCanonicalOwnershipBoundary({
     context,
     clientFactory: resolvedClientFactory,
     configuration,
     identityAuthority,
     observedSessionIdentity: identityAuthority.observedSessionIdentity,
     specification,
-    postflightOperation: () =>
-      runPostflight(context, resolvedClientFactory, configuration),
+    async postflightOperation() {
+      const postflight = await runPostflight(
+        context,
+        resolvedClientFactory,
+        configuration
+      );
+      requireHarness(
+        postflight.report.exitCode === 0 &&
+          postflight.report.sameLogicalDatabase === "pass" &&
+          postflight.report.migrationHistory.status === "pass" &&
+          postflight.report.migrationHistory.actual === EXPECTED_MIGRATION_COUNT &&
+          postflight.report.schema === "pass" &&
+          postflight.report.acl === "pass" &&
+          postflight.report.readOnlySmoke === "pass" &&
+          postflight.report.dataCountsUnchanged === "pass",
+        "EXTERNAL_FIXTURE_POSTFLIGHT_FAILED"
+      );
+      return postflight;
+    },
   });
-  requireHarness(
-    postflight.report.exitCode === 0 &&
-      postflight.report.sameLogicalDatabase === "pass" &&
-      postflight.report.migrationHistory.status === "pass" &&
-      postflight.report.migrationHistory.actual === EXPECTED_MIGRATION_COUNT &&
-      postflight.report.schema === "pass" &&
-      postflight.report.acl === "pass" &&
-      postflight.report.readOnlySmoke === "pass" &&
-      postflight.report.dataCountsUnchanged === "pass",
-    "EXTERNAL_FIXTURE_POSTFLIGHT_FAILED"
-  );
 
-  await withClient(
-    context,
-    resolvedClientFactory,
-    fixtureCredentials(configuration),
-    (client) =>
-      client.query("CREATE TABLE public.external_fixture_postflight_drift (id integer)")
-  );
-  const postflightDrift = await runPostflight(
-    context,
-    resolvedClientFactory,
-    configuration
-  );
-  requireHarness(
-    postflightDrift.report.exitCode === 1 &&
-      postflightDrift.report.failure?.checkId === "TABLE_SET_MISMATCH",
-    "EXTERNAL_FIXTURE_POSTFLIGHT_DRIFT_NOT_REJECTED"
-  );
-  await withClient(
-    context,
-    resolvedClientFactory,
-    fixtureCredentials(configuration),
-    (client) => client.query("DROP TABLE public.external_fixture_postflight_drift")
-  );
+  await runPostflightDriftPhase(context, async () => {
+    await withClient(
+      context,
+      resolvedClientFactory,
+      fixtureCredentials(configuration),
+      (client) =>
+        client.query(
+          "CREATE TABLE public.external_fixture_postflight_drift (id integer)"
+        )
+    );
+    const postflightDrift = await runPostflight(
+      context,
+      resolvedClientFactory,
+      configuration
+    );
+    requireHarness(
+      postflightDrift.report.exitCode === 1 &&
+        postflightDrift.report.failure?.checkId === "TABLE_SET_MISMATCH",
+      "EXTERNAL_FIXTURE_POSTFLIGHT_DRIFT_NOT_REJECTED"
+    );
+    await withClient(
+      context,
+      resolvedClientFactory,
+      fixtureCredentials(configuration),
+      (client) => client.query("DROP TABLE public.external_fixture_postflight_drift")
+    );
+  });
 
   return publicSuccessResult();
+}
+
+export async function runConnectionOnlyHarness(options = {}) {
+  const context = createDeadlineContext(options.deadlineLimits);
+  const internalProbeState =
+    INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_OPTIONS.get(options);
+  EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.add(context);
+  if (internalProbeState) {
+    internalProbeState.context = context;
+    INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.set(context, internalProbeState);
+  }
+  try {
+    return await runConnectionOnlyHarnessWithinContext(options, context);
+  } finally {
+    INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.delete(context);
+    EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.delete(context);
+  }
+}
+
+const INTERNAL_PHASE_PROBE_SCENARIOS = Object.freeze({
+  "fixture-client-connect-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.fixtureClientConnect,
+  }),
+  "production-fixture-client-connect-path": Object.freeze({
+    kind: "production-path",
+    phase: EXTERNAL_FIXTURE_PHASES.fixtureClientConnect,
+  }),
+  "fixture-identity-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.fixtureIdentity,
+  }),
+  "fixture-ledger-setup-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.fixtureLedgerSetup,
+  }),
+  "extension-inventory-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.extensionInventory,
+  }),
+  "fixture-client-close-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.fixtureClientClose,
+  }),
+  "preflight-stability-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.preflightStability,
+  }),
+  "snapshot-drift-control-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.snapshotDriftControl,
+  }),
+  "extension-classification-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.extensionClassification,
+  }),
+  "pre-mutation-client-connect-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.preMutationClientConnect,
+  }),
+  "pre-mutation-identity-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.preMutationIdentity,
+  }),
+  "default-privilege-revoke-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.defaultPrivilegeRevoke,
+  }),
+  "fixture-role-setup-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.fixtureRoleSetup,
+  }),
+  "migration-boundary-identity-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationBoundaryIdentity,
+  }),
+  "migration-baseline-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationBaseline,
+  }),
+  "migration-public-acl-negative-control-unexpected-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPublicAclNegativeControl,
+  }),
+  "migration-final-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationFinal,
+  }),
+  "migration-replay-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReplay,
+  }),
+  "migration-postconditions-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPostconditions,
+  }),
+  "migration-client-close-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationClientClose,
+  }),
+  "transaction-rollback-control-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.transactionRollbackControl,
+  }),
+  "cleanup-client-connect-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.cleanupClientConnect,
+  }),
+  "cleanup-identity-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.cleanupIdentity,
+  }),
+  "ownership-pre-inventory-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.ownershipPreInventory,
+  }),
+  "ownership-canonicalization-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.ownershipCanonicalization,
+  }),
+  "ownership-post-snapshot-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.ownershipPostSnapshot,
+  }),
+  "authority-pre-inventory-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.authorityPreInventory,
+  }),
+  "bounded-revoke-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.boundedRevoke,
+  }),
+  "authority-zero-residue-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.authorityZeroResidue,
+  }),
+  "maintenance-owner-snapshot-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.maintenanceOwnerSnapshot,
+  }),
+  "canonical-client-close-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.canonicalClientClose,
+  }),
+  "postflight-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.postflight,
+  }),
+  "postflight-drift-rejects": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.postflightDrift,
+  }),
+  "migration-final-through-outer-wrappers": Object.freeze({
+    kind: "nested",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationFinal,
+  }),
+  "migration-final-plus-canonical-close": Object.freeze({
+    kind: "primary-close",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationFinal,
+  }),
+  "canonical-close-only": Object.freeze({
+    kind: "close-only",
+    phase: null,
+  }),
+  "cross-context-token-replay": Object.freeze({
+    kind: "cross-context",
+    phase: null,
+  }),
+  "fixture-identity-timeout": Object.freeze({
+    kind: "timeout",
+    phase: null,
+  }),
+  "unbranded-unknown": Object.freeze({ kind: "unknown", phase: null }),
+  "forged-known-marker-message": Object.freeze({ kind: "forged", phase: null }),
+  "forged-known-marker-object": Object.freeze({
+    kind: "forged-object",
+    phase: null,
+  }),
+  "redaction-shaped-unknown": Object.freeze({ kind: "redaction", phase: null }),
+  "intentional-public-acl-negative-control": Object.freeze({
+    kind: "intentional-negative-control",
+    phase: null,
+  }),
+  success: Object.freeze({ kind: "production-success", phase: null }),
+});
+
+function createFixedPhaseProbeClient({ queryNeverSettles = false, endRejects = false } = {}) {
+  const counters = { connect: 0, query: 0, end: 0, destroy: 0 };
+  const client = {
+    connection: {
+      stream: {
+        destroy() {
+          counters.destroy += 1;
+        },
+      },
+    },
+    async connect() {
+      counters.connect += 1;
+    },
+    query() {
+      counters.query += 1;
+      return queryNeverSettles
+        ? new Promise(() => undefined)
+        : Promise.resolve({ rows: [] });
+    },
+    async end() {
+      counters.end += 1;
+      if (endRejects) throw new Error("fixed-private-close-failure");
+    },
+  };
+  return Object.freeze({ client, counters });
+}
+
+function fixedPhaseProbeTranscript({
+  error,
+  publicResult,
+  state,
+  context,
+  probeStateRemoved,
+  targetClient,
+  unrelatedClient,
+}) {
+  const failureMarker = error === null ? null : externalFixtureFailureMarker(error);
+  return Object.freeze({
+    failureMarker,
+    exitCode: error === null ? 0 : 1,
+    stdout: error === null ? `${JSON.stringify(publicResult)}\n` : "",
+    stderr: error === null ? "" : `${failureMarker}\n`,
+    publicResult,
+    phaseTrace: Object.freeze([...state.phaseTrace]),
+    phaseStartCount: state.phaseTrace.length,
+    targetHitCount: state.targetHitCount,
+    operationStartCount: state.operationStartCount,
+    skippedOperationCount: state.skippedOperationCount ?? 0,
+    postflightStartCount: state.postflightStartCount,
+    connectionFactoryCallCount: state.connectionFactoryCallCount,
+    activeClientCount: context.activeClients.size,
+    targetConnectCount:
+      state.graphCounters?.connect ?? targetClient?.counters.connect ?? 0,
+    targetQueryCount:
+      state.graphCounters?.query ?? targetClient?.counters.query ?? 0,
+    targetEndCount: state.graphCounters?.end ?? targetClient?.counters.end ?? 0,
+    targetDestroyCount:
+      state.graphCounters?.destroy ?? targetClient?.counters.destroy ?? 0,
+    unrelatedDestroyCount: unrelatedClient?.counters.destroy ?? 0,
+    probeStateRemoved,
+  });
+}
+
+async function runProductionGraphPhaseProbeForTests(specification) {
+  const state = {
+    targetPhase: specification.phase,
+    targetHitCount: 0,
+    operationStartCount: 0,
+    postflightStartCount: 0,
+    skippedOperationCount: 0,
+    connectionFactoryCallCount: 0,
+    phaseTrace: [],
+    context: null,
+    productionGraph: true,
+    graphCounters: { connect: 0, query: 0, end: 0, destroy: 0 },
+  };
+  const options = Object.freeze({
+    environment: Object.freeze({
+      NODE_ENV: "test",
+      ACTUSTUBE_STAGING_HARNESS_DATABASE_URL:
+        "postgresql://actustube_ci_fixture:fixed_probe_only@127.0.0.1:5432/actustube_ci_fixture",
+      ACTUSTUBE_STAGING_HARNESS_EXPECTED_DATABASE: "actustube_ci_fixture",
+      ACTUSTUBE_STAGING_HARNESS_EXPECTED_ROLE: "actustube_ci_fixture",
+      ACTUSTUBE_STAGING_HARNESS_EXPECTED_MAJOR: "18",
+      ACTUSTUBE_STAGING_HARNESS_EXPECTED_MIGRATION_MAX: "6",
+    }),
+    clientFactory() {
+      state.connectionFactoryCallCount += 1;
+      const clientOrdinal = state.connectionFactoryCallCount;
+      return {
+        connection: {
+          stream: {
+            destroy() {
+              state.graphCounters.destroy += 1;
+            },
+          },
+        },
+        async connect() {
+          state.graphCounters.connect += 1;
+          if (
+            (state.targetPhase ===
+              EXTERNAL_FIXTURE_PHASES.fixtureClientConnect &&
+              clientOrdinal === 1) ||
+            (state.targetPhase ===
+              EXTERNAL_FIXTURE_PHASES.preMutationClientConnect &&
+              clientOrdinal === 2) ||
+            (state.targetPhase ===
+              EXTERNAL_FIXTURE_PHASES.cleanupClientConnect &&
+              clientOrdinal === 3)
+          ) {
+            throw new Error("fixed-private-client-connect-failure");
+          }
+        },
+        async query() {
+          state.graphCounters.query += 1;
+          throw new Error("fixed-private-unreachable-production-graph-query");
+        },
+        async end() {
+          state.graphCounters.end += 1;
+          if (
+            (state.targetPhase ===
+              EXTERNAL_FIXTURE_PHASES.fixtureClientClose &&
+              clientOrdinal === 1) ||
+            (state.targetPhase ===
+              EXTERNAL_FIXTURE_PHASES.migrationClientClose &&
+              clientOrdinal === 2) ||
+            (state.targetPhase ===
+              EXTERNAL_FIXTURE_PHASES.canonicalClientClose &&
+              clientOrdinal === 3)
+          ) {
+            throw new Error("fixed-private-client-close-failure");
+          }
+        },
+      };
+    },
+  });
+  INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_OPTIONS.set(options, state);
+  let error = null;
+  let publicResult = null;
+  try {
+    publicResult = await runConnectionOnlyHarness(options);
+  } catch (caughtError) {
+    error = caughtError;
+  } finally {
+    INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_OPTIONS.delete(options);
+  }
+  requireHarness(state.context !== null, "EXTERNAL_FIXTURE_PHASE_PROBE_NOT_TRIGGERED");
+  if (specification.phase === null) {
+    requireHarness(
+      error === null && publicResult !== null,
+      "EXTERNAL_FIXTURE_PHASE_PROBE_NOT_TRIGGERED"
+    );
+  } else {
+    requireHarness(
+      error !== null && state.targetHitCount === 1,
+      "EXTERNAL_FIXTURE_PHASE_PROBE_NOT_TRIGGERED"
+    );
+  }
+  const probeStateRemoved =
+    !INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_OPTIONS.has(options) &&
+    !INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.has(state.context);
+  return fixedPhaseProbeTranscript({
+    error,
+    publicResult,
+    state,
+    context: state.context,
+    probeStateRemoved,
+    targetClient: null,
+    unrelatedClient: null,
+  });
+}
+
+export async function runExternalFixturePhaseProbeForTests(scenario) {
+  requireHarness(
+    arguments.length === 1 &&
+      typeof scenario === "string" &&
+      Object.prototype.hasOwnProperty.call(INTERNAL_PHASE_PROBE_SCENARIOS, scenario),
+    "EXTERNAL_FIXTURE_PHASE_PROBE_INVALID"
+  );
+  const specification = INTERNAL_PHASE_PROBE_SCENARIOS[scenario];
+  if (
+    specification.kind === "phase" ||
+    specification.kind === "production-path" ||
+    specification.kind === "production-success"
+  ) {
+    return await runProductionGraphPhaseProbeForTests(specification);
+  }
+  const context = createDeadlineContext(
+    specification.kind === "timeout"
+      ? {
+          totalMilliseconds: 100,
+          connectMilliseconds: 20,
+          queryMilliseconds: 5,
+          closeMilliseconds: 20,
+        }
+      : undefined
+  );
+  const state = {
+    targetPhase: specification.phase,
+    targetHitCount: 0,
+    operationStartCount: 0,
+    skippedOperationCount: 0,
+    postflightStartCount: 0,
+    connectionFactoryCallCount: 0,
+    phaseTrace: [],
+  };
+  INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.set(context, state);
+  let error = null;
+  let publicResult = null;
+  let targetClient = null;
+  let unrelatedClient = null;
+  try {
+    if (specification.kind === "nested") {
+      await runMigrationPostconditionsPhase(context, () =>
+        runMigrationFinalPhase(context, async () => undefined)
+      );
+    } else if (
+      specification.kind === "primary-close" ||
+      specification.kind === "close-only"
+    ) {
+      targetClient = createFixedPhaseProbeClient({ endRejects: true });
+      await withClient(
+        context,
+        () => targetClient.client,
+        {},
+        specification.kind === "primary-close"
+          ? () =>
+              runMigrationPostconditionsPhase(context, () =>
+                runMigrationFinalPhase(context, async () => undefined)
+              )
+          : async () => undefined,
+        CANONICAL_CLEANUP_CLIENT_LIFECYCLE
+      );
+    } else if (specification.kind === "timeout") {
+      targetClient = createFixedPhaseProbeClient({ queryNeverSettles: true });
+      unrelatedClient = createFixedPhaseProbeClient();
+      const unrelatedContext = createDeadlineContext();
+      const unrelatedOwnedClient = await openClient(
+        unrelatedContext,
+        () => unrelatedClient.client,
+        {}
+      );
+      try {
+        await withClient(context, () => targetClient.client, {}, (client) =>
+          runFixtureIdentityPhase(context, () => client.query())
+        );
+      } finally {
+        await closeOwnedClient(unrelatedContext, unrelatedOwnedClient);
+      }
+    } else if (specification.kind === "cross-context") {
+      const sourceContext = createDeadlineContext();
+      const sourceState = {
+        targetPhase: EXTERNAL_FIXTURE_PHASES.migrationFinal,
+        targetHitCount: 0,
+        operationStartCount: 0,
+        skippedOperationCount: 0,
+        postflightStartCount: 0,
+        connectionFactoryCallCount: 0,
+        phaseTrace: [],
+      };
+      INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.set(
+        sourceContext,
+        sourceState
+      );
+      let sourceFailure = null;
+      try {
+        await runMigrationFinalPhase(sourceContext, async () => undefined);
+      } catch (caughtError) {
+        sourceFailure = caughtError;
+      } finally {
+        INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.delete(sourceContext);
+      }
+      requireHarness(
+        sourceFailure !== null &&
+          sourceState.targetHitCount === 1 &&
+          !INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.has(sourceContext),
+        "EXTERNAL_FIXTURE_PHASE_PROBE_NOT_TRIGGERED"
+      );
+      await runMigrationPostconditionsPhase(context, () =>
+        Promise.reject(sourceFailure)
+      );
+    } else if (specification.kind === "unknown") {
+      throw new Error("fixed-private-unknown-failure");
+    } else if (specification.kind === "forged") {
+      throw new Error(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL"
+      );
+    } else if (specification.kind === "forged-object") {
+      throw Object.freeze({
+        phase: "MIGRATION_FINAL",
+        code: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
+        marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
+      });
+    } else if (specification.kind === "redaction") {
+      throw new Error(
+        "credential://fixed-private@127.0.0.1:5432/private_db\n" +
+          "SELECT private_role FROM private_catalog"
+      );
+    } else if (specification.kind === "intentional-negative-control") {
+      await runMigrationPublicAclNegativeControlPhase(context, async () => {
+        try {
+          throw new Error("fixed-expected-public-acl-rejection");
+        } catch {
+          return undefined;
+        }
+      });
+      publicResult = publicSuccessResult();
+    }
+  } catch (caughtError) {
+    error = caughtError;
+  } finally {
+    INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.delete(context);
+  }
+  const probeStateRemoved =
+    !INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.has(context);
+  requireHarness(
+    error !== null || publicResult !== null,
+    "EXTERNAL_FIXTURE_PHASE_PROBE_NOT_TRIGGERED"
+  );
+  return fixedPhaseProbeTranscript({
+    error,
+    publicResult,
+    state,
+    context,
+    probeStateRemoved,
+    targetClient,
+    unrelatedClient,
+  });
 }
 
 const DEADLINE_PROBE_SCENARIOS = new Set([
@@ -4723,11 +5825,7 @@ if (invokedDirectly) {
     const result = await runConnectionOnlyHarness();
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
-    const marker =
-      error instanceof HarnessIssue &&
-      error.code === "EXTERNAL_FIXTURE_NOT_CONFIGURED"
-        ? "EXTERNAL_FIXTURE_NOT_CONFIGURED"
-        : "EXTERNAL_FIXTURE_VERIFICATION_FAILED";
+    const marker = externalFixtureFailureMarker(error);
     process.stderr.write(`${marker}\n`);
     process.exitCode = 1;
   }

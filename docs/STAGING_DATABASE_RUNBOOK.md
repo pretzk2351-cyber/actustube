@@ -1,6 +1,6 @@
 # ActusTube Staging Database Preflight / Postflight Runbook
 
-最終更新日：2026-08-17
+最終更新日：2026-08-23
 
 ## 目的と適用範囲
 
@@ -124,9 +124,9 @@ canonicalization後かつproduction postflight前に、別のcatalog snapshotで
 
 完全一致時だけ、current databaseのexecutor `CREATE`、`public` schemaのexecutor / legacy owner、`drizzle` schemaとmigration ledger table / sequenceのexecutor権限、legacy ownerからexecutorへのmembershipを、固定objectと固定roleへの7個のbounded REVOKEで除去します。target-as-grantorや未列挙ACL dependencyをcleanup対象へ加えず、7 REVOKEからallowlistを拡張しません。`DROP OWNED`、`REASSIGN OWNED`、role / database / schema削除、broad cleanupは使用しません。REVOKE後はACLのgrantee / grantor、未列挙ACL dependency、default ACL、membership、ownership、grant optionを含む同じ独立inventoryがexact 0行であることと、同じcanonical owner snapshotが維持されることを再確認します。このClientがbounded closeまで正常終了した場合だけproduction postflightをexact 1回開始します。inventory不一致、owner変更失敗、各REVOKE失敗、権限またはmembership残存、owner drift、query / close timeoutではpostflight開始0です。
 
-local fake-client testはquery順序、same-client callback、固定allowlist、grantor / grantee row contract、shared-dependency backstop、cleanup後の残存状態、timeout後の停止、unrelated context非破壊を確認します。7個のREVOKEはproduction実装からimportしないtest-localのexact SQL / parameter oracleで照合し、wrong object / role / privilege / order、marker / prefixだけの一致、追加SQLではauthority stateを削除しません。これはactual PostgreSQLのDDL / REVOKE権限、owner cascade、catalog completeness、Migrationまたはpostflight成功を証明しません。GitHub Actions PostgreSQL 18.6 gateはまだNOT RUNで、staging / Production / Neon / poolerのactual owner / ACLはNOT VERIFIEDです。repository-owned PostgreSQL lifecycle authorityは0のままで、advisory lockは引き続き未実装です。
+local fake-client testはquery順序、same-client callback、固定allowlist、grantor / grantee row contract、shared-dependency backstop、cleanup後の残存状態、timeout後の停止、unrelated context非破壊を確認します。7個のREVOKEはproduction実装からimportしないtest-localのexact SQL / parameter oracleで照合し、wrong object / role / privilege / order、marker / prefixだけの一致、追加SQLではauthority stateを削除しません。これはactual PostgreSQLのDDL / REVOKE権限、owner cascade、catalog completeness、Migrationまたはpostflight成功を証明しません。GitHub Actions PostgreSQL 18.6 gateのrun `32639709042`は`RUN / FAILED`で、generic marker `EXTERNAL_FIXTURE_VERIFICATION_FAILED`からunderlying failure phaseは特定できませんでした。新しいphase-marker qualification runはNOT RUNで、staging / Production / Neon / poolerのactual owner / ACLはNOT VERIFIEDです。repository-owned PostgreSQL lifecycle authorityは0のままで、advisory lockは引き続き未実装です。
 
-connection configurationのroleは接続時のexpected identityにすぎません。productionとfake probeは同じpre-mutation boundaryを通り、mandatoryな接続 / timeout設定後の最初のfixture-level queryでDB-observed `session_user` / `current_user`をexact 1-row contractとして検証します。両者とconfiguration roleが一致した後だけ`ALTER DEFAULT PRIVILEGES`、role作成、GRANT、Migration callbackを開始し、mismatch、query failure、timeout時のfixture mutationは0です。最初のactual `session_user`から作成したexact `sessionRole` keyだけのfrozen objectを唯一のdownstream grantor authorityとして維持します。Migration boundaryの再観測はこのobjectとの値比較だけに使い、新しいobjectへ置換しません。expected 11 ACL grantor、owner canonicalization、temporary-authority contract、cleanup identity比較は同じoriginal object referenceへ束縛し、configuration roleやACL inventory resultから生成しません。cleanup Clientは最初のqueryでidentityを再観測し、ownership inventory、canonicalization、`ALTER ... OWNER`より前に両roleとoriginal frozen identityの一致を要求します。cleanup identity mismatch、query failure、timeoutではowner change、ownership / authority inventory、REVOKE、postflightは0です。local testではcaller configuration、initial / boundary / cleanup DB-observed role、actual fake ACL grantorを独立したoption / state pathで供給します。このfake Client検証はactual PostgreSQL semanticsを証明せず、PostgreSQL 18.6 external gateはNOT RUN、実staging / Production / Neon / poolerはNOT VERIFIED、repository-owned PostgreSQL lifecycle authorityは0のままです。
+connection configurationのroleは接続時のexpected identityにすぎません。productionとfake probeは同じpre-mutation boundaryを通り、mandatoryな接続 / timeout設定後の最初のfixture-level queryでDB-observed `session_user` / `current_user`をexact 1-row contractとして検証します。両者とconfiguration roleが一致した後だけ`ALTER DEFAULT PRIVILEGES`、role作成、GRANT、Migration callbackを開始し、mismatch、query failure、timeout時のfixture mutationは0です。最初のactual `session_user`から作成したexact `sessionRole` keyだけのfrozen objectを唯一のdownstream grantor authorityとして維持します。Migration boundaryの再観測はこのobjectとの値比較だけに使い、新しいobjectへ置換しません。expected 11 ACL grantor、owner canonicalization、temporary-authority contract、cleanup identity比較は同じoriginal object referenceへ束縛し、configuration roleやACL inventory resultから生成しません。cleanup Clientは最初のqueryでidentityを再観測し、ownership inventory、canonicalization、`ALTER ... OWNER`より前に両roleとoriginal frozen identityの一致を要求します。cleanup identity mismatch、query failure、timeoutではowner change、ownership / authority inventory、REVOKE、postflightは0です。local testではcaller configuration、initial / boundary / cleanup DB-observed role、actual fake ACL grantorを独立したoption / state pathで供給します。このfake Client検証はactual PostgreSQL semanticsを証明しません。PostgreSQL 18.6 external gateのrun `32639709042`は`RUN / FAILED`で、underlying failure phaseは`NOT IDENTIFIED`です。observability-only変更を含む新HEADのqualification runはNOT RUN、実staging / Production / Neon / poolerはNOT VERIFIED、repository-owned PostgreSQL lifecycle authorityは0のままです。
 
 `pg_class`はtable / sequence / primary-key indexについてrelation kind、namespace、access method、persistence、replica identity、RLS、populated / partition / shared / rewrite / row-type / typed-table状態、tablespace、TOASTのzero / nonzeroと参照対応、ACL / option、owner関係、固定boolean / charを検証します。`relfilenode`、`relpages`、`reltuples`、`relallvisible`、`relallfrozen`、`relfrozenxid`、`relminmxid`はrewrite、planner統計、VACUUM、freeze、transaction状態で変動するためfield別理由をcoverage matrixへ記録してexact固定から除外します。その他のstable fieldに未検査を残しません。
 
@@ -257,18 +257,34 @@ repository側のconnection-only verifierが受け取るfixture入力は、`ACTUS
 
 PostgreSQL lifecycleは`.github/workflows/staging-database-preflight.yml`のUbuntu 24.04 service containerだけが所有します。repository内のembedded PostgreSQL dependency、local PostgreSQL lifecycle package command、起動・停止scriptはすべて削除済みです。workflowはdigest固定PostgreSQL 18.6、read-only repository permission、15分job timeout、credentialを永続化しないcheckout、Node 24、`npm ci --ignore-scripts`を固定し、verifier、TypeScript、full Vitest、full ESLintを順に実行します。repository verifierにはdatabase process API、port allocation、filesystem root、cleanup worker、watchdog、process query、PID / kill、OS utility、recursive delete、quarantine、reparse handling、IPC lifecycle ownership、native broker / Job ObjectのコードもDI seamもありません。
 
+### GitHub Actions external fixture execution history
+
+次をimmutableな履歴として記録します。
+
+```text
+GitHub Actions run: 32639709042
+Head SHA: 6aa050888b24a20b231d245b05d292bcebec3ccb
+PostgreSQL 18.6 service-container gate: RUN / FAILED
+Observed public marker: EXTERNAL_FIXTURE_VERIFICATION_FAILED
+Underlying failure phase: NOT IDENTIFIED
+```
+
+Failureはgeneric markerへ集約され、actual production external-harness pathのどのphaseで失敗したか、service-container fixture内のpreflight、Migration、cleanup、postflightがどこまで開始・完了したかは特定できません。この結果をroot cause確定、actual PostgreSQL defect修正済み、PostgreSQL 18.6 PASS、または一時障害の証明として扱いません。
+
+今回の変更は固定ASCII phase markerによるpublic-safe observabilityだけを追加し、underlying PostgreSQL behaviorを修正しません。初期fixture Client、Migration Client、canonical cleanup Clientのconnect / closeは、追加operationではなく既存の実在lifecycle await boundaryを個別phaseとして分類します。新しいphase-marker qualification runはこのcommit時点でNOT RUNです。Raw error、error message、stack、cause、SQL、URL、credential、host、port、database、session / executor / legacy-owner role、OID、ACL / membership / catalog / `pg_shdepend` rowをpublic outputへ追加しません。
+
 connection-only verifierはharness開始時にmonotonic clockから作成した単一のabsolute deadlineを使用します。totalは300,000ms、connectは10,000ms、client queryは30,000ms、server statementは20,000ms、lockは5,000ms、idle transactionは20,000ms、client closeは5,000ms以下です。各operationは固有上限とtotal残時間の小さい方で停止し、timeout時はrepository verifierが作成した当該`pg.Client`のsocketだけをidempotentに破棄します。timeout後は同じClientを再利用せず、追加query、ROLLBACK、`RESET ROLE`、owner / membership query、probe、別operationを開始しません。別deadline contextへ登録したunrelated Clientは破棄せず、そのcontext自身のbounded closeだけで終了します。`client.end()`も有限期限であり、完了しない場合は同じowned socketを破棄します。provider-native cancellation、実Neon、transaction pooler、実staging owner / ACL、advisory lockは引き続きNOT TESTEDまたはNOT VERIFIEDです。
 
 P3 unit gateだけはconnection-only verifierから分離した`test-staging-database-fault-lifecycle.mjs`で固定sourceのbenign Node childを使います。connection-only verifierはこのmoduleをimportせず、`node:child_process`へ到達しません。P3 parentが固定modeをprivate IPCで1回渡し、childのexact schema / occurrence / capability / sequence / phaseを検証した上で、parentが`exit`と`close`のevent count、code、signal、monotonic timestampを別々に記録し、error eventとauthenticated phase sequenceも保持します。exact nonzero code、exact signal、deadline時aliveだけをacceptedとし、wrong / zero exit、wrong signal、deadline前正常終了、phase前failure、phase後正常終了、terminal reason偽装、duplicate / malformed / replayed phaseをrejectします。result keyはexact allowlistであり、private bindingとPID情報を含めません。これはdatabase processのownership、termination、cleanupをテストするものではありません。
 
-- external fixture separate-role connection、PostgreSQL 18.6 actual結果、移植したusage Migration意味検証：GitHub Actions実行前のためNOT RUN
+- external fixture separate-role connection、PostgreSQL 18.6 actual結果、移植したusage Migration意味検証：run `32639709042`は`RUN / FAILED`。generic markerのためfailure phase、各境界への到達、Migration / cleanup / postflightの完了状態はNOT IDENTIFIEDで、PASSはNOT VERIFIED。新しいphase-marker qualification runはNOT RUN
 - staging専用provider resource：文書上は別工程で作成済み。今回のlocal product recoveryではprovider状態をNOT VERIFIED
 - 実staging DB：未接続・未検証。preflight / Migration / postflightは実行0回
 - real transaction pooler behavior：実provider endpoint未接続のためNOT TESTED
 - 実staging owner / ACL：実staging DB未接続のためNOT TESTED
 - Production：未接続・不変
 
-local fake Client / unit testのPASSはrole・owner・deadline境界の静的な実装確認であり、actual PostgreSQLのMigration実行結果ではありません。local unit PASSまたは将来のGitHub Actions disposable fixture PASSを、実provider poolerや実staging DBのPASSとして扱いません。workflow未実行時はexternal fixture検証をPASSと記録しません。
+local fake Client / unit testのPASSはrole・owner・deadline境界の静的な実装確認であり、actual PostgreSQLのMigration実行結果ではありません。local unit PASSまたは将来のGitHub Actions disposable fixture PASSを、実provider poolerや実staging DBのPASSとして扱いません。run `32639709042`は`RUN / FAILED`でありexternal fixture検証をPASSと記録しません。generic markerだけではunderlying failure phaseまたはroot causeを確定せず、新しいphase-marker qualification runは実行前のためNOT RUNです。
 
 ## 成功・停止・cleanup
 

@@ -28,6 +28,7 @@ import {
   externalFixtureSuccessResultForTests,
   harnessAuthorityBoundaryForTests,
   runConnectionOnlyHarness,
+  runExternalFixturePhaseProbeForTests,
   runHarnessDeadlineProbeForTests,
   runHarnessTransactionBoundaryProbeForTests,
   runMigrationOwnerBoundaryProbeForTests,
@@ -53,6 +54,272 @@ const directUrl =
   `postgresql://staging_direct:${fakeSecret}@ep-actustube-safe.example.test/staging_database?sslmode=require`;
 const pooledUrl =
   `postgresql://staging_runtime:${fakeSecret}@ep-actustube-safe-pooler.example.test/staging_database?sslmode=require`;
+
+const externalFixturePhaseMarkerOracle = Object.freeze([
+  Object.freeze({
+    scenario: "fixture-client-connect-rejects",
+    phase: "FIXTURE_CLIENT_CONNECT",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_CLIENT_CONNECT",
+  }),
+  Object.freeze({
+    scenario: "fixture-identity-rejects",
+    phase: "FIXTURE_IDENTITY",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_IDENTITY",
+  }),
+  Object.freeze({
+    scenario: "fixture-ledger-setup-rejects",
+    phase: "FIXTURE_LEDGER_SETUP",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_LEDGER_SETUP",
+  }),
+  Object.freeze({
+    scenario: "extension-inventory-rejects",
+    phase: "EXTENSION_INVENTORY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_EXTENSION_INVENTORY",
+  }),
+  Object.freeze({
+    scenario: "fixture-client-close-rejects",
+    phase: "FIXTURE_CLIENT_CLOSE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_CLIENT_CLOSE",
+  }),
+  Object.freeze({
+    scenario: "preflight-stability-rejects",
+    phase: "PREFLIGHT_STABILITY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_PREFLIGHT_STABILITY",
+  }),
+  Object.freeze({
+    scenario: "snapshot-drift-control-rejects",
+    phase: "SNAPSHOT_DRIFT_CONTROL",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_SNAPSHOT_DRIFT_CONTROL",
+  }),
+  Object.freeze({
+    scenario: "extension-classification-rejects",
+    phase: "EXTENSION_CLASSIFICATION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_EXTENSION_CLASSIFICATION",
+  }),
+  Object.freeze({
+    scenario: "pre-mutation-client-connect-rejects",
+    phase: "PRE_MUTATION_CLIENT_CONNECT",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_PRE_MUTATION_CLIENT_CONNECT",
+  }),
+  Object.freeze({
+    scenario: "pre-mutation-identity-rejects",
+    phase: "PRE_MUTATION_IDENTITY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_PRE_MUTATION_IDENTITY",
+  }),
+  Object.freeze({
+    scenario: "default-privilege-revoke-rejects",
+    phase: "DEFAULT_PRIVILEGE_REVOKE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_DEFAULT_PRIVILEGE_REVOKE",
+  }),
+  Object.freeze({
+    scenario: "fixture-role-setup-rejects",
+    phase: "FIXTURE_ROLE_SETUP",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_ROLE_SETUP",
+  }),
+  Object.freeze({
+    scenario: "migration-boundary-identity-rejects",
+    phase: "MIGRATION_BOUNDARY_IDENTITY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_BOUNDARY_IDENTITY",
+  }),
+  Object.freeze({
+    scenario: "migration-baseline-rejects",
+    phase: "MIGRATION_BASELINE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_BASELINE",
+  }),
+  Object.freeze({
+    scenario: "migration-public-acl-negative-control-unexpected-rejects",
+    phase: "MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL",
+  }),
+  Object.freeze({
+    scenario: "migration-final-rejects",
+    phase: "MIGRATION_FINAL",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
+  }),
+  Object.freeze({
+    scenario: "migration-replay-rejects",
+    phase: "MIGRATION_REPLAY",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY",
+  }),
+  Object.freeze({
+    scenario: "migration-postconditions-rejects",
+    phase: "MIGRATION_POSTCONDITIONS",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS",
+  }),
+  Object.freeze({
+    scenario: "migration-client-close-rejects",
+    phase: "MIGRATION_CLIENT_CLOSE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_CLIENT_CLOSE",
+  }),
+  Object.freeze({
+    scenario: "transaction-rollback-control-rejects",
+    phase: "TRANSACTION_ROLLBACK_CONTROL",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_TRANSACTION_ROLLBACK_CONTROL",
+  }),
+  Object.freeze({
+    scenario: "cleanup-client-connect-rejects",
+    phase: "CLEANUP_CLIENT_CONNECT",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_CLEANUP_CLIENT_CONNECT",
+  }),
+  Object.freeze({
+    scenario: "cleanup-identity-rejects",
+    phase: "CLEANUP_IDENTITY",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_CLEANUP_IDENTITY",
+  }),
+  Object.freeze({
+    scenario: "ownership-pre-inventory-rejects",
+    phase: "OWNERSHIP_PRE_INVENTORY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_OWNERSHIP_PRE_INVENTORY",
+  }),
+  Object.freeze({
+    scenario: "ownership-canonicalization-rejects",
+    phase: "OWNERSHIP_CANONICALIZATION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_OWNERSHIP_CANONICALIZATION",
+  }),
+  Object.freeze({
+    scenario: "ownership-post-snapshot-rejects",
+    phase: "OWNERSHIP_POST_SNAPSHOT",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_OWNERSHIP_POST_SNAPSHOT",
+  }),
+  Object.freeze({
+    scenario: "authority-pre-inventory-rejects",
+    phase: "AUTHORITY_PRE_INVENTORY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_AUTHORITY_PRE_INVENTORY",
+  }),
+  Object.freeze({
+    scenario: "bounded-revoke-rejects",
+    phase: "BOUNDED_REVOKE",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_BOUNDED_REVOKE",
+  }),
+  Object.freeze({
+    scenario: "authority-zero-residue-rejects",
+    phase: "AUTHORITY_ZERO_RESIDUE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_AUTHORITY_ZERO_RESIDUE",
+  }),
+  Object.freeze({
+    scenario: "maintenance-owner-snapshot-rejects",
+    phase: "MAINTENANCE_OWNER_SNAPSHOT",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MAINTENANCE_OWNER_SNAPSHOT",
+  }),
+  Object.freeze({
+    scenario: "canonical-client-close-rejects",
+    phase: "CANONICAL_CLIENT_CLOSE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_CANONICAL_CLIENT_CLOSE",
+  }),
+  Object.freeze({
+    scenario: "postflight-rejects",
+    phase: "POSTFLIGHT",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_POSTFLIGHT",
+  }),
+  Object.freeze({
+    scenario: "postflight-drift-rejects",
+    phase: "POSTFLIGHT_DRIFT",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_POSTFLIGHT_DRIFT",
+  }),
+] as const);
+
+const externalFixtureProductionPhaseOrder = Object.freeze([
+  "FIXTURE_CLIENT_CONNECT",
+  "FIXTURE_IDENTITY",
+  "FIXTURE_LEDGER_SETUP",
+  "EXTENSION_INVENTORY",
+  "FIXTURE_CLIENT_CLOSE",
+  "PREFLIGHT_STABILITY",
+  "SNAPSHOT_DRIFT_CONTROL",
+  "EXTENSION_CLASSIFICATION",
+  "PRE_MUTATION_CLIENT_CONNECT",
+  "PRE_MUTATION_IDENTITY",
+  "DEFAULT_PRIVILEGE_REVOKE",
+  "FIXTURE_ROLE_SETUP",
+  "MIGRATION_BOUNDARY_IDENTITY",
+  "FIXTURE_ROLE_SETUP",
+  "MIGRATION_BASELINE",
+  "MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL",
+  "MIGRATION_FINAL",
+  "MIGRATION_POSTCONDITIONS",
+  "MIGRATION_REPLAY",
+  "MIGRATION_POSTCONDITIONS",
+  "MIGRATION_CLIENT_CLOSE",
+  "MIGRATION_POSTCONDITIONS",
+  "TRANSACTION_ROLLBACK_CONTROL",
+  "CLEANUP_CLIENT_CONNECT",
+  "CLEANUP_IDENTITY",
+  "OWNERSHIP_PRE_INVENTORY",
+  "OWNERSHIP_CANONICALIZATION",
+  "OWNERSHIP_POST_SNAPSHOT",
+  "AUTHORITY_PRE_INVENTORY",
+  "BOUNDED_REVOKE",
+  "AUTHORITY_ZERO_RESIDUE",
+  "MAINTENANCE_OWNER_SNAPSHOT",
+  "CANONICAL_CLIENT_CLOSE",
+  "POSTFLIGHT",
+  "POSTFLIGHT_DRIFT",
+] as const);
+
+const externalFixturePublicSuccessOracle = Object.freeze({
+  success: true,
+  fixtureConfigured: true,
+  lifecycleOwner: "github_actions_service_container",
+  postgresqlMajor: 18,
+  migrationCount: 7,
+  stablePreflight: true,
+  snapshotDriftRejected: true,
+  extensionClassification: true,
+  independentExtensionInventory: true,
+  migrationOrderAndReplay: true,
+  usageMigrationSemantics: true,
+  temporaryAuthorityCleanup: true,
+  deadlineBounded: true,
+  transactionRollback: true,
+  postflight: true,
+  postflightDriftRejected: true,
+  verifierQueriesReadOnly: true,
+  outputRedaction: true,
+});
+
+const externalFixtureUnknownMarkerOracle = Object.freeze([
+  Object.freeze({
+    scenario: "unbranded-unknown",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
+  }),
+  Object.freeze({
+    scenario: "forged-known-marker-message",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
+  }),
+  Object.freeze({
+    scenario: "forged-known-marker-object",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
+  }),
+  Object.freeze({
+    scenario: "redaction-shaped-unknown",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
+  }),
+] as const);
 
 function validEnvironment(): any {
   return {
@@ -935,6 +1202,23 @@ const faultLifecycleModule = resolve(
   repositoryRoot,
   "scripts/test-staging-database-fault-lifecycle.mjs"
 );
+
+function sourceSection(
+  source: string,
+  startLiteral: string,
+  endLiteral: string
+): string {
+  const start = source.indexOf(startLiteral);
+  const end = source.indexOf(endLiteral, start + startLiteral.length);
+  if (start < 0 || end < 0 || end <= start) {
+    throw new Error("TEST_SOURCE_SECTION_NOT_FOUND");
+  }
+  return source.slice(start, end);
+}
+
+function literalOccurrenceCount(source: string, literal: string): number {
+  return source.split(literal).length - 1;
+}
 
 function externalFixtureEnvironment(
   overrides: Partial<NodeJS.ProcessEnv> = {}
@@ -2438,6 +2722,7 @@ describe("connection-only external fixture boundary", () => {
         "externalFixtureSuccessResultForTests",
         "harnessAuthorityBoundaryForTests",
         "runConnectionOnlyHarness",
+        "runExternalFixturePhaseProbeForTests",
         "runHarnessDeadlineProbeForTests",
         "runHarnessTransactionBoundaryProbeForTests",
         "runMigrationOwnerBoundaryProbeForTests",
@@ -3460,8 +3745,8 @@ describe("connection-only external fixture boundary", () => {
     const source = await readFile(postgresHarnessModule, "utf8");
     expect(source).toContain("session_user AS session_role");
     expect(source).toContain("current_user AS effective_role");
-    expect(source).toContain(
-      "const boundaryObservedIdentity = await assertInitialMigrationBoundaryRoles"
+    expect(source).toMatch(
+      /const boundaryObservedIdentity = await runMigrationBoundaryIdentityPhase\([\s\S]{0,180}assertInitialMigrationBoundaryRoles\(/
     );
     expect(source).toContain(
       "return Object.freeze({ beforeFinalResult })"
@@ -5543,6 +5828,7 @@ describe("connection-only external fixture boundary", () => {
     }
 
     const success = externalFixtureSuccessResultForTests();
+    expect(success).toEqual(externalFixturePublicSuccessOracle);
     expect(Object.keys(success).sort()).toEqual(
       [
         "extensionClassification",
@@ -5580,9 +5866,650 @@ describe("connection-only external fixture boundary", () => {
     expect(cli).toEqual({
       code: 1,
       stdout: "",
-      stderr: "EXTERNAL_FIXTURE_VERIFICATION_FAILED\n",
+      stderr: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN\n",
     });
     expect(JSON.stringify(cli)).not.toContain(credential);
+  });
+});
+
+describe("external PostgreSQL public-safe phase observability oracle", () => {
+  const actualLifecyclePhases: readonly string[] = [
+    "FIXTURE_CLIENT_CONNECT",
+    "FIXTURE_CLIENT_CLOSE",
+    "PRE_MUTATION_CLIENT_CONNECT",
+    "MIGRATION_CLIENT_CLOSE",
+    "CLEANUP_CLIENT_CONNECT",
+    "CANONICAL_CLIENT_CLOSE",
+  ];
+  const transcriptKeys = [
+    "activeClientCount",
+    "connectionFactoryCallCount",
+    "exitCode",
+    "failureMarker",
+    "operationStartCount",
+    "phaseStartCount",
+    "phaseTrace",
+    "postflightStartCount",
+    "probeStateRemoved",
+    "publicResult",
+    "skippedOperationCount",
+    "stderr",
+    "stdout",
+    "targetConnectCount",
+    "targetDestroyCount",
+    "targetEndCount",
+    "targetHitCount",
+    "targetQueryCount",
+    "unrelatedDestroyCount",
+  ].sort();
+
+  it("keeps the independent literal oracle complete and duplicate-free", () => {
+    expect(externalFixturePhaseMarkerOracle).toHaveLength(32);
+    expect(
+      new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.scenario)).size
+    ).toBe(32);
+    expect(
+      new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.phase)).size
+    ).toBe(32);
+    expect(
+      new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.marker)).size
+    ).toBe(32);
+    expect(externalFixtureUnknownMarkerOracle).toHaveLength(4);
+    expect(
+      new Set(externalFixtureUnknownMarkerOracle.map((entry) => entry.scenario))
+        .size
+    ).toBe(4);
+    expect(
+      externalFixturePhaseMarkerOracle.some(
+        (entry) => entry.phase === "FIXTURE_LEDGER_SETUP"
+      )
+    ).toBe(true);
+    const oraclePhases: readonly string[] =
+      externalFixturePhaseMarkerOracle.map((entry) => entry.phase);
+    expect(oraclePhases).not.toContain("PREFLIGHT_INITIAL");
+  });
+
+  it.each(externalFixturePhaseMarkerOracle)(
+    "maps the fixed $scenario scenario to its independent literal marker",
+    async ({ scenario, phase, marker }) => {
+      const result = await runExternalFixturePhaseProbeForTests(scenario);
+      const targetIndex = externalFixtureProductionPhaseOrder.indexOf(phase);
+      expect(targetIndex).toBeGreaterThanOrEqual(0);
+      const expectedTrace = externalFixtureProductionPhaseOrder.slice(
+        0,
+        targetIndex + 1
+      );
+      if (targetIndex >= 1 && targetIndex <= 3) {
+        expectedTrace.push("FIXTURE_CLIENT_CLOSE");
+      } else if (targetIndex >= 9 && targetIndex <= 19) {
+        expectedTrace.push("MIGRATION_CLIENT_CLOSE");
+      } else if (targetIndex >= 24 && targetIndex <= 31) {
+        expectedTrace.push("CANONICAL_CLIENT_CLOSE");
+      }
+      const expectedSkippedOperationCount =
+        externalFixtureProductionPhaseOrder
+          .slice(0, targetIndex)
+          .filter((candidate) => !actualLifecyclePhases.includes(candidate))
+          .length;
+      const expectedClientCount =
+        targetIndex <= 7 ? 1 : targetIndex <= 22 ? 2 : 3;
+      const expectedOperationStartCount = expectedTrace.filter((candidate) =>
+        actualLifecyclePhases.includes(candidate)
+      ).length;
+
+      expect(result.failureMarker).toBe(marker);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(`${marker}\n`);
+      expect(
+        result.stderr.split(/\r?\n/).filter((line) => line.length > 0)
+      ).toEqual([marker]);
+      expect(result.stdout).not.toContain(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_"
+      );
+      expect(result.publicResult).toBeNull();
+      expect(result.phaseTrace).toEqual(expectedTrace);
+      expect(result.phaseStartCount).toBe(expectedTrace.length);
+      expect(result.targetHitCount).toBe(1);
+      expect(result.operationStartCount).toBe(expectedOperationStartCount);
+      expect(result.skippedOperationCount).toBe(
+        expectedSkippedOperationCount
+      );
+      expect(result.postflightStartCount).toBe(
+        phase === "POSTFLIGHT_DRIFT" ? 2 : phase === "POSTFLIGHT" ? 1 : 0
+      );
+      expect(result.connectionFactoryCallCount).toBe(expectedClientCount);
+      expect(result.targetConnectCount).toBe(expectedClientCount);
+      expect(result.targetEndCount).toBe(expectedClientCount);
+      expect(result.targetQueryCount).toBe(0);
+      expect(result.targetDestroyCount).toBe(0);
+      expect(result.activeClientCount).toBe(0);
+      expect(result.probeStateRemoved).toBe(true);
+      expect(Object.keys(result).sort()).toEqual(transcriptKeys);
+    }
+  );
+
+  it.each(externalFixtureUnknownMarkerOracle)(
+    "maps the fixed $scenario scenario to UNKNOWN without trusting its message",
+    async ({ scenario, marker }) => {
+      const result = await runExternalFixturePhaseProbeForTests(scenario);
+
+      expect(result).toMatchObject({
+        failureMarker: marker,
+        exitCode: 1,
+        stdout: "",
+        stderr: `${marker}\n`,
+        publicResult: null,
+        phaseTrace: [],
+        phaseStartCount: 0,
+        targetHitCount: 0,
+        operationStartCount: 0,
+        postflightStartCount: 0,
+        connectionFactoryCallCount: 0,
+        activeClientCount: 0,
+        probeStateRemoved: true,
+      });
+      expect(
+        result.stderr.split(/\r?\n/).filter((line) => line.length > 0)
+      ).toEqual([marker]);
+      expect(Object.keys(result).sort()).toEqual(transcriptKeys);
+    }
+  );
+
+  it("keeps the public success result unchanged and emits no marker", async () => {
+    const expected = externalFixturePublicSuccessOracle;
+    const result = await runExternalFixturePhaseProbeForTests("success");
+
+    expect(result).toMatchObject({
+      failureMarker: null,
+      exitCode: 0,
+      stderr: "",
+      publicResult: expected,
+      phaseTrace: externalFixtureProductionPhaseOrder,
+      phaseStartCount: externalFixtureProductionPhaseOrder.length,
+      targetHitCount: 0,
+      operationStartCount: 6,
+      skippedOperationCount: 29,
+      postflightStartCount: 2,
+      connectionFactoryCallCount: 3,
+      targetConnectCount: 3,
+      targetQueryCount: 0,
+      targetEndCount: 3,
+      targetDestroyCount: 0,
+      activeClientCount: 0,
+      probeStateRemoved: true,
+    });
+    expect(result.stdout).toBe(`${JSON.stringify(expected)}\n`);
+    expect(result.stdout).not.toContain(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_"
+    );
+    expect(Object.keys(result.publicResult || {}).sort()).toEqual(
+      Object.keys(expected).sort()
+    );
+    expect(Object.keys(result).sort()).toEqual(transcriptKeys);
+  });
+
+  it("preserves the migration-final inner marker through outer wrappers", async () => {
+    const result = await runExternalFixturePhaseProbeForTests(
+      "migration-final-through-outer-wrappers"
+    );
+
+    expect(result).toMatchObject({
+      failureMarker:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL\n",
+      phaseTrace: ["MIGRATION_POSTCONDITIONS", "MIGRATION_FINAL"],
+      phaseStartCount: 2,
+      targetHitCount: 1,
+      operationStartCount: 1,
+      postflightStartCount: 0,
+      activeClientCount: 0,
+      probeStateRemoved: true,
+    });
+  });
+
+  it("preserves the primary marker while canonical close still runs and fails", async () => {
+    const result = await runExternalFixturePhaseProbeForTests(
+      "migration-final-plus-canonical-close"
+    );
+
+    expect(result).toMatchObject({
+      failureMarker:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL\n",
+      phaseTrace: [
+        "CLEANUP_CLIENT_CONNECT",
+        "MIGRATION_POSTCONDITIONS",
+        "MIGRATION_FINAL",
+        "CANONICAL_CLIENT_CLOSE",
+      ],
+      phaseStartCount: 4,
+      targetHitCount: 1,
+      operationStartCount: 3,
+      postflightStartCount: 0,
+      targetConnectCount: 1,
+      targetEndCount: 1,
+      targetDestroyCount: 0,
+      activeClientCount: 0,
+      probeStateRemoved: true,
+    });
+  });
+
+  it("uses canonical-client-close only for a close-only failure", async () => {
+    const result = await runExternalFixturePhaseProbeForTests(
+      "canonical-close-only"
+    );
+
+    expect(result).toMatchObject({
+      failureMarker:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_CANONICAL_CLIENT_CLOSE",
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_CANONICAL_CLIENT_CLOSE\n",
+      phaseTrace: ["CLEANUP_CLIENT_CONNECT", "CANONICAL_CLIENT_CLOSE"],
+      phaseStartCount: 2,
+      targetHitCount: 0,
+      operationStartCount: 2,
+      postflightStartCount: 0,
+      targetConnectCount: 1,
+      targetEndCount: 1,
+      targetDestroyCount: 0,
+      activeClientCount: 0,
+      probeStateRemoved: true,
+    });
+  });
+
+  it("rebrands a private token replayed from another context at the current phase", async () => {
+    const result = await runExternalFixturePhaseProbeForTests(
+      "cross-context-token-replay"
+    );
+
+    expect(result).toMatchObject({
+      failureMarker:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS",
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS\n",
+      publicResult: null,
+      phaseTrace: ["MIGRATION_POSTCONDITIONS"],
+      phaseStartCount: 1,
+      targetHitCount: 0,
+      operationStartCount: 1,
+      skippedOperationCount: 0,
+      postflightStartCount: 0,
+      activeClientCount: 0,
+      probeStateRemoved: true,
+    });
+    expect(result.stderr).not.toContain("MIGRATION_FINAL");
+  });
+
+  it("keeps unknown, forgery, and secret-shaped errors fully redacted", async () => {
+    for (const { scenario } of externalFixtureUnknownMarkerOracle) {
+      const result = await runExternalFixturePhaseProbeForTests(scenario);
+      const serialized = JSON.stringify(result);
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN"
+      );
+      for (const forbidden of [
+        "fixed-private-unknown-failure",
+        "MIGRATION_FINAL",
+        "credential://",
+        "127.0.0.1",
+        "5432",
+        "private_db",
+        "SELECT private_role",
+        "private_catalog",
+        "stack",
+        "cause",
+      ]) {
+        expect(serialized).not.toContain(forbidden);
+      }
+      expect(Object.keys(result).sort()).toEqual(transcriptKeys);
+    }
+  });
+
+  it("rejects missing, extra, and unknown scenarios before running a probe", async () => {
+    await expect(
+      Reflect.apply(runExternalFixturePhaseProbeForTests, undefined, [])
+    ).rejects.toThrow("EXTERNAL_FIXTURE_PHASE_PROBE_INVALID");
+    await expect(
+      Reflect.apply(runExternalFixturePhaseProbeForTests, undefined, [
+        "success",
+        "unexpected-extra-argument",
+      ])
+    ).rejects.toThrow("EXTERNAL_FIXTURE_PHASE_PROBE_INVALID");
+    await expect(
+      runExternalFixturePhaseProbeForTests("unknown-scenario-name")
+    ).rejects.toThrow("EXTERNAL_FIXTURE_PHASE_PROBE_INVALID");
+  });
+
+  it("keeps the intentional PUBLIC-ACL rejection inside its successful control", async () => {
+    const expected = externalFixturePublicSuccessOracle;
+    const result = await runExternalFixturePhaseProbeForTests(
+      "intentional-public-acl-negative-control"
+    );
+
+    expect(result).toMatchObject({
+      failureMarker: null,
+      exitCode: 0,
+      stderr: "",
+      publicResult: expected,
+      phaseTrace: ["MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL"],
+      phaseStartCount: 1,
+      targetHitCount: 0,
+      operationStartCount: 1,
+      postflightStartCount: 0,
+      activeClientCount: 0,
+      probeStateRemoved: true,
+    });
+    expect(result.stdout).toBe(`${JSON.stringify(expected)}\n`);
+  });
+
+  it("bounds timeout cleanup to the owned client and leaves unrelated state intact", async () => {
+    const beforeUnhandled = process.listenerCount("unhandledRejection");
+    const beforeUncaught = process.listenerCount("uncaughtException");
+    const unhandled: unknown[] = [];
+    const unhandledListener = (error: unknown) => unhandled.push(error);
+    process.on("unhandledRejection", unhandledListener);
+    try {
+      const result = await runExternalFixturePhaseProbeForTests(
+        "fixture-identity-timeout"
+      );
+
+      expect(result).toMatchObject({
+        failureMarker:
+          "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_IDENTITY",
+        exitCode: 1,
+        stdout: "",
+        stderr:
+          "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_IDENTITY\n",
+        phaseTrace: ["FIXTURE_IDENTITY"],
+        phaseStartCount: 1,
+        targetHitCount: 0,
+        operationStartCount: 1,
+        postflightStartCount: 0,
+        targetConnectCount: 1,
+        targetQueryCount: 1,
+        targetEndCount: 0,
+        targetDestroyCount: 1,
+        unrelatedDestroyCount: 0,
+        activeClientCount: 0,
+        probeStateRemoved: true,
+      });
+      await Promise.resolve();
+      expect(unhandled).toEqual([]);
+      expect(process.listenerCount("uncaughtException")).toBe(beforeUncaught);
+    } finally {
+      process.off("unhandledRejection", unhandledListener);
+    }
+    expect(process.listenerCount("unhandledRejection")).toBe(beforeUnhandled);
+    expect(process.listenerCount("uncaughtException")).toBe(beforeUncaught);
+  });
+
+  it("isolates concurrent probe contexts without marker or trace crossover", async () => {
+    const [identity, revoke] = await Promise.all([
+      runExternalFixturePhaseProbeForTests("fixture-identity-rejects"),
+      runExternalFixturePhaseProbeForTests("bounded-revoke-rejects"),
+    ]);
+
+    expect(identity).toMatchObject({
+      failureMarker:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_IDENTITY",
+      phaseTrace: [
+        "FIXTURE_CLIENT_CONNECT",
+        "FIXTURE_IDENTITY",
+        "FIXTURE_CLIENT_CLOSE",
+      ],
+      targetHitCount: 1,
+      probeStateRemoved: true,
+    });
+    expect(revoke).toMatchObject({
+      failureMarker:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_BOUNDED_REVOKE",
+      phaseTrace: [
+        ...externalFixtureProductionPhaseOrder.slice(0, 30),
+        "CANONICAL_CLIENT_CLOSE",
+      ],
+      targetHitCount: 1,
+      probeStateRemoved: true,
+    });
+    expect(identity.stderr).not.toContain("BOUNDED_REVOKE");
+    expect(revoke.stderr).not.toContain("FIXTURE_IDENTITY");
+  });
+
+  it("removes probe state after success, failure, close failure, and timeout", async () => {
+    for (const scenario of [
+      "success",
+      "fixture-identity-rejects",
+      "canonical-close-only",
+      "fixture-identity-timeout",
+    ]) {
+      const result = await runExternalFixturePhaseProbeForTests(scenario);
+      expect(result.probeStateRemoved).toBe(true);
+      expect(result.activeClientCount).toBe(0);
+    }
+  });
+
+  it("routes a fixed scenario through the actual exported production harness path", async () => {
+    const result = await runExternalFixturePhaseProbeForTests(
+      "production-fixture-client-connect-path"
+    );
+
+    expect(result).toMatchObject({
+      failureMarker:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_CLIENT_CONNECT",
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_FIXTURE_CLIENT_CONNECT\n",
+      phaseTrace: ["FIXTURE_CLIENT_CONNECT"],
+      phaseStartCount: 1,
+      targetHitCount: 1,
+      operationStartCount: 1,
+      postflightStartCount: 0,
+      connectionFactoryCallCount: 1,
+      targetConnectCount: 1,
+      targetEndCount: 1,
+      activeClientCount: 0,
+      probeStateRemoved: true,
+    });
+  });
+
+  it("binds every non-UNKNOWN phase wrapper to the production operation graph", async () => {
+    const source = await readFile(postgresHarnessModule, "utf8");
+    const productionSource = sourceSection(
+      source,
+      "const EXTERNAL_FIXTURE_PHASES = Object.freeze({",
+      "const INTERNAL_PHASE_PROBE_SCENARIOS = Object.freeze({"
+    );
+    const exactProductionOccurrences = Object.freeze({
+      runFixtureClientConnectPhase: 2,
+      runFixtureIdentityPhase: 2,
+      runFixtureLedgerSetupPhase: 2,
+      runExtensionInventoryPhase: 2,
+      runFixtureClientClosePhase: 2,
+      runPreflightStabilityPhase: 2,
+      runSnapshotDriftControlPhase: 2,
+      runExtensionClassificationPhase: 2,
+      runPreMutationClientConnectPhase: 2,
+      runPreMutationIdentityPhase: 2,
+      runDefaultPrivilegeRevokePhase: 2,
+      runFixtureRoleSetupPhase: 3,
+      runMigrationBoundaryIdentityPhase: 2,
+      runMigrationBaselinePhase: 2,
+      runMigrationPublicAclNegativeControlPhase: 2,
+      runMigrationFinalPhase: 2,
+      runMigrationReplayPhase: 2,
+      runMigrationPostconditionsPhase: 4,
+      runMigrationClientClosePhase: 2,
+      runTransactionRollbackControlPhase: 2,
+      runCleanupClientConnectPhase: 2,
+      runCleanupIdentityPhase: 2,
+      runOwnershipPreInventoryPhase: 2,
+      runOwnershipCanonicalizationPhase: 2,
+      runOwnershipPostSnapshotPhase: 2,
+      runAuthorityPreInventoryPhase: 2,
+      runBoundedRevokePhase: 2,
+      runAuthorityZeroResiduePhase: 2,
+      runMaintenanceOwnerSnapshotPhase: 2,
+      runCanonicalClientClosePhase: 2,
+      runPostflightPhase: 2,
+      runPostflightDriftPhase: 2,
+    });
+    for (const [wrapper, expectedCount] of Object.entries(
+      exactProductionOccurrences
+    )) {
+      expect(literalOccurrenceCount(productionSource, `${wrapper}(`)).toBe(
+        expectedCount
+      );
+    }
+
+    const withClientSection = sourceSection(
+      productionSource,
+      "async function withClient(",
+      "function fixtureCredentials("
+    );
+    expect(withClientSection).toMatch(
+      /INITIAL_FIXTURE_CLIENT_LIFECYCLE[\s\S]{0,120}runFixtureClientConnectPhase\(context, openOperation\)/
+    );
+    expect(withClientSection).toMatch(
+      /MIGRATION_CLIENT_LIFECYCLE[\s\S]{0,120}runPreMutationClientConnectPhase\(context, openOperation\)/
+    );
+    expect(withClientSection).toMatch(
+      /CANONICAL_CLEANUP_CLIENT_LIFECYCLE[\s\S]{0,120}runCleanupClientConnectPhase\(context, openOperation\)/
+    );
+    expect(withClientSection).toMatch(
+      /INITIAL_FIXTURE_CLIENT_LIFECYCLE[\s\S]{0,160}runFixtureClientClosePhase\(context,[\s\S]{0,80}closeOwnedClient\(context, ownedClient\)/
+    );
+    expect(withClientSection).toMatch(
+      /MIGRATION_CLIENT_LIFECYCLE[\s\S]{0,160}runMigrationClientClosePhase\(context,[\s\S]{0,80}closeOwnedClient\(context, ownedClient\)/
+    );
+    expect(withClientSection).toMatch(
+      /CANONICAL_CLEANUP_CLIENT_LIFECYCLE[\s\S]{0,160}runCanonicalClientClosePhase\(context,[\s\S]{0,80}closeOwnedClient\(context, ownedClient\)/
+    );
+    expect(withClientSection).toMatch(
+      /if \(primaryFailed\) throw primaryFailure;\s*if \(closeFailed\) throw closeFailure;/
+    );
+
+    const preMutationSection = sourceSection(
+      productionSource,
+      "async function runPreMutationSessionIdentityBoundary({",
+      "function validateInitialMigrationBoundaryRoles("
+    );
+    expect(preMutationSection).toMatch(
+      /runPreMutationIdentityPhase\([\s\S]{0,180}observeSessionIdentity\(/
+    );
+    expect(preMutationSection).toMatch(/MIGRATION_CLIENT_LIFECYCLE/);
+
+    const migrationSection = sourceSection(
+      productionSource,
+      "async function orchestrateUsageMigrationOwnerBoundary({",
+      "function usageSignatureArraySql("
+    );
+    for (const binding of [
+      /runFixtureRoleSetupPhase\([\s\S]{0,100}createUsageFixtureRoles\(/,
+      /runMigrationBoundaryIdentityPhase\([\s\S]{0,180}assertInitialMigrationBoundaryRoles\(/,
+      /runFixtureRoleSetupPhase\([\s\S]{0,100}grantUsageMigrationPrivileges\(/,
+      /runMigrationBaselinePhase\([\s\S]{0,220}runMigrationCallback\([\s\S]{0,80}"baseline"/,
+      /runMigrationPublicAclNegativeControlPhase\([\s\S]{0,100}beforeFinalMigration\(/,
+      /runMigrationFinalPhase\([\s\S]{0,220}runMigrationCallback\(context, client, "final"/,
+      /runMigrationReplayPhase\([\s\S]{0,220}runMigrationCallback\(context, client, "replay"/,
+      /runMigrationPostconditionsPhase\([\s\S]{0,120}assertUsageOwnerPostcondition\(/,
+      /runDefaultPrivilegeRevokePhase\([\s\S]{0,120}client\.query\(/,
+      /runMigrationPostconditionsPhase\([\s\S]{0,160}verifyUsageAclInheritance\(/,
+    ]) {
+      expect(migrationSection).toMatch(binding);
+    }
+
+    const canonicalSection = sourceSection(
+      productionSource,
+      "async function runCanonicalOwnershipBoundary({",
+      "async function configureRuntimeAcl("
+    );
+    for (const binding of [
+      /runCleanupIdentityPhase\([\s\S]{0,120}observeSessionIdentity\(/,
+      /runOwnershipPreInventoryPhase\([\s\S]{0,100}assertPreCanonicalOwnershipInventory\(/,
+      /runOwnershipCanonicalizationPhase\([\s\S]{0,100}canonicalizeFixtureOwnership\(/,
+      /runOwnershipPostSnapshotPhase\([\s\S]{0,100}assertPostCanonicalOwnershipSnapshot\(/,
+      /runAuthorityPreInventoryPhase\([\s\S]{0,140}assertPreCleanupTemporaryAuthorityInventory\(/,
+      /runBoundedRevokePhase\([\s\S]{0,100}revokeTemporaryMigrationAuthorities\(/,
+      /runAuthorityZeroResiduePhase\([\s\S]{0,100}assertZeroTemporaryAuthorityResidue\(/,
+      /runMaintenanceOwnerSnapshotPhase\([\s\S]{0,100}assertPostCanonicalOwnershipSnapshot\(/,
+      /CANONICAL_CLEANUP_CLIENT_LIFECYCLE/,
+      /runPostflightPhase\(context, postflightOperation\)/,
+    ]) {
+      expect(canonicalSection).toMatch(binding);
+    }
+
+    const connectionHarnessSection = sourceSection(
+      productionSource,
+      "async function runConnectionOnlyHarnessWithinContext(options, context)",
+      "export async function runConnectionOnlyHarness(options = {})"
+    );
+    for (const binding of [
+      /runFixtureIdentityPhase\([\s\S]{0,100}assertFixtureIdentity\(/,
+      /runFixtureLedgerSetupPhase\([\s\S]{0,100}createEmptyMigrationLedger\(/,
+      /runExtensionInventoryPhase\([\s\S]{0,100}verifyIndependentExtensionInventory\(/,
+      /INITIAL_FIXTURE_CLIENT_LIFECYCLE/,
+      /runPreflightStabilityPhase\([\s\S]{0,180}runStablePreflight\(/,
+      /runSnapshotDriftControlPhase\([\s\S]{0,180}runStablePreflight\(/,
+      /runExtensionClassificationPhase\([\s\S]{0,120}verifyExtensionClassificationMatrix\(/,
+      /runTransactionRollbackControlPhase\([\s\S]{0,120}verifyTransactionRollback\(/,
+      /runCanonicalOwnershipBoundary\([\s\S]{0,500}runPostflight\(/,
+      /runPostflightDriftPhase\([\s\S]{0,500}runPostflight\(/,
+    ]) {
+      expect(connectionHarnessSection).toMatch(binding);
+    }
+
+    expect(productionSource).not.toContain("PREFLIGHT_INITIAL");
+    expect(
+      literalOccurrenceCount(
+        productionSource,
+        "const EXTERNAL_FIXTURE_PHASE_MARKERS = Object.freeze({"
+      )
+    ).toBe(1);
+
+    const probeEntrySection = sourceSection(
+      source,
+      "export async function runExternalFixturePhaseProbeForTests(scenario)",
+      "const DEADLINE_PROBE_SCENARIOS = new Set(["
+    );
+    expect(probeEntrySection).toMatch(
+      /requireHarness\([\s\S]{0,180}arguments\.length === 1[\s\S]{0,180}INTERNAL_PHASE_PROBE_SCENARIOS/
+    );
+    expect(probeEntrySection.indexOf("requireHarness(")).toBeLessThan(
+      probeEntrySection.indexOf("const specification")
+    );
+    expect(probeEntrySection.indexOf("const specification")).toBeLessThan(
+      probeEntrySection.indexOf("createDeadlineContext(")
+    );
+    expect(probeEntrySection).not.toMatch(
+      /process\.env|process\.argv|callerPhase|callerMarker|callbackScenario/
+    );
+
+    const directInvocationSection = source.slice(
+      source.indexOf("const invokedDirectly =")
+    );
+    expect(directInvocationSection).toMatch(
+      /if \(invokedDirectly\) \{\s*try \{[\s\S]*?const result = await runConnectionOnlyHarness\(\);[\s\S]*?process\.stdout\.write\(`\$\{JSON\.stringify\(result\)\}\\n`\);\s*\} catch \(error\) \{\s*const marker = externalFixtureFailureMarker\(error\);\s*process\.stderr\.write\(`\$\{marker\}\\n`\);\s*process\.exitCode = 1;\s*\}\s*\}/
+    );
+    expect(
+      literalOccurrenceCount(
+        directInvocationSection,
+        "externalFixtureFailureMarker(error)"
+      )
+    ).toBe(1);
+    expect(
+      literalOccurrenceCount(directInvocationSection, "process.stderr.write(")
+    ).toBe(1);
   });
 });
 
