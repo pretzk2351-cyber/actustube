@@ -156,10 +156,262 @@ const externalFixturePhaseMarkerOracle = Object.freeze([
     marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY",
   }),
   Object.freeze({
-    scenario: "migration-postconditions-rejects",
-    phase: "MIGRATION_POSTCONDITIONS",
+    scenario: "migration-final-owner-postcondition-failure",
+    phase: "MIGRATION_FINAL_OWNER_POSTCONDITION",
     marker:
-      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS",
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL_OWNER_POSTCONDITION",
+  }),
+  Object.freeze({
+    scenario: "migration-replay-owner-postcondition-failure",
+    phase: "MIGRATION_REPLAY_OWNER_POSTCONDITION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY_OWNER_POSTCONDITION",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-acl-inheritance-failure",
+    phase: "MIGRATION_USAGE_ACL_INHERITANCE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_ACL_INHERITANCE",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-owner-postcondition-failure",
+    phase: "MIGRATION_USAGE_OWNER_POSTCONDITION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_OWNER_POSTCONDITION",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-owner-inheritance-failure",
+    phase: "MIGRATION_USAGE_OWNER_INHERITANCE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_OWNER_INHERITANCE",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-legacy-acl-preservation-failure",
+    phase: "MIGRATION_USAGE_LEGACY_ACL_PRESERVATION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_LEGACY_ACL_PRESERVATION",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-acl-comparison-failure",
+    phase: "MIGRATION_USAGE_ACL_COMPARISON",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_ACL_COMPARISON",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-explicit-runtime-privilege-failure",
+    phase: "MIGRATION_USAGE_EXPLICIT_RUNTIME_PRIVILEGE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_PRIVILEGE",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-membership-runtime-privilege-failure",
+    phase: "MIGRATION_USAGE_MEMBERSHIP_RUNTIME_PRIVILEGE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_MEMBERSHIP_RUNTIME_PRIVILEGE",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-denied-runtime-privilege-failure",
+    phase: "MIGRATION_USAGE_DENIED_RUNTIME_PRIVILEGE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_DENIED_RUNTIME_PRIVILEGE",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-public-runtime-privilege-failure",
+    phase: "MIGRATION_USAGE_PUBLIC_RUNTIME_PRIVILEGE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_PUBLIC_RUNTIME_PRIVILEGE",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-security-mode-failure",
+    phase: "MIGRATION_USAGE_SECURITY_MODE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_SECURITY_MODE",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-search-path-failure",
+    phase: "MIGRATION_USAGE_SEARCH_PATH",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_SEARCH_PATH",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-explicit-runtime-execution-failure",
+    phase: "MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-membership-runtime-execution-failure",
+    phase: "MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-denied-runtime-execution-failure",
+    phase: "MIGRATION_USAGE_DENIED_RUNTIME_EXECUTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_DENIED_RUNTIME_EXECUTION",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-public-runtime-execution-failure",
+    phase: "MIGRATION_USAGE_PUBLIC_RUNTIME_EXECUTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_PUBLIC_RUNTIME_EXECUTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-resolution-failure",
+    phase: "MIGRATION_PLAN_RESOLUTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_RESOLUTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-free-fallback-failure",
+    phase: "MIGRATION_PLAN_FREE_FALLBACK",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_FREE_FALLBACK",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-inactive-fallback-failure",
+    phase: "MIGRATION_PLAN_INACTIVE_FALLBACK",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_INACTIVE_FALLBACK",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-future-assignment-rejection",
+    phase: "MIGRATION_PLAN_FUTURE_ASSIGNMENT_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_FUTURE_ASSIGNMENT_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-expired-assignment-rejection",
+    phase: "MIGRATION_PLAN_EXPIRED_ASSIGNMENT_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_EXPIRED_ASSIGNMENT_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-unknown-reference-rejection",
+    phase: "MIGRATION_PLAN_UNKNOWN_REFERENCE_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_UNKNOWN_REFERENCE_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-duplicate-assignment-rejection",
+    phase: "MIGRATION_PLAN_DUPLICATE_ASSIGNMENT_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_DUPLICATE_ASSIGNMENT_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-missing-baseline-rejection",
+    phase: "MIGRATION_PLAN_MISSING_BASELINE_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_MISSING_BASELINE_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-duplicate-baseline-rejection",
+    phase: "MIGRATION_PLAN_DUPLICATE_BASELINE_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_DUPLICATE_BASELINE_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-inactive-baseline-rejection",
+    phase: "MIGRATION_PLAN_INACTIVE_BASELINE_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_INACTIVE_BASELINE_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-limit-mismatch-rejection",
+    phase: "MIGRATION_PLAN_LIMIT_MISMATCH_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_LIMIT_MISMATCH_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-plan-invalid-limit-rejection",
+    phase: "MIGRATION_PLAN_INVALID_LIMIT_REJECTION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_INVALID_LIMIT_REJECTION",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-lifecycle-failure",
+    phase: "MIGRATION_RESERVATION_LIFECYCLE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_LIFECYCLE",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-concurrency-setup-failure",
+    phase: "MIGRATION_RESERVATION_CONCURRENCY_SETUP",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENCY_SETUP",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-concurrent-limit-failure",
+    phase: "MIGRATION_RESERVATION_CONCURRENT_LIMIT",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENT_LIMIT",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-bucket-postcondition-failure",
+    phase: "MIGRATION_RESERVATION_BUCKET_POSTCONDITION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_BUCKET_POSTCONDITION",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-concurrency-cleanup-failure",
+    phase: "MIGRATION_RESERVATION_CONCURRENCY_CLEANUP",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENCY_CLEANUP",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-release-setup-failure",
+    phase: "MIGRATION_RESERVATION_RELEASE_SETUP",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_RELEASE_SETUP",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-release-create-failure",
+    phase: "MIGRATION_RESERVATION_RELEASE_CREATE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_RELEASE_CREATE",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-release-idempotency-failure",
+    phase: "MIGRATION_RESERVATION_RELEASE_IDEMPOTENCY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_RELEASE_IDEMPOTENCY",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-finalization-create-failure",
+    phase: "MIGRATION_RESERVATION_FINALIZATION_CREATE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_FINALIZATION_CREATE",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-finalization-failure",
+    phase: "MIGRATION_RESERVATION_FINALIZATION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_FINALIZATION",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-stale-setup-failure",
+    phase: "MIGRATION_RESERVATION_STALE_SETUP",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_STALE_SETUP",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-stale-recovery-failure",
+    phase: "MIGRATION_RESERVATION_STALE_RECOVERY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_STALE_RECOVERY",
+  }),
+  Object.freeze({
+    scenario: "migration-reservation-lifecycle-cleanup-failure",
+    phase: "MIGRATION_RESERVATION_LIFECYCLE_CLEANUP",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_LIFECYCLE_CLEANUP",
+  }),
+  Object.freeze({
+    scenario: "migration-runtime-acl-configuration-failure",
+    phase: "MIGRATION_RUNTIME_ACL_CONFIGURATION",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RUNTIME_ACL_CONFIGURATION",
   }),
   Object.freeze({
     scenario: "migration-client-close-rejects",
@@ -261,11 +513,51 @@ const externalFixtureProductionPhaseOrder = Object.freeze([
   "MIGRATION_BASELINE",
   "MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL",
   "MIGRATION_FINAL",
-  "MIGRATION_POSTCONDITIONS",
+  "MIGRATION_FINAL_OWNER_POSTCONDITION",
   "MIGRATION_REPLAY",
-  "MIGRATION_POSTCONDITIONS",
+  "MIGRATION_REPLAY_OWNER_POSTCONDITION",
   "MIGRATION_CLIENT_CLOSE",
-  "MIGRATION_POSTCONDITIONS",
+  "MIGRATION_USAGE_ACL_INHERITANCE",
+  "MIGRATION_USAGE_OWNER_POSTCONDITION",
+  "MIGRATION_USAGE_OWNER_INHERITANCE",
+  "MIGRATION_USAGE_LEGACY_ACL_PRESERVATION",
+  "MIGRATION_USAGE_ACL_COMPARISON",
+  "MIGRATION_USAGE_EXPLICIT_RUNTIME_PRIVILEGE",
+  "MIGRATION_USAGE_MEMBERSHIP_RUNTIME_PRIVILEGE",
+  "MIGRATION_USAGE_DENIED_RUNTIME_PRIVILEGE",
+  "MIGRATION_USAGE_PUBLIC_RUNTIME_PRIVILEGE",
+  "MIGRATION_USAGE_SECURITY_MODE",
+  "MIGRATION_USAGE_SEARCH_PATH",
+  "MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+  "MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+  "MIGRATION_USAGE_DENIED_RUNTIME_EXECUTION",
+  "MIGRATION_USAGE_PUBLIC_RUNTIME_EXECUTION",
+  "MIGRATION_PLAN_RESOLUTION",
+  "MIGRATION_PLAN_FREE_FALLBACK",
+  "MIGRATION_PLAN_INACTIVE_FALLBACK",
+  "MIGRATION_PLAN_FUTURE_ASSIGNMENT_REJECTION",
+  "MIGRATION_PLAN_EXPIRED_ASSIGNMENT_REJECTION",
+  "MIGRATION_PLAN_UNKNOWN_REFERENCE_REJECTION",
+  "MIGRATION_PLAN_DUPLICATE_ASSIGNMENT_REJECTION",
+  "MIGRATION_PLAN_MISSING_BASELINE_REJECTION",
+  "MIGRATION_PLAN_DUPLICATE_BASELINE_REJECTION",
+  "MIGRATION_PLAN_INACTIVE_BASELINE_REJECTION",
+  "MIGRATION_PLAN_LIMIT_MISMATCH_REJECTION",
+  "MIGRATION_PLAN_INVALID_LIMIT_REJECTION",
+  "MIGRATION_RESERVATION_LIFECYCLE",
+  "MIGRATION_RESERVATION_CONCURRENCY_SETUP",
+  "MIGRATION_RESERVATION_CONCURRENT_LIMIT",
+  "MIGRATION_RESERVATION_BUCKET_POSTCONDITION",
+  "MIGRATION_RESERVATION_CONCURRENCY_CLEANUP",
+  "MIGRATION_RESERVATION_RELEASE_SETUP",
+  "MIGRATION_RESERVATION_RELEASE_CREATE",
+  "MIGRATION_RESERVATION_RELEASE_IDEMPOTENCY",
+  "MIGRATION_RESERVATION_FINALIZATION_CREATE",
+  "MIGRATION_RESERVATION_FINALIZATION",
+  "MIGRATION_RESERVATION_STALE_SETUP",
+  "MIGRATION_RESERVATION_STALE_RECOVERY",
+  "MIGRATION_RESERVATION_LIFECYCLE_CLEANUP",
+  "MIGRATION_RUNTIME_ACL_CONFIGURATION",
   "TRANSACTION_ROLLBACK_CONTROL",
   "CLEANUP_CLIENT_CONNECT",
   "CLEANUP_IDENTITY",
@@ -309,6 +601,10 @@ const externalFixtureUnknownMarkerOracle = Object.freeze([
   }),
   Object.freeze({
     scenario: "forged-known-marker-message",
+    marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
+  }),
+  Object.freeze({
+    scenario: "old-broad-marker-message",
     marker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
   }),
   Object.freeze({
@@ -5904,21 +6200,21 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
   ].sort();
 
   it("keeps the independent literal oracle complete and duplicate-free", () => {
-    expect(externalFixturePhaseMarkerOracle).toHaveLength(32);
+    expect(externalFixturePhaseMarkerOracle).toHaveLength(74);
     expect(
       new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.scenario)).size
-    ).toBe(32);
+    ).toBe(74);
     expect(
       new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.phase)).size
-    ).toBe(32);
+    ).toBe(74);
     expect(
       new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.marker)).size
-    ).toBe(32);
-    expect(externalFixtureUnknownMarkerOracle).toHaveLength(4);
+    ).toBe(74);
+    expect(externalFixtureUnknownMarkerOracle).toHaveLength(5);
     expect(
       new Set(externalFixtureUnknownMarkerOracle.map((entry) => entry.scenario))
         .size
-    ).toBe(4);
+    ).toBe(5);
     expect(
       externalFixturePhaseMarkerOracle.some(
         (entry) => entry.phase === "FIXTURE_LEDGER_SETUP"
@@ -5927,6 +6223,46 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
     const oraclePhases: readonly string[] =
       externalFixturePhaseMarkerOracle.map((entry) => entry.phase);
     expect(oraclePhases).not.toContain("PREFLIGHT_INITIAL");
+    expect(oraclePhases).not.toContain("MIGRATION_POSTCONDITIONS");
+  });
+
+  it("maps the migration postcondition subphase matrix without marker swaps", async () => {
+    const matrix = [
+      [
+        "migration-final-owner-postcondition-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL_OWNER_POSTCONDITION",
+      ],
+      [
+        "migration-replay-owner-postcondition-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY_OWNER_POSTCONDITION",
+      ],
+      [
+        "migration-usage-acl-inheritance-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_ACL_INHERITANCE",
+      ],
+      [
+        "migration-plan-resolution-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_RESOLUTION",
+      ],
+      [
+        "migration-reservation-lifecycle-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_LIFECYCLE",
+      ],
+      [
+        "migration-runtime-acl-configuration-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RUNTIME_ACL_CONFIGURATION",
+      ],
+    ] as const;
+    const observedMarkers: string[] = [];
+    for (const [scenario, expectedMarker] of matrix) {
+      const result = await runExternalFixturePhaseProbeForTests(scenario);
+      expect(result.failureMarker).toBe(expectedMarker);
+      expect(result.stderr).toBe(`${expectedMarker}\n`);
+      expect(result.stdout).toBe("");
+      expect(result.exitCode).toBe(1);
+      observedMarkers.push(result.failureMarker);
+    }
+    expect(new Set(observedMarkers).size).toBe(matrix.length);
   });
 
   it.each(externalFixturePhaseMarkerOracle)(
@@ -5939,23 +6275,63 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
         0,
         targetIndex + 1
       );
-      if (targetIndex >= 1 && targetIndex <= 3) {
+      const fixtureCloseIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "FIXTURE_CLIENT_CLOSE"
+      );
+      const preMutationConnectIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "PRE_MUTATION_CLIENT_CONNECT"
+      );
+      const migrationCloseIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "MIGRATION_CLIENT_CLOSE"
+      );
+      const usageContainerIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "MIGRATION_USAGE_ACL_INHERITANCE"
+      );
+      const cleanupConnectIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "CLEANUP_CLIENT_CONNECT"
+      );
+      const canonicalCloseIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "CANONICAL_CLIENT_CLOSE"
+      );
+      const probeContainerPhases = [
+        "MIGRATION_USAGE_ACL_INHERITANCE",
+        "MIGRATION_PLAN_RESOLUTION",
+        "MIGRATION_RESERVATION_LIFECYCLE",
+      ];
+      if (targetIndex > 0 && targetIndex < fixtureCloseIndex) {
         expectedTrace.push("FIXTURE_CLIENT_CLOSE");
-      } else if (targetIndex >= 9 && targetIndex <= 19) {
+      } else if (
+        targetIndex > preMutationConnectIndex &&
+        targetIndex < migrationCloseIndex
+      ) {
         expectedTrace.push("MIGRATION_CLIENT_CLOSE");
-      } else if (targetIndex >= 24 && targetIndex <= 31) {
+      } else if (
+        targetIndex > cleanupConnectIndex &&
+        targetIndex < canonicalCloseIndex
+      ) {
         expectedTrace.push("CANONICAL_CLIENT_CLOSE");
       }
       const expectedSkippedOperationCount =
         externalFixtureProductionPhaseOrder
           .slice(0, targetIndex)
-          .filter((candidate) => !actualLifecyclePhases.includes(candidate))
+          .filter(
+            (candidate) =>
+              !actualLifecyclePhases.includes(candidate) &&
+              !probeContainerPhases.includes(candidate)
+          )
           .length;
       const expectedClientCount =
-        targetIndex <= 7 ? 1 : targetIndex <= 22 ? 2 : 3;
-      const expectedOperationStartCount = expectedTrace.filter((candidate) =>
-        actualLifecyclePhases.includes(candidate)
-      ).length;
+        1 +
+        (targetIndex >= preMutationConnectIndex ? 1 : 0) +
+        (targetIndex > usageContainerIndex ? 1 : 0) +
+        (targetIndex >= cleanupConnectIndex ? 1 : 0);
+      const expectedOperationStartCount =
+        expectedTrace.filter((candidate) =>
+          actualLifecyclePhases.includes(candidate)
+        ).length +
+        externalFixtureProductionPhaseOrder
+          .slice(0, targetIndex)
+          .filter((candidate) => probeContainerPhases.includes(candidate)).length;
 
       expect(result.failureMarker).toBe(marker);
       expect(result.exitCode).toBe(1);
@@ -6016,6 +6392,25 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
     }
   );
 
+  it("rejects the retired broad migration postcondition marker message as UNKNOWN", async () => {
+    const result = await runExternalFixturePhaseProbeForTests(
+      "old-broad-marker-message"
+    );
+    expect(result).toMatchObject({
+      failureMarker: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
+      exitCode: 1,
+      stdout: "",
+      stderr: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN\n",
+      phaseTrace: [],
+      phaseStartCount: 0,
+      targetHitCount: 0,
+      operationStartCount: 0,
+      postflightStartCount: 0,
+      activeClientCount: 0,
+      probeStateRemoved: true,
+    });
+  });
+
   it("keeps the public success result unchanged and emits no marker", async () => {
     const expected = externalFixturePublicSuccessOracle;
     const result = await runExternalFixturePhaseProbeForTests("success");
@@ -6028,13 +6423,13 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       phaseTrace: externalFixtureProductionPhaseOrder,
       phaseStartCount: externalFixtureProductionPhaseOrder.length,
       targetHitCount: 0,
-      operationStartCount: 6,
-      skippedOperationCount: 29,
+      operationStartCount: 9,
+      skippedOperationCount: 66,
       postflightStartCount: 2,
-      connectionFactoryCallCount: 3,
-      targetConnectCount: 3,
+      connectionFactoryCallCount: 4,
+      targetConnectCount: 4,
       targetQueryCount: 0,
-      targetEndCount: 3,
+      targetEndCount: 4,
       targetDestroyCount: 0,
       activeClientCount: 0,
       probeStateRemoved: true,
@@ -6049,19 +6444,22 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
     expect(Object.keys(result).sort()).toEqual(transcriptKeys);
   });
 
-  it("preserves the migration-final inner marker through outer wrappers", async () => {
+  it("preserves the final-owner subphase marker through outer wrappers", async () => {
     const result = await runExternalFixturePhaseProbeForTests(
       "migration-final-through-outer-wrappers"
     );
 
     expect(result).toMatchObject({
       failureMarker:
-        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL_OWNER_POSTCONDITION",
       exitCode: 1,
       stdout: "",
       stderr:
-        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL\n",
-      phaseTrace: ["MIGRATION_POSTCONDITIONS", "MIGRATION_FINAL"],
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL_OWNER_POSTCONDITION\n",
+      phaseTrace: [
+        "MIGRATION_USAGE_ACL_INHERITANCE",
+        "MIGRATION_FINAL_OWNER_POSTCONDITION",
+      ],
       phaseStartCount: 2,
       targetHitCount: 1,
       operationStartCount: 1,
@@ -6078,15 +6476,15 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
 
     expect(result).toMatchObject({
       failureMarker:
-        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL_OWNER_POSTCONDITION",
       exitCode: 1,
       stdout: "",
       stderr:
-        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL\n",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL_OWNER_POSTCONDITION\n",
       phaseTrace: [
         "CLEANUP_CLIENT_CONNECT",
-        "MIGRATION_POSTCONDITIONS",
-        "MIGRATION_FINAL",
+        "MIGRATION_USAGE_ACL_INHERITANCE",
+        "MIGRATION_FINAL_OWNER_POSTCONDITION",
         "CANONICAL_CLIENT_CLOSE",
       ],
       phaseStartCount: 4,
@@ -6133,13 +6531,13 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
 
     expect(result).toMatchObject({
       failureMarker:
-        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY_OWNER_POSTCONDITION",
       exitCode: 1,
       stdout: "",
       stderr:
-        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS\n",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY_OWNER_POSTCONDITION\n",
       publicResult: null,
-      phaseTrace: ["MIGRATION_POSTCONDITIONS"],
+      phaseTrace: ["MIGRATION_REPLAY_OWNER_POSTCONDITION"],
       phaseStartCount: 1,
       targetHitCount: 0,
       operationStartCount: 1,
@@ -6148,7 +6546,7 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       activeClientCount: 0,
       probeStateRemoved: true,
     });
-    expect(result.stderr).not.toContain("MIGRATION_FINAL");
+    expect(result.stderr).not.toContain("MIGRATION_FINAL_OWNER_POSTCONDITION");
   });
 
   it("keeps unknown, forgery, and secret-shaped errors fully redacted", async () => {
@@ -6161,6 +6559,7 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       for (const forbidden of [
         "fixed-private-unknown-failure",
         "MIGRATION_FINAL",
+        "MIGRATION_POSTCONDITIONS",
         "credential://",
         "127.0.0.1",
         "5432",
@@ -6275,7 +6674,10 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       failureMarker:
         "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_BOUNDED_REVOKE",
       phaseTrace: [
-        ...externalFixtureProductionPhaseOrder.slice(0, 30),
+        ...externalFixtureProductionPhaseOrder.slice(
+          0,
+          externalFixtureProductionPhaseOrder.indexOf("BOUNDED_REVOKE") + 1
+        ),
         "CANONICAL_CLIENT_CLOSE",
       ],
       targetHitCount: 1,
@@ -6348,7 +6750,41 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       runMigrationPublicAclNegativeControlPhase: 2,
       runMigrationFinalPhase: 2,
       runMigrationReplayPhase: 2,
-      runMigrationPostconditionsPhase: 4,
+      runMigrationFinalOwnerPostconditionPhase: 2,
+      runMigrationReplayOwnerPostconditionPhase: 2,
+      runMigrationUsageAclInheritancePhase: 2,
+      runMigrationUsageOwnerPostconditionPhase: 2,
+      runMigrationUsageOwnerInheritancePhase: 2,
+      runMigrationUsageLegacyAclPreservationPhase: 2,
+      runMigrationUsageAclComparisonPhase: 2,
+      runMigrationUsageExplicitRuntimePrivilegePhase: 2,
+      runMigrationUsageMembershipRuntimePrivilegePhase: 2,
+      runMigrationUsageDeniedRuntimePrivilegePhase: 2,
+      runMigrationUsagePublicRuntimePrivilegePhase: 2,
+      runMigrationUsageSecurityModePhase: 2,
+      runMigrationUsageSearchPathPhase: 2,
+      runMigrationUsageExplicitRuntimeExecutionPhase: 2,
+      runMigrationUsageMembershipRuntimeExecutionPhase: 2,
+      runMigrationUsageDeniedRuntimeExecutionPhase: 2,
+      runMigrationUsagePublicRuntimeExecutionPhase: 2,
+      runMigrationPlanResolutionPhase: 2,
+      runMigrationPlanFreeFallbackPhase: 2,
+      runMigrationPlanInactiveFallbackPhase: 2,
+      runMigrationPlanFailurePhase: 2,
+      runMigrationReservationLifecyclePhase: 2,
+      runMigrationReservationConcurrencySetupPhase: 2,
+      runMigrationReservationConcurrentLimitPhase: 2,
+      runMigrationReservationBucketPostconditionPhase: 2,
+      runMigrationReservationConcurrencyCleanupPhase: 2,
+      runMigrationReservationReleaseSetupPhase: 2,
+      runMigrationReservationReleaseCreatePhase: 2,
+      runMigrationReservationReleaseIdempotencyPhase: 2,
+      runMigrationReservationFinalizationCreatePhase: 2,
+      runMigrationReservationFinalizationPhase: 2,
+      runMigrationReservationStaleSetupPhase: 2,
+      runMigrationReservationStaleRecoveryPhase: 2,
+      runMigrationReservationLifecycleCleanupPhase: 2,
+      runMigrationRuntimeAclConfigurationPhase: 2,
       runMigrationClientClosePhase: 2,
       runTransactionRollbackControlPhase: 2,
       runCleanupClientConnectPhase: 2,
@@ -6422,11 +6858,87 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       /runMigrationPublicAclNegativeControlPhase\([\s\S]{0,100}beforeFinalMigration\(/,
       /runMigrationFinalPhase\([\s\S]{0,220}runMigrationCallback\(context, client, "final"/,
       /runMigrationReplayPhase\([\s\S]{0,220}runMigrationCallback\(context, client, "replay"/,
-      /runMigrationPostconditionsPhase\([\s\S]{0,120}assertUsageOwnerPostcondition\(/,
+      /runMigrationFinalOwnerPostconditionPhase\([\s\S]{0,120}assertUsageOwnerPostcondition\(/,
+      /runMigrationReplayOwnerPostconditionPhase\([\s\S]{0,120}assertUsageOwnerPostcondition\(/,
       /runDefaultPrivilegeRevokePhase\([\s\S]{0,120}client\.query\(/,
-      /runMigrationPostconditionsPhase\([\s\S]{0,160}verifyUsageAclInheritance\(/,
+      /runMigrationUsageAclInheritancePhase\([\s\S]{0,160}verifyUsageAclInheritance\(/,
+      /runMigrationPlanResolutionPhase\([\s\S]{0,120}verifyPlanResolution\(/,
+      /runMigrationReservationLifecyclePhase\([\s\S]{0,140}verifyReservationLifecycle\(/,
+      /runMigrationRuntimeAclConfigurationPhase\([\s\S]{0,220}configureRuntimeAcl\(/,
     ]) {
       expect(migrationSection).toMatch(binding);
+    }
+
+    const usageSubphaseSection = sourceSection(
+      productionSource,
+      "async function verifyUsageAclInheritance(",
+      "async function withRollback("
+    );
+    for (const wrapper of [
+      "runMigrationUsageOwnerPostconditionPhase",
+      "runMigrationUsageOwnerInheritancePhase",
+      "runMigrationUsageLegacyAclPreservationPhase",
+      "runMigrationUsageAclComparisonPhase",
+      "runMigrationUsageExplicitRuntimePrivilegePhase",
+      "runMigrationUsageMembershipRuntimePrivilegePhase",
+      "runMigrationUsageDeniedRuntimePrivilegePhase",
+      "runMigrationUsagePublicRuntimePrivilegePhase",
+      "runMigrationUsageSecurityModePhase",
+      "runMigrationUsageSearchPathPhase",
+      "runMigrationUsageExplicitRuntimeExecutionPhase",
+      "runMigrationUsageMembershipRuntimeExecutionPhase",
+      "runMigrationUsageDeniedRuntimeExecutionPhase",
+      "runMigrationUsagePublicRuntimeExecutionPhase",
+    ]) {
+      expect(literalOccurrenceCount(usageSubphaseSection, `${wrapper}(`)).toBe(1);
+    }
+
+    const planSubphaseSection = sourceSection(
+      productionSource,
+      "async function verifyPlanResolution(",
+      "async function executeFixtureQuery("
+    );
+    expect(planSubphaseSection).toContain("runMigrationPlanFreeFallbackPhase(");
+    expect(planSubphaseSection).toContain("runMigrationPlanInactiveFallbackPhase(");
+    expect(planSubphaseSection).toContain(
+      "runMigrationPlanFailurePhase(context, index"
+    );
+    for (const phase of [
+      "MIGRATION_PLAN_FUTURE_ASSIGNMENT_REJECTION",
+      "MIGRATION_PLAN_EXPIRED_ASSIGNMENT_REJECTION",
+      "MIGRATION_PLAN_UNKNOWN_REFERENCE_REJECTION",
+      "MIGRATION_PLAN_DUPLICATE_ASSIGNMENT_REJECTION",
+      "MIGRATION_PLAN_MISSING_BASELINE_REJECTION",
+      "MIGRATION_PLAN_DUPLICATE_BASELINE_REJECTION",
+      "MIGRATION_PLAN_INACTIVE_BASELINE_REJECTION",
+      "MIGRATION_PLAN_LIMIT_MISMATCH_REJECTION",
+      "MIGRATION_PLAN_INVALID_LIMIT_REJECTION",
+    ]) {
+      expect(literalOccurrenceCount(productionSource, `"${phase}"`)).toBe(1);
+    }
+
+    const reservationSubphaseSection = sourceSection(
+      productionSource,
+      "async function verifyReservationLifecycle(",
+      "async function verifyTransactionRollback("
+    );
+    for (const wrapper of [
+      "runMigrationReservationConcurrencySetupPhase",
+      "runMigrationReservationConcurrentLimitPhase",
+      "runMigrationReservationBucketPostconditionPhase",
+      "runMigrationReservationConcurrencyCleanupPhase",
+      "runMigrationReservationReleaseSetupPhase",
+      "runMigrationReservationReleaseCreatePhase",
+      "runMigrationReservationReleaseIdempotencyPhase",
+      "runMigrationReservationFinalizationCreatePhase",
+      "runMigrationReservationFinalizationPhase",
+      "runMigrationReservationStaleSetupPhase",
+      "runMigrationReservationStaleRecoveryPhase",
+      "runMigrationReservationLifecycleCleanupPhase",
+    ]) {
+      expect(literalOccurrenceCount(reservationSubphaseSection, `${wrapper}(`)).toBe(
+        1
+      );
     }
 
     const canonicalSection = sourceSection(
@@ -6470,6 +6982,16 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
     }
 
     expect(productionSource).not.toContain("PREFLIGHT_INITIAL");
+    expect(productionSource).not.toContain("migrationPostconditions");
+    expect(productionSource).not.toContain(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS"
+    );
+    expect(
+      literalOccurrenceCount(
+        source,
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS"
+      )
+    ).toBe(1);
     expect(
       literalOccurrenceCount(
         productionSource,

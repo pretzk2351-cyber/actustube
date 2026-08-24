@@ -1158,7 +1158,65 @@ const EXTERNAL_FIXTURE_PHASES = Object.freeze({
   migrationPublicAclNegativeControl: "MIGRATION_PUBLIC_ACL_NEGATIVE_CONTROL",
   migrationFinal: "MIGRATION_FINAL",
   migrationReplay: "MIGRATION_REPLAY",
-  migrationPostconditions: "MIGRATION_POSTCONDITIONS",
+  migrationFinalOwnerPostcondition: "MIGRATION_FINAL_OWNER_POSTCONDITION",
+  migrationReplayOwnerPostcondition: "MIGRATION_REPLAY_OWNER_POSTCONDITION",
+  migrationUsageAclInheritance: "MIGRATION_USAGE_ACL_INHERITANCE",
+  migrationUsageOwnerPostcondition: "MIGRATION_USAGE_OWNER_POSTCONDITION",
+  migrationUsageOwnerInheritance: "MIGRATION_USAGE_OWNER_INHERITANCE",
+  migrationUsageLegacyAclPreservation: "MIGRATION_USAGE_LEGACY_ACL_PRESERVATION",
+  migrationUsageAclComparison: "MIGRATION_USAGE_ACL_COMPARISON",
+  migrationUsageExplicitRuntimePrivilege:
+    "MIGRATION_USAGE_EXPLICIT_RUNTIME_PRIVILEGE",
+  migrationUsageMembershipRuntimePrivilege:
+    "MIGRATION_USAGE_MEMBERSHIP_RUNTIME_PRIVILEGE",
+  migrationUsageDeniedRuntimePrivilege: "MIGRATION_USAGE_DENIED_RUNTIME_PRIVILEGE",
+  migrationUsagePublicRuntimePrivilege: "MIGRATION_USAGE_PUBLIC_RUNTIME_PRIVILEGE",
+  migrationUsageSecurityMode: "MIGRATION_USAGE_SECURITY_MODE",
+  migrationUsageSearchPath: "MIGRATION_USAGE_SEARCH_PATH",
+  migrationUsageExplicitRuntimeExecution:
+    "MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+  migrationUsageMembershipRuntimeExecution:
+    "MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+  migrationUsageDeniedRuntimeExecution: "MIGRATION_USAGE_DENIED_RUNTIME_EXECUTION",
+  migrationUsagePublicRuntimeExecution: "MIGRATION_USAGE_PUBLIC_RUNTIME_EXECUTION",
+  migrationPlanResolution: "MIGRATION_PLAN_RESOLUTION",
+  migrationPlanFreeFallback: "MIGRATION_PLAN_FREE_FALLBACK",
+  migrationPlanInactiveFallback: "MIGRATION_PLAN_INACTIVE_FALLBACK",
+  migrationPlanFutureAssignmentRejection:
+    "MIGRATION_PLAN_FUTURE_ASSIGNMENT_REJECTION",
+  migrationPlanExpiredAssignmentRejection:
+    "MIGRATION_PLAN_EXPIRED_ASSIGNMENT_REJECTION",
+  migrationPlanUnknownReferenceRejection:
+    "MIGRATION_PLAN_UNKNOWN_REFERENCE_REJECTION",
+  migrationPlanDuplicateAssignmentRejection:
+    "MIGRATION_PLAN_DUPLICATE_ASSIGNMENT_REJECTION",
+  migrationPlanMissingBaselineRejection:
+    "MIGRATION_PLAN_MISSING_BASELINE_REJECTION",
+  migrationPlanDuplicateBaselineRejection:
+    "MIGRATION_PLAN_DUPLICATE_BASELINE_REJECTION",
+  migrationPlanInactiveBaselineRejection:
+    "MIGRATION_PLAN_INACTIVE_BASELINE_REJECTION",
+  migrationPlanLimitMismatchRejection: "MIGRATION_PLAN_LIMIT_MISMATCH_REJECTION",
+  migrationPlanInvalidLimitRejection: "MIGRATION_PLAN_INVALID_LIMIT_REJECTION",
+  migrationReservationLifecycle: "MIGRATION_RESERVATION_LIFECYCLE",
+  migrationReservationConcurrencySetup: "MIGRATION_RESERVATION_CONCURRENCY_SETUP",
+  migrationReservationConcurrentLimit: "MIGRATION_RESERVATION_CONCURRENT_LIMIT",
+  migrationReservationBucketPostcondition:
+    "MIGRATION_RESERVATION_BUCKET_POSTCONDITION",
+  migrationReservationConcurrencyCleanup:
+    "MIGRATION_RESERVATION_CONCURRENCY_CLEANUP",
+  migrationReservationReleaseSetup: "MIGRATION_RESERVATION_RELEASE_SETUP",
+  migrationReservationReleaseCreate: "MIGRATION_RESERVATION_RELEASE_CREATE",
+  migrationReservationReleaseIdempotency:
+    "MIGRATION_RESERVATION_RELEASE_IDEMPOTENCY",
+  migrationReservationFinalizationCreate:
+    "MIGRATION_RESERVATION_FINALIZATION_CREATE",
+  migrationReservationFinalization: "MIGRATION_RESERVATION_FINALIZATION",
+  migrationReservationStaleSetup: "MIGRATION_RESERVATION_STALE_SETUP",
+  migrationReservationStaleRecovery: "MIGRATION_RESERVATION_STALE_RECOVERY",
+  migrationReservationLifecycleCleanup:
+    "MIGRATION_RESERVATION_LIFECYCLE_CLEANUP",
+  migrationRuntimeAclConfiguration: "MIGRATION_RUNTIME_ACL_CONFIGURATION",
   migrationClientClose: "MIGRATION_CLIENT_CLOSE",
   transactionRollbackControl: "TRANSACTION_ROLLBACK_CONTROL",
   cleanupClientConnect: "CLEANUP_CLIENT_CONNECT",
@@ -1210,8 +1268,92 @@ const EXTERNAL_FIXTURE_PHASE_MARKERS = Object.freeze({
     "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL",
   MIGRATION_REPLAY:
     "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY",
-  MIGRATION_POSTCONDITIONS:
-    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS",
+  MIGRATION_FINAL_OWNER_POSTCONDITION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL_OWNER_POSTCONDITION",
+  MIGRATION_REPLAY_OWNER_POSTCONDITION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY_OWNER_POSTCONDITION",
+  MIGRATION_USAGE_ACL_INHERITANCE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_ACL_INHERITANCE",
+  MIGRATION_USAGE_OWNER_POSTCONDITION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_OWNER_POSTCONDITION",
+  MIGRATION_USAGE_OWNER_INHERITANCE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_OWNER_INHERITANCE",
+  MIGRATION_USAGE_LEGACY_ACL_PRESERVATION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_LEGACY_ACL_PRESERVATION",
+  MIGRATION_USAGE_ACL_COMPARISON:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_ACL_COMPARISON",
+  MIGRATION_USAGE_EXPLICIT_RUNTIME_PRIVILEGE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_PRIVILEGE",
+  MIGRATION_USAGE_MEMBERSHIP_RUNTIME_PRIVILEGE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_MEMBERSHIP_RUNTIME_PRIVILEGE",
+  MIGRATION_USAGE_DENIED_RUNTIME_PRIVILEGE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_DENIED_RUNTIME_PRIVILEGE",
+  MIGRATION_USAGE_PUBLIC_RUNTIME_PRIVILEGE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_PUBLIC_RUNTIME_PRIVILEGE",
+  MIGRATION_USAGE_SECURITY_MODE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_SECURITY_MODE",
+  MIGRATION_USAGE_SEARCH_PATH:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_SEARCH_PATH",
+  MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+  MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+  MIGRATION_USAGE_DENIED_RUNTIME_EXECUTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_DENIED_RUNTIME_EXECUTION",
+  MIGRATION_USAGE_PUBLIC_RUNTIME_EXECUTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_PUBLIC_RUNTIME_EXECUTION",
+  MIGRATION_PLAN_RESOLUTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_RESOLUTION",
+  MIGRATION_PLAN_FREE_FALLBACK:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_FREE_FALLBACK",
+  MIGRATION_PLAN_INACTIVE_FALLBACK:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_INACTIVE_FALLBACK",
+  MIGRATION_PLAN_FUTURE_ASSIGNMENT_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_FUTURE_ASSIGNMENT_REJECTION",
+  MIGRATION_PLAN_EXPIRED_ASSIGNMENT_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_EXPIRED_ASSIGNMENT_REJECTION",
+  MIGRATION_PLAN_UNKNOWN_REFERENCE_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_UNKNOWN_REFERENCE_REJECTION",
+  MIGRATION_PLAN_DUPLICATE_ASSIGNMENT_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_DUPLICATE_ASSIGNMENT_REJECTION",
+  MIGRATION_PLAN_MISSING_BASELINE_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_MISSING_BASELINE_REJECTION",
+  MIGRATION_PLAN_DUPLICATE_BASELINE_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_DUPLICATE_BASELINE_REJECTION",
+  MIGRATION_PLAN_INACTIVE_BASELINE_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_INACTIVE_BASELINE_REJECTION",
+  MIGRATION_PLAN_LIMIT_MISMATCH_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_LIMIT_MISMATCH_REJECTION",
+  MIGRATION_PLAN_INVALID_LIMIT_REJECTION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_PLAN_INVALID_LIMIT_REJECTION",
+  MIGRATION_RESERVATION_LIFECYCLE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_LIFECYCLE",
+  MIGRATION_RESERVATION_CONCURRENCY_SETUP:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENCY_SETUP",
+  MIGRATION_RESERVATION_CONCURRENT_LIMIT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENT_LIMIT",
+  MIGRATION_RESERVATION_BUCKET_POSTCONDITION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_BUCKET_POSTCONDITION",
+  MIGRATION_RESERVATION_CONCURRENCY_CLEANUP:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENCY_CLEANUP",
+  MIGRATION_RESERVATION_RELEASE_SETUP:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_RELEASE_SETUP",
+  MIGRATION_RESERVATION_RELEASE_CREATE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_RELEASE_CREATE",
+  MIGRATION_RESERVATION_RELEASE_IDEMPOTENCY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_RELEASE_IDEMPOTENCY",
+  MIGRATION_RESERVATION_FINALIZATION_CREATE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_FINALIZATION_CREATE",
+  MIGRATION_RESERVATION_FINALIZATION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_FINALIZATION",
+  MIGRATION_RESERVATION_STALE_SETUP:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_STALE_SETUP",
+  MIGRATION_RESERVATION_STALE_RECOVERY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_STALE_RECOVERY",
+  MIGRATION_RESERVATION_LIFECYCLE_CLEANUP:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_LIFECYCLE_CLEANUP",
+  MIGRATION_RUNTIME_ACL_CONFIGURATION:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RUNTIME_ACL_CONFIGURATION",
   MIGRATION_CLIENT_CLOSE:
     "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_CLIENT_CLOSE",
   TRANSACTION_ROLLBACK_CONTROL:
@@ -1242,6 +1384,11 @@ const EXTERNAL_FIXTURE_PHASE_MARKERS = Object.freeze({
     "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_POSTFLIGHT_DRIFT",
   UNKNOWN: "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN",
 });
+const INTERNAL_PHASE_PROBE_CONTAINER_PHASES = new Set([
+  EXTERNAL_FIXTURE_PHASES.migrationUsageAclInheritance,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanResolution,
+  EXTERNAL_FIXTURE_PHASES.migrationReservationLifecycle,
+]);
 const EXTERNAL_FIXTURE_PHASE_FAILURES = new WeakMap();
 const EXTERNAL_FIXTURE_NOT_CONFIGURED_FAILURES = new WeakSet();
 const EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS = new WeakSet();
@@ -1636,6 +1783,7 @@ async function runExternalFixturePhase(context, phase, operation) {
     if (injectFixedProbeFailure) throw INTERNAL_PHASE_PROBE_FAILURE;
     if (
       probeState?.productionGraph === true &&
+      !INTERNAL_PHASE_PROBE_CONTAINER_PHASES.has(fixedPhase) &&
       ![
         EXTERNAL_FIXTURE_PHASES.fixtureClientConnect,
         EXTERNAL_FIXTURE_PHASES.fixtureClientClose,
@@ -1808,10 +1956,298 @@ function runMigrationReplayPhase(context, operation) {
   );
 }
 
-function runMigrationPostconditionsPhase(context, operation) {
-  return runExternalFixturePhase(
+function runFixedMigrationSubphase(context, phase, operation) {
+  return runExternalFixturePhase(context, phase, operation);
+}
+
+function runMigrationFinalOwnerPostconditionPhase(context, operation) {
+  return runFixedMigrationSubphase(
     context,
-    EXTERNAL_FIXTURE_PHASES.migrationPostconditions,
+    EXTERNAL_FIXTURE_PHASES.migrationFinalOwnerPostcondition,
+    operation
+  );
+}
+
+function runMigrationReplayOwnerPostconditionPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReplayOwnerPostcondition,
+    operation
+  );
+}
+
+function runMigrationUsageAclInheritancePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageAclInheritance,
+    operation
+  );
+}
+
+function runMigrationUsageOwnerPostconditionPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageOwnerPostcondition,
+    operation
+  );
+}
+
+function runMigrationUsageOwnerInheritancePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageOwnerInheritance,
+    operation
+  );
+}
+
+function runMigrationUsageLegacyAclPreservationPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageLegacyAclPreservation,
+    operation
+  );
+}
+
+function runMigrationUsageAclComparisonPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageAclComparison,
+    operation
+  );
+}
+
+function runMigrationUsageExplicitRuntimePrivilegePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageExplicitRuntimePrivilege,
+    operation
+  );
+}
+
+function runMigrationUsageMembershipRuntimePrivilegePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageMembershipRuntimePrivilege,
+    operation
+  );
+}
+
+function runMigrationUsageDeniedRuntimePrivilegePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageDeniedRuntimePrivilege,
+    operation
+  );
+}
+
+function runMigrationUsagePublicRuntimePrivilegePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsagePublicRuntimePrivilege,
+    operation
+  );
+}
+
+function runMigrationUsageSecurityModePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageSecurityMode,
+    operation
+  );
+}
+
+function runMigrationUsageSearchPathPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageSearchPath,
+    operation
+  );
+}
+
+function runMigrationUsageExplicitRuntimeExecutionPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageExplicitRuntimeExecution,
+    operation
+  );
+}
+
+function runMigrationUsageMembershipRuntimeExecutionPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageMembershipRuntimeExecution,
+    operation
+  );
+}
+
+function runMigrationUsageDeniedRuntimeExecutionPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageDeniedRuntimeExecution,
+    operation
+  );
+}
+
+function runMigrationUsagePublicRuntimeExecutionPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsagePublicRuntimeExecution,
+    operation
+  );
+}
+
+function runMigrationPlanResolutionPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationPlanResolution,
+    operation
+  );
+}
+
+function runMigrationPlanFreeFallbackPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationPlanFreeFallback,
+    operation
+  );
+}
+
+function runMigrationPlanInactiveFallbackPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationPlanInactiveFallback,
+    operation
+  );
+}
+
+const MIGRATION_PLAN_FAILURE_PHASES = Object.freeze([
+  EXTERNAL_FIXTURE_PHASES.migrationPlanFutureAssignmentRejection,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanExpiredAssignmentRejection,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanUnknownReferenceRejection,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanDuplicateAssignmentRejection,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanMissingBaselineRejection,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanDuplicateBaselineRejection,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanInactiveBaselineRejection,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanLimitMismatchRejection,
+  EXTERNAL_FIXTURE_PHASES.migrationPlanInvalidLimitRejection,
+]);
+
+function runMigrationPlanFailurePhase(context, index, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    MIGRATION_PLAN_FAILURE_PHASES[index],
+    operation
+  );
+}
+
+function runMigrationReservationLifecyclePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationLifecycle,
+    operation
+  );
+}
+
+function runMigrationReservationConcurrencySetupPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencySetup,
+    operation
+  );
+}
+
+function runMigrationReservationConcurrentLimitPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrentLimit,
+    operation
+  );
+}
+
+function runMigrationReservationBucketPostconditionPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationBucketPostcondition,
+    operation
+  );
+}
+
+function runMigrationReservationConcurrencyCleanupPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencyCleanup,
+    operation
+  );
+}
+
+function runMigrationReservationReleaseSetupPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationReleaseSetup,
+    operation
+  );
+}
+
+function runMigrationReservationReleaseCreatePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationReleaseCreate,
+    operation
+  );
+}
+
+function runMigrationReservationReleaseIdempotencyPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationReleaseIdempotency,
+    operation
+  );
+}
+
+function runMigrationReservationFinalizationCreatePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationFinalizationCreate,
+    operation
+  );
+}
+
+function runMigrationReservationFinalizationPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationFinalization,
+    operation
+  );
+}
+
+function runMigrationReservationStaleSetupPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationStaleSetup,
+    operation
+  );
+}
+
+function runMigrationReservationStaleRecoveryPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationStaleRecovery,
+    operation
+  );
+}
+
+function runMigrationReservationLifecycleCleanupPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationLifecycleCleanup,
+    operation
+  );
+}
+
+function runMigrationRuntimeAclConfigurationPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationRuntimeAclConfiguration,
     operation
   );
 }
@@ -3722,7 +4158,7 @@ async function orchestrateUsageMigrationOwnerBoundary({
       await runMigrationCallback(context, client, "final", finalMigration);
     })
   );
-  await runMigrationPostconditionsPhase(context, () =>
+  await runMigrationFinalOwnerPostconditionPhase(context, () =>
     assertUsageOwnerPostcondition(client, expectedSessionRole)
   );
   await runMigrationReplayPhase(context, () =>
@@ -3731,7 +4167,7 @@ async function orchestrateUsageMigrationOwnerBoundary({
       await runMigrationCallback(context, client, "replay", replayMigration);
     })
   );
-  await runMigrationPostconditionsPhase(context, () =>
+  await runMigrationReplayOwnerPostconditionPhase(context, () =>
     assertUsageOwnerPostcondition(client, expectedSessionRole)
   );
   return Object.freeze({ beforeFinalResult });
@@ -3853,23 +4289,29 @@ async function applyMigrationsAndRuntimeAcl(
   if (internalProbeState) {
     internalProbeState.laterVerificationStubInvocations += 1;
   } else {
-    await runMigrationPostconditionsPhase(context, async () => {
-      await verifyUsageAclInheritance(
+    await runMigrationUsageAclInheritancePhase(context, () =>
+      verifyUsageAclInheritance(
         context,
         clientFactory,
         configuration,
         legacyAclHash,
         configuration.role
-      );
-      await verifyPlanResolution(context, clientFactory, configuration);
-      await verifyReservationLifecycle(context, clientFactory, configuration);
-      await withClient(
+      )
+    );
+    await runMigrationPlanResolutionPhase(context, () =>
+      verifyPlanResolution(context, clientFactory, configuration)
+    );
+    await runMigrationReservationLifecyclePhase(context, () =>
+      verifyReservationLifecycle(context, clientFactory, configuration)
+    );
+    await runMigrationRuntimeAclConfigurationPhase(context, () =>
+      withClient(
         context,
         clientFactory,
         fixtureCredentials(configuration),
         (client) => configureRuntimeAcl(client, configuration)
-      );
-    });
+      )
+    );
   }
   requireOriginalObservedSessionIdentity(
     identityAuthority,
@@ -3996,173 +4438,199 @@ async function verifyUsageAclInheritance(
     clientFactory,
     fixtureCredentials(configuration),
     async (client) => {
-      await assertUsageOwnerPostcondition(client, expectedSessionRole);
+      await runMigrationUsageOwnerPostconditionPhase(context, () =>
+        assertUsageOwnerPostcondition(client, expectedSessionRole)
+      );
       const targets = usageSignatureArraySql();
-      await catalogBoolean(
-        client,
-        `WITH legacy AS (
-           SELECT proowner FROM pg_catalog.pg_proc
-           WHERE oid = pg_catalog.to_regprocedure($1)
-         )
-         SELECT COUNT(*) = ${VERSIONED_USAGE_SIGNATURES.length}
-           AND bool_and(target.proowner = legacy.proowner) AS matches
-         FROM unnest(ARRAY[${targets}]::text[]) AS signature
-         CROSS JOIN legacy
-         INNER JOIN pg_catalog.pg_proc AS target
-           ON target.oid = pg_catalog.to_regprocedure(signature)`,
-        [LEGACY_USAGE_SIGNATURE]
-      );
-      await catalogBoolean(
-        client,
-        `SELECT pg_catalog.md5(proacl::text) = $2 AS preserved
-         FROM pg_catalog.pg_proc
-         WHERE oid = pg_catalog.to_regprocedure($1)`,
-        [LEGACY_USAGE_SIGNATURE, legacyAclHash]
-      );
-      await catalogBoolean(
-        client,
-        `SELECT bool_and(
-           NOT EXISTS (
-             SELECT acl.grantee, acl.privilege_type, acl.is_grantable
-             FROM pg_catalog.pg_proc AS target
-             CROSS JOIN LATERAL pg_catalog.aclexplode(
-               COALESCE(target.proacl, pg_catalog.acldefault('f', target.proowner))
-             ) AS acl
-             WHERE target.oid = pg_catalog.to_regprocedure(signature)
-               AND acl.grantee <> target.proowner
-             EXCEPT
-             SELECT acl.grantee, acl.privilege_type, acl.is_grantable
-             FROM pg_catalog.pg_proc AS legacy
-             CROSS JOIN LATERAL pg_catalog.aclexplode(
-               COALESCE(legacy.proacl, pg_catalog.acldefault('f', legacy.proowner))
-             ) AS acl
-             WHERE legacy.oid = pg_catalog.to_regprocedure($1)
-               AND acl.grantee <> legacy.proowner
+      await runMigrationUsageOwnerInheritancePhase(context, () =>
+        catalogBoolean(
+          client,
+          `WITH legacy AS (
+             SELECT proowner FROM pg_catalog.pg_proc
+             WHERE oid = pg_catalog.to_regprocedure($1)
            )
-           AND NOT EXISTS (
-             SELECT acl.grantee, acl.privilege_type, acl.is_grantable
-             FROM pg_catalog.pg_proc AS legacy
-             CROSS JOIN LATERAL pg_catalog.aclexplode(
-               COALESCE(legacy.proacl, pg_catalog.acldefault('f', legacy.proowner))
-             ) AS acl
-             WHERE legacy.oid = pg_catalog.to_regprocedure($1)
-               AND acl.grantee <> legacy.proowner
-             EXCEPT
-             SELECT acl.grantee, acl.privilege_type, acl.is_grantable
-             FROM pg_catalog.pg_proc AS target
-             CROSS JOIN LATERAL pg_catalog.aclexplode(
-               COALESCE(target.proacl, pg_catalog.acldefault('f', target.proowner))
-             ) AS acl
-             WHERE target.oid = pg_catalog.to_regprocedure(signature)
-               AND acl.grantee <> target.proowner
-           )
-         ) AS equal
-         FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
-        [LEGACY_USAGE_SIGNATURE]
+           SELECT COUNT(*) = ${VERSIONED_USAGE_SIGNATURES.length}
+             AND bool_and(target.proowner = legacy.proowner) AS matches
+           FROM unnest(ARRAY[${targets}]::text[]) AS signature
+           CROSS JOIN legacy
+           INNER JOIN pg_catalog.pg_proc AS target
+             ON target.oid = pg_catalog.to_regprocedure(signature)`,
+          [LEGACY_USAGE_SIGNATURE]
+        )
       );
-      await catalogBoolean(
-        client,
-        `SELECT bool_and(
-           pg_catalog.has_function_privilege(
-             $1, pg_catalog.to_regprocedure(signature), 'EXECUTE'
-           )
-         ) AS allowed
-         FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
-        [USAGE_FIXTURE_ROLES.explicitRuntime]
+      await runMigrationUsageLegacyAclPreservationPhase(context, () =>
+        catalogBoolean(
+          client,
+          `SELECT pg_catalog.md5(proacl::text) = $2 AS preserved
+           FROM pg_catalog.pg_proc
+           WHERE oid = pg_catalog.to_regprocedure($1)`,
+          [LEGACY_USAGE_SIGNATURE, legacyAclHash]
+        )
       );
-      await catalogBoolean(
-        client,
-        `SELECT bool_and(
-           pg_catalog.has_function_privilege(
-             $1, pg_catalog.to_regprocedure(signature), 'EXECUTE'
-           )
-         ) AS allowed
-         FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
-        [USAGE_FIXTURE_ROLES.membershipRuntime]
-      );
-      for (const deniedRole of [
-        USAGE_FIXTURE_ROLES.deniedRuntime,
-        USAGE_FIXTURE_ROLES.publicProbe,
-      ]) {
-        await catalogBoolean(
+      await runMigrationUsageAclComparisonPhase(context, () =>
+        catalogBoolean(
           client,
           `SELECT bool_and(
-             NOT pg_catalog.has_function_privilege(
+             NOT EXISTS (
+               SELECT acl.grantee, acl.privilege_type, acl.is_grantable
+               FROM pg_catalog.pg_proc AS target
+               CROSS JOIN LATERAL pg_catalog.aclexplode(
+                 COALESCE(target.proacl, pg_catalog.acldefault('f', target.proowner))
+               ) AS acl
+               WHERE target.oid = pg_catalog.to_regprocedure(signature)
+                 AND acl.grantee <> target.proowner
+               EXCEPT
+               SELECT acl.grantee, acl.privilege_type, acl.is_grantable
+               FROM pg_catalog.pg_proc AS legacy
+               CROSS JOIN LATERAL pg_catalog.aclexplode(
+                 COALESCE(legacy.proacl, pg_catalog.acldefault('f', legacy.proowner))
+               ) AS acl
+               WHERE legacy.oid = pg_catalog.to_regprocedure($1)
+                 AND acl.grantee <> legacy.proowner
+             )
+             AND NOT EXISTS (
+               SELECT acl.grantee, acl.privilege_type, acl.is_grantable
+               FROM pg_catalog.pg_proc AS legacy
+               CROSS JOIN LATERAL pg_catalog.aclexplode(
+                 COALESCE(legacy.proacl, pg_catalog.acldefault('f', legacy.proowner))
+               ) AS acl
+               WHERE legacy.oid = pg_catalog.to_regprocedure($1)
+                 AND acl.grantee <> legacy.proowner
+               EXCEPT
+               SELECT acl.grantee, acl.privilege_type, acl.is_grantable
+               FROM pg_catalog.pg_proc AS target
+               CROSS JOIN LATERAL pg_catalog.aclexplode(
+                 COALESCE(target.proacl, pg_catalog.acldefault('f', target.proowner))
+               ) AS acl
+               WHERE target.oid = pg_catalog.to_regprocedure(signature)
+                 AND acl.grantee <> target.proowner
+             )
+           ) AS equal
+           FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
+          [LEGACY_USAGE_SIGNATURE]
+        )
+      );
+      await runMigrationUsageExplicitRuntimePrivilegePhase(context, () =>
+        catalogBoolean(
+          client,
+          `SELECT bool_and(
+             pg_catalog.has_function_privilege(
                $1, pg_catalog.to_regprocedure(signature), 'EXECUTE'
              )
-           ) AS denied
+           ) AS allowed
            FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
-          [deniedRole]
-        );
-      }
-      await catalogBoolean(
-        client,
-        `WITH legacy AS (
-           SELECT prosecdef FROM pg_catalog.pg_proc
-           WHERE oid = pg_catalog.to_regprocedure($1)
-         )
-         SELECT bool_and(target.prosecdef = legacy.prosecdef) AS matches
-         FROM unnest(ARRAY[${targets}]::text[]) AS signature
-         CROSS JOIN legacy
-         INNER JOIN pg_catalog.pg_proc AS target
-           ON target.oid = pg_catalog.to_regprocedure(signature)`,
-        [LEGACY_USAGE_SIGNATURE]
+          [USAGE_FIXTURE_ROLES.explicitRuntime]
+        )
       );
-      await catalogBoolean(
-        client,
-        `SELECT bool_and(
-           procedure.proconfig IS NOT DISTINCT FROM
-             ARRAY['search_path=public, pg_temp']::text[]
-         ) AS fixed
-         FROM unnest(ARRAY[${targets}, '${LEGACY_USAGE_SIGNATURE}']::text[])
-           AS signature
-         INNER JOIN pg_catalog.pg_proc AS procedure
-           ON procedure.oid = pg_catalog.to_regprocedure(signature)`
+      await runMigrationUsageMembershipRuntimePrivilegePhase(context, () =>
+        catalogBoolean(
+          client,
+          `SELECT bool_and(
+             pg_catalog.has_function_privilege(
+               $1, pg_catalog.to_regprocedure(signature), 'EXECUTE'
+             )
+           ) AS allowed
+           FROM unnest(ARRAY[${targets}]::text[]) AS signature`,
+          [USAGE_FIXTURE_ROLES.membershipRuntime]
+        )
+      );
+      const deniedPrivilegeQuery = `SELECT bool_and(
+         NOT pg_catalog.has_function_privilege(
+           $1, pg_catalog.to_regprocedure(signature), 'EXECUTE'
+         )
+       ) AS denied
+       FROM unnest(ARRAY[${targets}]::text[]) AS signature`;
+      await runMigrationUsageDeniedRuntimePrivilegePhase(context, () =>
+        catalogBoolean(client, deniedPrivilegeQuery, [
+          USAGE_FIXTURE_ROLES.deniedRuntime,
+        ])
+      );
+      await runMigrationUsagePublicRuntimePrivilegePhase(context, () =>
+        catalogBoolean(client, deniedPrivilegeQuery, [
+          USAGE_FIXTURE_ROLES.publicProbe,
+        ])
+      );
+      await runMigrationUsageSecurityModePhase(context, () =>
+        catalogBoolean(
+          client,
+          `WITH legacy AS (
+             SELECT prosecdef FROM pg_catalog.pg_proc
+             WHERE oid = pg_catalog.to_regprocedure($1)
+           )
+           SELECT bool_and(target.prosecdef = legacy.prosecdef) AS matches
+           FROM unnest(ARRAY[${targets}]::text[]) AS signature
+           CROSS JOIN legacy
+           INNER JOIN pg_catalog.pg_proc AS target
+             ON target.oid = pg_catalog.to_regprocedure(signature)`,
+          [LEGACY_USAGE_SIGNATURE]
+        )
+      );
+      await runMigrationUsageSearchPathPhase(context, () =>
+        catalogBoolean(
+          client,
+          `SELECT bool_and(
+             procedure.proconfig IS NOT DISTINCT FROM
+               ARRAY['search_path=public, pg_temp']::text[]
+           ) AS fixed
+           FROM unnest(ARRAY[${targets}, '${LEGACY_USAGE_SIGNATURE}']::text[])
+             AS signature
+           INNER JOIN pg_catalog.pg_proc AS procedure
+             ON procedure.oid = pg_catalog.to_regprocedure(signature)`
+        )
       );
     }
   );
 
   const nonExistingUser = "10000000-0000-4000-8000-000000000001";
-  for (const executionRole of [
-    USAGE_FIXTURE_ROLES.explicitRuntime,
-    USAGE_FIXTURE_ROLES.membershipRuntime,
-  ]) {
-    const result = await queryAsUsageRole(
-      context,
-      clientFactory,
-      configuration,
-      executionRole,
-      `SELECT allowed FROM public.reserve_usage_limits_v2(
-         $1::uuid, 1, 'channel_analysis'::public.usage_metric,
-         statement_timestamp()
-       )`,
-      [nonExistingUser]
-    );
-    requireHarness(
-      result.rows?.[0]?.allowed === false,
-      "EXTERNAL_FIXTURE_USAGE_RUNTIME_EXECUTION_MISMATCH"
-    );
-  }
-  for (const deniedRole of [
-    USAGE_FIXTURE_ROLES.deniedRuntime,
-    USAGE_FIXTURE_ROLES.publicProbe,
-  ]) {
-    await expectDatabaseFailure(
-      () =>
-        queryAsUsageRole(
-          context,
-          clientFactory,
-          configuration,
-          deniedRole,
-          `SELECT * FROM public.reserve_usage_limits_v2(
-             $1::uuid, 1, 'channel_analysis'::public.usage_metric,
-             statement_timestamp()
-           )`,
-          [nonExistingUser]
-        ),
-      "42501"
-    );
-  }
+  const executeAllowedRole = (executionRole) => async () => {
+      const result = await queryAsUsageRole(
+        context,
+        clientFactory,
+        configuration,
+        executionRole,
+        `SELECT allowed FROM public.reserve_usage_limits_v2(
+           $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+           statement_timestamp()
+         )`,
+        [nonExistingUser]
+      );
+      requireHarness(
+        result.rows?.[0]?.allowed === false,
+        "EXTERNAL_FIXTURE_USAGE_RUNTIME_EXECUTION_MISMATCH"
+      );
+    };
+  await runMigrationUsageExplicitRuntimeExecutionPhase(
+    context,
+    executeAllowedRole(USAGE_FIXTURE_ROLES.explicitRuntime)
+  );
+  await runMigrationUsageMembershipRuntimeExecutionPhase(
+    context,
+    executeAllowedRole(USAGE_FIXTURE_ROLES.membershipRuntime)
+  );
+  const expectDeniedRole = (deniedRole) => () =>
+      expectDatabaseFailure(
+        () =>
+          queryAsUsageRole(
+            context,
+            clientFactory,
+            configuration,
+            deniedRole,
+            `SELECT * FROM public.reserve_usage_limits_v2(
+               $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+               statement_timestamp()
+             )`,
+            [nonExistingUser]
+          ),
+        "42501"
+      );
+  await runMigrationUsageDeniedRuntimeExecutionPhase(
+    context,
+    expectDeniedRole(USAGE_FIXTURE_ROLES.deniedRuntime)
+  );
+  await runMigrationUsagePublicRuntimeExecutionPhase(
+    context,
+    expectDeniedRole(USAGE_FIXTURE_ROLES.publicProbe)
+  );
 }
 
 async function withRollback(context, clientFactory, configuration, operation) {
@@ -4218,72 +4686,76 @@ async function expectPlanFailureInTransaction(client, userId) {
 }
 
 async function verifyPlanResolution(context, clientFactory, configuration) {
-  await withRollback(context, clientFactory, configuration, async (client) => {
-    const userId = "20000000-0000-4000-8000-000000000001";
-    await insertUsageUser(client, userId);
-    const status = await client.query(
-      `SELECT available, canonical_plan_key, plan_from_assignment,
-              analysis_daily_remaining, ai_monthly_remaining
-       FROM public.get_usage_status_v1(
-         $1::uuid, 1, '2026-09-01T12:00:00Z'::timestamptz
-       )`,
-      [userId]
-    );
-    requireHarness(
-      JSON.stringify(status.rows?.[0]) ===
-        JSON.stringify({
-          available: true,
-          canonical_plan_key: "free",
-          plan_from_assignment: false,
-          analysis_daily_remaining: 2,
-          ai_monthly_remaining: 3,
-        }),
-      "EXTERNAL_FIXTURE_FREE_PLAN_FALLBACK_MISMATCH"
-    );
-    const reservation = await client.query(
-      `SELECT allowed, canonical_plan_key, plan_from_assignment
-       FROM public.reserve_usage_limits_v2(
-         $1::uuid, 1, 'channel_analysis'::public.usage_metric,
-         '2026-09-01T12:00:00Z'::timestamptz
-       )`,
-      [userId]
-    );
-    requireHarness(
-      reservation.rows?.[0]?.allowed === true &&
-        reservation.rows?.[0]?.canonical_plan_key === "free" &&
-        reservation.rows?.[0]?.plan_from_assignment === false,
-      "EXTERNAL_FIXTURE_FREE_PLAN_RESERVATION_MISMATCH"
-    );
-  });
+  await runMigrationPlanFreeFallbackPhase(context, () =>
+    withRollback(context, clientFactory, configuration, async (client) => {
+      const userId = "20000000-0000-4000-8000-000000000001";
+      await insertUsageUser(client, userId);
+      const status = await client.query(
+        `SELECT available, canonical_plan_key, plan_from_assignment,
+                analysis_daily_remaining, ai_monthly_remaining
+         FROM public.get_usage_status_v1(
+           $1::uuid, 1, '2026-09-01T12:00:00Z'::timestamptz
+         )`,
+        [userId]
+      );
+      requireHarness(
+        JSON.stringify(status.rows?.[0]) ===
+          JSON.stringify({
+            available: true,
+            canonical_plan_key: "free",
+            plan_from_assignment: false,
+            analysis_daily_remaining: 2,
+            ai_monthly_remaining: 3,
+          }),
+        "EXTERNAL_FIXTURE_FREE_PLAN_FALLBACK_MISMATCH"
+      );
+      const reservation = await client.query(
+        `SELECT allowed, canonical_plan_key, plan_from_assignment
+         FROM public.reserve_usage_limits_v2(
+           $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+           '2026-09-01T12:00:00Z'::timestamptz
+         )`,
+        [userId]
+      );
+      requireHarness(
+        reservation.rows?.[0]?.allowed === true &&
+          reservation.rows?.[0]?.canonical_plan_key === "free" &&
+          reservation.rows?.[0]?.plan_from_assignment === false,
+        "EXTERNAL_FIXTURE_FREE_PLAN_RESERVATION_MISMATCH"
+      );
+    })
+  );
 
-  await withRollback(context, clientFactory, configuration, async (client) => {
-    const userId = "20000000-0000-4000-8000-000000000002";
-    await insertUsageUser(client, userId);
-    await client.query(
-      `INSERT INTO public.user_plan_assignments (
-         user_id, plan_code, status, source, starts_at, ends_at
-       ) VALUES
-         ($1, 'free', 'inactive', 'system', '2026-01-01T00:00:00Z', NULL),
-         ($1, 'free', 'expired', 'system', '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z')`,
-      [userId]
-    );
-    const status = await client.query(
-      `SELECT available, canonical_plan_key, plan_from_assignment
-       FROM public.get_usage_status_v1(
-         $1::uuid, 1, '2026-09-01T12:00:00Z'::timestamptz
-       )`,
-      [userId]
-    );
-    requireHarness(
-      JSON.stringify(status.rows?.[0]) ===
-        JSON.stringify({
-          available: true,
-          canonical_plan_key: "free",
-          plan_from_assignment: false,
-        }),
-      "EXTERNAL_FIXTURE_INACTIVE_PLAN_FALLBACK_MISMATCH"
-    );
-  });
+  await runMigrationPlanInactiveFallbackPhase(context, () =>
+    withRollback(context, clientFactory, configuration, async (client) => {
+      const userId = "20000000-0000-4000-8000-000000000002";
+      await insertUsageUser(client, userId);
+      await client.query(
+        `INSERT INTO public.user_plan_assignments (
+           user_id, plan_code, status, source, starts_at, ends_at
+         ) VALUES
+           ($1, 'free', 'inactive', 'system', '2026-01-01T00:00:00Z', NULL),
+           ($1, 'free', 'expired', 'system', '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z')`,
+        [userId]
+      );
+      const status = await client.query(
+        `SELECT available, canonical_plan_key, plan_from_assignment
+         FROM public.get_usage_status_v1(
+           $1::uuid, 1, '2026-09-01T12:00:00Z'::timestamptz
+         )`,
+        [userId]
+      );
+      requireHarness(
+        JSON.stringify(status.rows?.[0]) ===
+          JSON.stringify({
+            available: true,
+            canonical_plan_key: "free",
+            plan_from_assignment: false,
+          }),
+        "EXTERNAL_FIXTURE_INACTIVE_PLAN_FALLBACK_MISMATCH"
+      );
+    })
+  );
 
   const failureSetups = [
     (client, userId) =>
@@ -4349,12 +4821,14 @@ async function verifyPlanResolution(context, clientFactory, configuration) {
       ),
   ];
   for (const [index, setup] of failureSetups.entries()) {
-    await withRollback(context, clientFactory, configuration, async (client) => {
-      const userId = `30000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
-      await insertUsageUser(client, userId);
-      await setup(client, userId);
-      await expectPlanFailureInTransaction(client, userId);
-    });
+    await runMigrationPlanFailurePhase(context, index, () =>
+      withRollback(context, clientFactory, configuration, async (client) => {
+        const userId = `30000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+        await insertUsageUser(client, userId);
+        await setup(client, userId);
+        await expectPlanFailureInTransaction(client, userId);
+      })
+    );
   }
 }
 
@@ -4392,160 +4866,190 @@ async function fixtureScalar(
 
 async function verifyReservationLifecycle(context, clientFactory, configuration) {
   const concurrentUser = "40000000-0000-4000-8000-000000000001";
-  await executeFixtureQuery(
-    context,
-    clientFactory,
-    configuration,
-    `INSERT INTO public.users (id, status, session_version)
-     VALUES ($1, 'active', 1);
-     INSERT INTO public.user_plan_assignments (
-       user_id, plan_code, status, source, starts_at
-     ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
-    [concurrentUser]
-  );
-  const concurrent = await Promise.all(
-    Array.from({ length: 10 }, () =>
-      queryAsUsageRole(
-        context,
-        clientFactory,
-        configuration,
-        USAGE_FIXTURE_ROLES.explicitRuntime,
-        `SELECT allowed FROM public.reserve_usage_limits_v2(
-           $1::uuid, 1, 'channel_analysis'::public.usage_metric,
-           '2026-09-01T12:00:00Z'::timestamptz
-         )`,
-        [concurrentUser],
-        { commit: true }
-      )
-    )
-  );
-  requireHarness(
-    concurrent.filter((result) => result.rows?.[0]?.allowed === true).length === 2,
-    "EXTERNAL_FIXTURE_CONCURRENT_RESERVATION_MISMATCH"
-  );
-  requireHarness(
-    Number(
-      await fixtureScalar(
-        context,
-        clientFactory,
-        configuration,
-        `SELECT MAX(used_count) FROM public.user_usage_buckets
-         WHERE user_id = $1 AND metric = 'channel_analysis'`,
-        [concurrentUser]
-      )
-    ) === 2,
-    "EXTERNAL_FIXTURE_USAGE_BUCKET_LIMIT_MISMATCH"
-  );
-  await executeFixtureQuery(
-    context,
-    clientFactory,
-    configuration,
-    "DELETE FROM public.users WHERE id = $1::uuid",
-    [concurrentUser]
-  );
-
-  const releaseUser = "40000000-0000-4000-8000-000000000002";
-  await executeFixtureQuery(
-    context,
-    clientFactory,
-    configuration,
-    `INSERT INTO public.users (id, status, session_version)
-     VALUES ($1, 'active', 1);
-     INSERT INTO public.user_plan_assignments (
-       user_id, plan_code, status, source, starts_at
-     ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
-    [releaseUser]
-  );
-  const released = await executeFixtureQuery(
-    context,
-    clientFactory,
-    configuration,
-    `SELECT reservation_id FROM public.reserve_usage_limits_v2(
-       $1::uuid, 1, 'channel_analysis'::public.usage_metric,
-       '2026-09-01T12:00:00Z'::timestamptz
-     )`,
-    [releaseUser]
-  );
-  const reservationId = released.rows?.[0]?.reservation_id;
-  requireHarness(
-    (await fixtureScalar(
+  await runMigrationReservationConcurrencySetupPhase(context, () =>
+    executeFixtureQuery(
       context,
       clientFactory,
       configuration,
-      "SELECT released FROM public.release_usage_limits($1::uuid, $2::uuid)",
-      [reservationId, releaseUser]
-    )) === true &&
+      `INSERT INTO public.users (id, status, session_version)
+       VALUES ($1, 'active', 1);
+       INSERT INTO public.user_plan_assignments (
+         user_id, plan_code, status, source, starts_at
+       ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
+      [concurrentUser]
+    )
+  );
+  await runMigrationReservationConcurrentLimitPhase(context, async () => {
+    const concurrent = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        queryAsUsageRole(
+          context,
+          clientFactory,
+          configuration,
+          USAGE_FIXTURE_ROLES.explicitRuntime,
+          `SELECT allowed FROM public.reserve_usage_limits_v2(
+             $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+             '2026-09-01T12:00:00Z'::timestamptz
+           )`,
+          [concurrentUser],
+          { commit: true }
+        )
+      )
+    );
+    requireHarness(
+      concurrent.filter((result) => result.rows?.[0]?.allowed === true).length ===
+        2,
+      "EXTERNAL_FIXTURE_CONCURRENT_RESERVATION_MISMATCH"
+    );
+  });
+  await runMigrationReservationBucketPostconditionPhase(context, async () => {
+    requireHarness(
+      Number(
+        await fixtureScalar(
+          context,
+          clientFactory,
+          configuration,
+          `SELECT MAX(used_count) FROM public.user_usage_buckets
+           WHERE user_id = $1 AND metric = 'channel_analysis'`,
+          [concurrentUser]
+        )
+      ) === 2,
+      "EXTERNAL_FIXTURE_USAGE_BUCKET_LIMIT_MISMATCH"
+    );
+  });
+  await runMigrationReservationConcurrencyCleanupPhase(context, () =>
+    executeFixtureQuery(
+      context,
+      clientFactory,
+      configuration,
+      "DELETE FROM public.users WHERE id = $1::uuid",
+      [concurrentUser]
+    )
+  );
+
+  const releaseUser = "40000000-0000-4000-8000-000000000002";
+  await runMigrationReservationReleaseSetupPhase(context, () =>
+    executeFixtureQuery(
+      context,
+      clientFactory,
+      configuration,
+      `INSERT INTO public.users (id, status, session_version)
+       VALUES ($1, 'active', 1);
+       INSERT INTO public.user_plan_assignments (
+         user_id, plan_code, status, source, starts_at
+       ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
+      [releaseUser]
+    )
+  );
+  const reservationId = await runMigrationReservationReleaseCreatePhase(
+    context,
+    async () => {
+      const released = await executeFixtureQuery(
+        context,
+        clientFactory,
+        configuration,
+        `SELECT reservation_id FROM public.reserve_usage_limits_v2(
+           $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+           '2026-09-01T12:00:00Z'::timestamptz
+         )`,
+        [releaseUser]
+      );
+      return released.rows?.[0]?.reservation_id;
+    }
+  );
+  await runMigrationReservationReleaseIdempotencyPhase(context, async () => {
+    requireHarness(
       (await fixtureScalar(
         context,
         clientFactory,
         configuration,
         "SELECT released FROM public.release_usage_limits($1::uuid, $2::uuid)",
         [reservationId, releaseUser]
-      )) === false,
-    "EXTERNAL_FIXTURE_ONE_TIME_RELEASE_MISMATCH"
-  );
-  const finalized = await executeFixtureQuery(
-    context,
-    clientFactory,
-    configuration,
-    `SELECT reservation_id FROM public.reserve_usage_limits_v2(
-       $1::uuid, 1, 'ai_consult'::public.usage_metric,
-       '2026-09-01T12:00:00Z'::timestamptz
-     )`,
-    [releaseUser]
-  );
-  requireHarness(
-    (await fixtureScalar(
-      context,
-      clientFactory,
-      configuration,
-      "SELECT public.finalize_usage_reservation($1::uuid, $2::uuid)",
-      [finalized.rows?.[0]?.reservation_id, releaseUser]
-    )) === true,
-    "EXTERNAL_FIXTURE_FINALIZATION_MISMATCH"
-  );
-
-  const staleUser = "40000000-0000-4000-8000-000000000003";
-  await executeFixtureQuery(
-    context,
-    clientFactory,
-    configuration,
-    `INSERT INTO public.users (id, status, session_version)
-     VALUES ($1, 'active', 1);
-     INSERT INTO public.user_plan_assignments (
-       user_id, plan_code, status, source, starts_at
-     ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z');
-     SELECT reservation_id FROM public.reserve_usage_limits_v2(
-       $1::uuid, 1, 'channel_analysis'::public.usage_metric,
-       '2026-09-01T12:00:00Z'::timestamptz
-     )`,
-    [staleUser]
-  );
-  const recoveries = await Promise.all(
-    Array.from({ length: 2 }, () =>
-      executeFixtureQuery(
+      )) === true &&
+        (await fixtureScalar(
+          context,
+          clientFactory,
+          configuration,
+          "SELECT released FROM public.release_usage_limits($1::uuid, $2::uuid)",
+          [reservationId, releaseUser]
+        )) === false,
+      "EXTERNAL_FIXTURE_ONE_TIME_RELEASE_MISMATCH"
+    );
+  });
+  const finalizedReservationId =
+    await runMigrationReservationFinalizationCreatePhase(context, async () => {
+      const finalized = await executeFixtureQuery(
         context,
         clientFactory,
         configuration,
-        `SELECT public.recover_stale_usage_reservations(
-           '2026-09-01T12:15:00Z'::timestamptz, 10
-         ) AS recovered`
-      )
+        `SELECT reservation_id FROM public.reserve_usage_limits_v2(
+           $1::uuid, 1, 'ai_consult'::public.usage_metric,
+           '2026-09-01T12:00:00Z'::timestamptz
+         )`,
+        [releaseUser]
+      );
+      return finalized.rows?.[0]?.reservation_id;
+    });
+  await runMigrationReservationFinalizationPhase(context, async () => {
+    requireHarness(
+      (await fixtureScalar(
+        context,
+        clientFactory,
+        configuration,
+        "SELECT public.finalize_usage_reservation($1::uuid, $2::uuid)",
+        [finalizedReservationId, releaseUser]
+      )) === true,
+      "EXTERNAL_FIXTURE_FINALIZATION_MISMATCH"
+    );
+  });
+
+  const staleUser = "40000000-0000-4000-8000-000000000003";
+  await runMigrationReservationStaleSetupPhase(context, () =>
+    executeFixtureQuery(
+      context,
+      clientFactory,
+      configuration,
+      `INSERT INTO public.users (id, status, session_version)
+       VALUES ($1, 'active', 1);
+       INSERT INTO public.user_plan_assignments (
+         user_id, plan_code, status, source, starts_at
+       ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z');
+       SELECT reservation_id FROM public.reserve_usage_limits_v2(
+         $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+         '2026-09-01T12:00:00Z'::timestamptz
+       )`,
+      [staleUser]
     )
   );
-  requireHarness(
-    recoveries.reduce(
-      (total, result) => total + Number(result.rows?.[0]?.recovered),
-      0
-    ) === 1,
-    "EXTERNAL_FIXTURE_STALE_RECOVERY_MISMATCH"
-  );
-  await executeFixtureQuery(
-    context,
-    clientFactory,
-    configuration,
-    "DELETE FROM public.users WHERE id = ANY($1::uuid[])",
-    [[releaseUser, staleUser]]
+  await runMigrationReservationStaleRecoveryPhase(context, async () => {
+    const recoveries = await Promise.all(
+      Array.from({ length: 2 }, () =>
+        executeFixtureQuery(
+          context,
+          clientFactory,
+          configuration,
+          `SELECT public.recover_stale_usage_reservations(
+             '2026-09-01T12:15:00Z'::timestamptz, 10
+           ) AS recovered`
+        )
+      )
+    );
+    requireHarness(
+      recoveries.reduce(
+        (total, result) => total + Number(result.rows?.[0]?.recovered),
+        0
+      ) === 1,
+      "EXTERNAL_FIXTURE_STALE_RECOVERY_MISMATCH"
+    );
+  });
+  await runMigrationReservationLifecycleCleanupPhase(context, () =>
+    executeFixtureQuery(
+      context,
+      clientFactory,
+      configuration,
+      "DELETE FROM public.users WHERE id = ANY($1::uuid[])",
+      [[releaseUser, staleUser]]
+    )
   );
 }
 
@@ -5180,9 +5684,177 @@ const INTERNAL_PHASE_PROBE_SCENARIOS = Object.freeze({
     kind: "phase",
     phase: EXTERNAL_FIXTURE_PHASES.migrationReplay,
   }),
-  "migration-postconditions-rejects": Object.freeze({
+  "migration-final-owner-postcondition-failure": Object.freeze({
     kind: "phase",
-    phase: EXTERNAL_FIXTURE_PHASES.migrationPostconditions,
+    phase: EXTERNAL_FIXTURE_PHASES.migrationFinalOwnerPostcondition,
+  }),
+  "migration-replay-owner-postcondition-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReplayOwnerPostcondition,
+  }),
+  "migration-usage-acl-inheritance-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageAclInheritance,
+  }),
+  "migration-usage-owner-postcondition-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageOwnerPostcondition,
+  }),
+  "migration-usage-owner-inheritance-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageOwnerInheritance,
+  }),
+  "migration-usage-legacy-acl-preservation-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageLegacyAclPreservation,
+  }),
+  "migration-usage-acl-comparison-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageAclComparison,
+  }),
+  "migration-usage-explicit-runtime-privilege-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageExplicitRuntimePrivilege,
+  }),
+  "migration-usage-membership-runtime-privilege-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageMembershipRuntimePrivilege,
+  }),
+  "migration-usage-denied-runtime-privilege-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageDeniedRuntimePrivilege,
+  }),
+  "migration-usage-public-runtime-privilege-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsagePublicRuntimePrivilege,
+  }),
+  "migration-usage-security-mode-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageSecurityMode,
+  }),
+  "migration-usage-search-path-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageSearchPath,
+  }),
+  "migration-usage-explicit-runtime-execution-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageExplicitRuntimeExecution,
+  }),
+  "migration-usage-membership-runtime-execution-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageMembershipRuntimeExecution,
+  }),
+  "migration-usage-denied-runtime-execution-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageDeniedRuntimeExecution,
+  }),
+  "migration-usage-public-runtime-execution-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsagePublicRuntimeExecution,
+  }),
+  "migration-plan-resolution-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanResolution,
+  }),
+  "migration-plan-free-fallback-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanFreeFallback,
+  }),
+  "migration-plan-inactive-fallback-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanInactiveFallback,
+  }),
+  "migration-plan-future-assignment-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanFutureAssignmentRejection,
+  }),
+  "migration-plan-expired-assignment-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanExpiredAssignmentRejection,
+  }),
+  "migration-plan-unknown-reference-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanUnknownReferenceRejection,
+  }),
+  "migration-plan-duplicate-assignment-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanDuplicateAssignmentRejection,
+  }),
+  "migration-plan-missing-baseline-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanMissingBaselineRejection,
+  }),
+  "migration-plan-duplicate-baseline-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanDuplicateBaselineRejection,
+  }),
+  "migration-plan-inactive-baseline-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanInactiveBaselineRejection,
+  }),
+  "migration-plan-limit-mismatch-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanLimitMismatchRejection,
+  }),
+  "migration-plan-invalid-limit-rejection": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationPlanInvalidLimitRejection,
+  }),
+  "migration-reservation-lifecycle-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationLifecycle,
+  }),
+  "migration-reservation-concurrency-setup-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencySetup,
+  }),
+  "migration-reservation-concurrent-limit-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrentLimit,
+  }),
+  "migration-reservation-bucket-postcondition-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationBucketPostcondition,
+  }),
+  "migration-reservation-concurrency-cleanup-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencyCleanup,
+  }),
+  "migration-reservation-release-setup-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationReleaseSetup,
+  }),
+  "migration-reservation-release-create-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationReleaseCreate,
+  }),
+  "migration-reservation-release-idempotency-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationReleaseIdempotency,
+  }),
+  "migration-reservation-finalization-create-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationFinalizationCreate,
+  }),
+  "migration-reservation-finalization-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationFinalization,
+  }),
+  "migration-reservation-stale-setup-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationStaleSetup,
+  }),
+  "migration-reservation-stale-recovery-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationStaleRecovery,
+  }),
+  "migration-reservation-lifecycle-cleanup-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationReservationLifecycleCleanup,
+  }),
+  "migration-runtime-acl-configuration-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationRuntimeAclConfiguration,
   }),
   "migration-client-close-rejects": Object.freeze({
     kind: "phase",
@@ -5242,11 +5914,11 @@ const INTERNAL_PHASE_PROBE_SCENARIOS = Object.freeze({
   }),
   "migration-final-through-outer-wrappers": Object.freeze({
     kind: "nested",
-    phase: EXTERNAL_FIXTURE_PHASES.migrationFinal,
+    phase: EXTERNAL_FIXTURE_PHASES.migrationFinalOwnerPostcondition,
   }),
   "migration-final-plus-canonical-close": Object.freeze({
     kind: "primary-close",
-    phase: EXTERNAL_FIXTURE_PHASES.migrationFinal,
+    phase: EXTERNAL_FIXTURE_PHASES.migrationFinalOwnerPostcondition,
   }),
   "canonical-close-only": Object.freeze({
     kind: "close-only",
@@ -5262,6 +5934,7 @@ const INTERNAL_PHASE_PROBE_SCENARIOS = Object.freeze({
   }),
   "unbranded-unknown": Object.freeze({ kind: "unknown", phase: null }),
   "forged-known-marker-message": Object.freeze({ kind: "forged", phase: null }),
+  "old-broad-marker-message": Object.freeze({ kind: "old-broad", phase: null }),
   "forged-known-marker-object": Object.freeze({
     kind: "forged-object",
     phase: null,
@@ -5382,7 +6055,7 @@ async function runProductionGraphPhaseProbeForTests(specification) {
               clientOrdinal === 2) ||
             (state.targetPhase ===
               EXTERNAL_FIXTURE_PHASES.cleanupClientConnect &&
-              clientOrdinal === 3)
+              clientOrdinal === 4)
           ) {
             throw new Error("fixed-private-client-connect-failure");
           }
@@ -5402,7 +6075,7 @@ async function runProductionGraphPhaseProbeForTests(specification) {
               clientOrdinal === 2) ||
             (state.targetPhase ===
               EXTERNAL_FIXTURE_PHASES.canonicalClientClose &&
-              clientOrdinal === 3)
+              clientOrdinal === 4)
           ) {
             throw new Error("fixed-private-client-close-failure");
           }
@@ -5487,8 +6160,8 @@ export async function runExternalFixturePhaseProbeForTests(scenario) {
   let unrelatedClient = null;
   try {
     if (specification.kind === "nested") {
-      await runMigrationPostconditionsPhase(context, () =>
-        runMigrationFinalPhase(context, async () => undefined)
+      await runMigrationUsageAclInheritancePhase(context, () =>
+        runMigrationFinalOwnerPostconditionPhase(context, async () => undefined)
       );
     } else if (
       specification.kind === "primary-close" ||
@@ -5501,8 +6174,11 @@ export async function runExternalFixturePhaseProbeForTests(scenario) {
         {},
         specification.kind === "primary-close"
           ? () =>
-              runMigrationPostconditionsPhase(context, () =>
-                runMigrationFinalPhase(context, async () => undefined)
+              runMigrationUsageAclInheritancePhase(context, () =>
+                runMigrationFinalOwnerPostconditionPhase(
+                  context,
+                  async () => undefined
+                )
               )
           : async () => undefined,
         CANONICAL_CLEANUP_CLIENT_LIFECYCLE
@@ -5526,7 +6202,7 @@ export async function runExternalFixturePhaseProbeForTests(scenario) {
     } else if (specification.kind === "cross-context") {
       const sourceContext = createDeadlineContext();
       const sourceState = {
-        targetPhase: EXTERNAL_FIXTURE_PHASES.migrationFinal,
+        targetPhase: EXTERNAL_FIXTURE_PHASES.migrationFinalOwnerPostcondition,
         targetHitCount: 0,
         operationStartCount: 0,
         skippedOperationCount: 0,
@@ -5540,7 +6216,10 @@ export async function runExternalFixturePhaseProbeForTests(scenario) {
       );
       let sourceFailure = null;
       try {
-        await runMigrationFinalPhase(sourceContext, async () => undefined);
+        await runMigrationFinalOwnerPostconditionPhase(
+          sourceContext,
+          async () => undefined
+        );
       } catch (caughtError) {
         sourceFailure = caughtError;
       } finally {
@@ -5552,7 +6231,7 @@ export async function runExternalFixturePhaseProbeForTests(scenario) {
           !INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.has(sourceContext),
         "EXTERNAL_FIXTURE_PHASE_PROBE_NOT_TRIGGERED"
       );
-      await runMigrationPostconditionsPhase(context, () =>
+      await runMigrationReplayOwnerPostconditionPhase(context, () =>
         Promise.reject(sourceFailure)
       );
     } else if (specification.kind === "unknown") {
@@ -5560,6 +6239,10 @@ export async function runExternalFixturePhaseProbeForTests(scenario) {
     } else if (specification.kind === "forged") {
       throw new Error(
         "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL"
+      );
+    } else if (specification.kind === "old-broad") {
+      throw new Error(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS"
       );
     } else if (specification.kind === "forged-object") {
       throw Object.freeze({
