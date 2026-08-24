@@ -44,6 +44,54 @@ const USAGE_FIXTURE_ROLES = Object.freeze({
   deniedRuntime: "actustube_ci_usage_denied",
   publicProbe: "actustube_ci_usage_public_probe",
 });
+const USAGE_BODY_ACL_RECIPIENTS = Object.freeze([
+  USAGE_FIXTURE_ROLES.explicitRuntime,
+  USAGE_FIXTURE_ROLES.runtimeGroup,
+]);
+const USAGE_BODY_OBJECT_ACL_MANIFEST = Object.freeze([
+  Object.freeze({
+    objectKind: "table",
+    schemaName: "public",
+    objectName: "users",
+    privileges: Object.freeze(["SELECT", "UPDATE"]),
+  }),
+  Object.freeze({
+    objectKind: "table",
+    schemaName: "public",
+    objectName: "user_plan_assignments",
+    privileges: Object.freeze(["SELECT"]),
+  }),
+  Object.freeze({
+    objectKind: "table",
+    schemaName: "public",
+    objectName: "plans",
+    privileges: Object.freeze(["SELECT"]),
+  }),
+  Object.freeze({
+    objectKind: "table",
+    schemaName: "public",
+    objectName: "user_usage_buckets",
+    privileges: Object.freeze(["SELECT", "INSERT", "UPDATE"]),
+  }),
+  Object.freeze({
+    objectKind: "table",
+    schemaName: "public",
+    objectName: "usage_reservation_leases",
+    privileges: Object.freeze(["SELECT", "INSERT"]),
+  }),
+]);
+const USAGE_BODY_ACL_ROW_KEYS = Object.freeze([
+  "authority_kind",
+  "recipient_relation",
+  "grantor_name",
+  "grantee_name",
+  "object_kind",
+  "schema_name",
+  "object_name",
+  "privilege_type",
+  "grant_option",
+  "shared_dependency_covered",
+]);
 const USAGE_MIGRATION_BOUNDARY_ROLES = Object.freeze({
   legacyOwner: "actustube_ci_usage_legacy_owner",
   migrationExecutor: "actustube_ci_usage_migration_executor",
@@ -1108,6 +1156,159 @@ const TEMPORARY_AUTHORITY_INVENTORY_SQL = `
 `;
 export const TEMPORARY_AUTHORITY_INVENTORY_SQL_FOR_TESTS =
   TEMPORARY_AUTHORITY_INVENTORY_SQL;
+const USAGE_BODY_ACL_INVENTORY_SQL = `
+  WITH target_roles AS (
+    SELECT role_entry.oid, role_entry.rolname
+    FROM pg_catalog.pg_roles AS role_entry
+    WHERE role_entry.rolname = ANY($1::text[])
+  ), target_objects(object_name, ordinal) AS (
+    VALUES
+      ('users'::text, 1),
+      ('user_plan_assignments'::text, 2),
+      ('plans'::text, 3),
+      ('user_usage_buckets'::text, 4),
+      ('usage_reservation_leases'::text, 5)
+  ), current_database_identity AS (
+    SELECT database_entry.oid
+    FROM pg_catalog.pg_database AS database_entry
+    WHERE database_entry.datname = pg_catalog.current_database()
+  ), relevant_relations AS (
+    SELECT
+      relation_entry.oid,
+      namespace_entry.nspname,
+      relation_entry.relname,
+      target_object.ordinal
+    FROM target_objects AS target_object
+    INNER JOIN pg_catalog.pg_namespace AS namespace_entry
+      ON namespace_entry.nspname = 'public'
+    INNER JOIN pg_catalog.pg_class AS relation_entry
+      ON relation_entry.relnamespace = namespace_entry.oid
+      AND relation_entry.relname = target_object.object_name
+      AND relation_entry.relkind IN ('r', 'p')
+  ), explicit_acl AS (
+    SELECT
+      relation_entry.oid AS relation_oid,
+      relation_entry.nspname,
+      relation_entry.relname,
+      relation_entry.ordinal,
+      acl.grantor,
+      acl.grantee,
+      acl.privilege_type,
+      acl.is_grantable,
+      grantor_identity.rolname AS grantor_name,
+      CASE
+        WHEN acl.grantee = 0 THEN 'PUBLIC'
+        ELSE grantee_identity.rolname
+      END AS grantee_name
+    FROM relevant_relations AS relation_entry
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      (SELECT catalog_relation.relacl
+       FROM pg_catalog.pg_class AS catalog_relation
+       WHERE catalog_relation.oid = relation_entry.oid)
+    ) AS acl
+    LEFT JOIN pg_catalog.pg_roles AS grantor_identity
+      ON grantor_identity.oid = acl.grantor
+    LEFT JOIN pg_catalog.pg_roles AS grantee_identity
+      ON grantee_identity.oid = acl.grantee
+    WHERE acl.grantee = 0
+       OR acl.grantee IN (SELECT oid FROM target_roles)
+       OR acl.grantor IN (SELECT oid FROM target_roles)
+  ), relevant_dependencies AS (
+    SELECT
+      dependency_entry.dbid,
+      dependency_entry.classid,
+      dependency_entry.objid,
+      dependency_entry.objsubid,
+      dependency_entry.refobjid,
+      target_role.rolname AS referenced_role,
+      relation_entry.nspname,
+      relation_entry.relname
+    FROM pg_catalog.pg_shdepend AS dependency_entry
+    INNER JOIN target_roles AS target_role
+      ON target_role.oid = dependency_entry.refobjid
+    LEFT JOIN relevant_relations AS relation_entry
+      ON dependency_entry.classid = 'pg_catalog.pg_class'::regclass
+      AND dependency_entry.objid = relation_entry.oid
+    WHERE dependency_entry.refclassid = 'pg_catalog.pg_authid'::regclass
+      AND dependency_entry.deptype = 'a'
+      AND dependency_entry.classid = 'pg_catalog.pg_class'::regclass
+      AND dependency_entry.objid IN (SELECT oid FROM relevant_relations)
+  ), inventory AS (
+    SELECT
+      'explicit_acl'::text AS authority_kind,
+      CASE explicit_acl.grantee_name
+        WHEN '${USAGE_FIXTURE_ROLES.explicitRuntime}' THEN 'explicit_direct'
+        WHEN '${USAGE_FIXTURE_ROLES.runtimeGroup}' THEN 'membership_group_direct'
+        ELSE 'unexpected'
+      END::text AS recipient_relation,
+      COALESCE(explicit_acl.grantor_name, 'UNRESOLVED')::text AS grantor_name,
+      COALESCE(explicit_acl.grantee_name, 'UNRESOLVED')::text AS grantee_name,
+      'table'::text AS object_kind,
+      explicit_acl.nspname::text AS schema_name,
+      explicit_acl.relname::text AS object_name,
+      explicit_acl.privilege_type::text AS privilege_type,
+      explicit_acl.is_grantable AS grant_option,
+      EXISTS (
+        SELECT 1
+        FROM relevant_dependencies AS dependency_entry
+        CROSS JOIN current_database_identity
+        WHERE dependency_entry.dbid = current_database_identity.oid
+          AND dependency_entry.classid = 'pg_catalog.pg_class'::regclass
+          AND dependency_entry.objid = explicit_acl.relation_oid
+          AND dependency_entry.objsubid = 0
+          AND dependency_entry.refobjid = explicit_acl.grantee
+      ) AS shared_dependency_covered,
+      explicit_acl.ordinal
+    FROM explicit_acl
+
+    UNION ALL
+
+    SELECT
+      'uncovered_acl_dependency'::text,
+      'unexpected'::text,
+      'UNRESOLVED'::text,
+      dependency_entry.referenced_role::text,
+      'table'::text,
+      COALESCE(dependency_entry.nspname, 'UNRESOLVED')::text,
+      COALESCE(dependency_entry.relname, 'UNRESOLVED')::text,
+      'ACL_DEPENDENCY'::text,
+      false,
+      false,
+      COALESCE(
+        (SELECT ordinal FROM target_objects
+         WHERE object_name = dependency_entry.relname),
+        2147483647
+      )
+    FROM relevant_dependencies AS dependency_entry
+    CROSS JOIN current_database_identity
+    WHERE dependency_entry.dbid = current_database_identity.oid
+      AND dependency_entry.objsubid = 0
+      AND NOT EXISTS (
+        SELECT 1
+        FROM explicit_acl
+        WHERE explicit_acl.relation_oid = dependency_entry.objid
+          AND explicit_acl.grantee = dependency_entry.refobjid
+      )
+  )
+  SELECT
+    authority_kind,
+    recipient_relation,
+    grantor_name,
+    grantee_name,
+    object_kind,
+    schema_name,
+    object_name,
+    privilege_type,
+    grant_option,
+    shared_dependency_covered
+  FROM inventory
+  ORDER BY
+    ordinal,
+    grantee_name,
+    privilege_type,
+    authority_kind,
+    grantor_name
+`;
 const FIXTURE_EXTENSION_CONTRACT = Object.freeze([
   Object.freeze({ name: "plpgsql", schema: "pg_catalog", version: "1.0" }),
 ]);
@@ -1160,6 +1361,12 @@ const EXTERNAL_FIXTURE_PHASES = Object.freeze({
   migrationReplay: "MIGRATION_REPLAY",
   migrationFinalOwnerPostcondition: "MIGRATION_FINAL_OWNER_POSTCONDITION",
   migrationReplayOwnerPostcondition: "MIGRATION_REPLAY_OWNER_POSTCONDITION",
+  migrationUsageBodyAclGrant: "MIGRATION_USAGE_BODY_ACL_GRANT",
+  migrationUsageBodyAclGrantInventory:
+    "MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY",
+  migrationUsageBodyAclRevoke: "MIGRATION_USAGE_BODY_ACL_REVOKE",
+  migrationUsageBodyAclZeroResidue:
+    "MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE",
   migrationUsageAclInheritance: "MIGRATION_USAGE_ACL_INHERITANCE",
   migrationUsageOwnerPostcondition: "MIGRATION_USAGE_OWNER_POSTCONDITION",
   migrationUsageOwnerInheritance: "MIGRATION_USAGE_OWNER_INHERITANCE",
@@ -1272,6 +1479,14 @@ const EXTERNAL_FIXTURE_PHASE_MARKERS = Object.freeze({
     "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_FINAL_OWNER_POSTCONDITION",
   MIGRATION_REPLAY_OWNER_POSTCONDITION:
     "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY_OWNER_POSTCONDITION",
+  MIGRATION_USAGE_BODY_ACL_GRANT:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT",
+  MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY",
+  MIGRATION_USAGE_BODY_ACL_REVOKE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_REVOKE",
+  MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE:
+    "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE",
   MIGRATION_USAGE_ACL_INHERITANCE:
     "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_ACL_INHERITANCE",
   MIGRATION_USAGE_OWNER_POSTCONDITION:
@@ -1972,6 +2187,38 @@ function runMigrationReplayOwnerPostconditionPhase(context, operation) {
   return runFixedMigrationSubphase(
     context,
     EXTERNAL_FIXTURE_PHASES.migrationReplayOwnerPostcondition,
+    operation
+  );
+}
+
+function runMigrationUsageBodyAclGrantPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclGrant,
+    operation
+  );
+}
+
+function runMigrationUsageBodyAclGrantInventoryPhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclGrantInventory,
+    operation
+  );
+}
+
+function runMigrationUsageBodyAclRevokePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclRevoke,
+    operation
+  );
+}
+
+function runMigrationUsageBodyAclZeroResiduePhase(context, operation) {
+  return runFixedMigrationSubphase(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclZeroResidue,
     operation
   );
 }
@@ -4012,6 +4259,302 @@ async function runCanonicalOwnershipBoundary({
   return await runPostflightPhase(context, postflightOperation);
 }
 
+const USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE = Object.freeze([
+  ...USAGE_BODY_ACL_RECIPIENTS,
+  USAGE_FIXTURE_ROLES.membershipRuntime,
+  USAGE_FIXTURE_ROLES.deniedRuntime,
+  USAGE_FIXTURE_ROLES.publicProbe,
+  USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor,
+  USAGE_MIGRATION_BOUNDARY_ROLES.legacyOwner,
+  RUNTIME_ROLE,
+]);
+
+function assertUsageBodyObjectAclManifest() {
+  const allowedPrivileges = new Set(["SELECT", "INSERT", "UPDATE"]);
+  requireHarness(
+    Object.isFrozen(USAGE_BODY_OBJECT_ACL_MANIFEST) &&
+      Object.isFrozen(USAGE_BODY_ACL_RECIPIENTS) &&
+      USAGE_BODY_ACL_RECIPIENTS.length === 2 &&
+      new Set(USAGE_BODY_ACL_RECIPIENTS).size === 2 &&
+      USAGE_BODY_ACL_RECIPIENTS.every((roleName) =>
+        SAFE_IDENTIFIER.test(roleName)
+      ) &&
+      USAGE_BODY_OBJECT_ACL_MANIFEST.length === 5 &&
+      USAGE_BODY_OBJECT_ACL_MANIFEST.every(
+        (entry) =>
+          Object.isFrozen(entry) &&
+          Object.isFrozen(entry.privileges) &&
+          entry.objectKind === "table" &&
+          entry.schemaName === "public" &&
+          SAFE_IDENTIFIER.test(entry.schemaName) &&
+          SAFE_IDENTIFIER.test(entry.objectName) &&
+          entry.privileges.length > 0 &&
+          new Set(entry.privileges).size === entry.privileges.length &&
+          entry.privileges.every((privilege) =>
+            allowedPrivileges.has(privilege)
+          )
+      ),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_MANIFEST_INVALID"
+  );
+}
+
+function usageBodyObjectAclStatement(action, grantorName) {
+  assertUsageBodyObjectAclManifest();
+  requireHarness(
+    (action === "GRANT" || action === "REVOKE") &&
+      SAFE_IDENTIFIER.test(grantorName),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_MANIFEST_INVALID"
+  );
+  const recipientKeyword = action === "GRANT" ? "TO" : "FROM";
+  const recipients = USAGE_BODY_ACL_RECIPIENTS.map(quoteIdentifier).join(", ");
+  const grantor = quoteIdentifier(grantorName);
+  return USAGE_BODY_OBJECT_ACL_MANIFEST.map(
+    (entry) =>
+      `${action} ${entry.privileges.join(", ")} ON TABLE ${quoteIdentifier(
+        entry.schemaName
+      )}.${quoteIdentifier(
+        entry.objectName
+      )} ${recipientKeyword} ${recipients} GRANTED BY ${grantor}`
+  ).join(";\n");
+}
+
+function mutateUsageBodyAclStatementForTest(statement, action, mutation) {
+  if (mutation === null) return statement;
+  requireHarness(
+    (action === "GRANT" || action === "REVOKE") &&
+      [
+        "wrong-object",
+        "wrong-privilege",
+        "wrong-recipient",
+        "wrong-grantor",
+        "wrong-privilege-order",
+        "wrong-statement-order",
+        "prefix-only",
+        "trailing-sql",
+        "query-config-values",
+      ].includes(mutation),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_TEST_MUTATION_INVALID"
+  );
+  if (mutation === "wrong-object") {
+    return statement.replace('"public"."users"', '"public"."oauth_accounts"');
+  }
+  if (mutation === "wrong-privilege") {
+    return statement.replace("GRANT SELECT, UPDATE", "GRANT SELECT, DELETE");
+  }
+  if (mutation === "wrong-recipient") {
+    return statement.replace(
+      quoteIdentifier(USAGE_FIXTURE_ROLES.runtimeGroup),
+      quoteIdentifier(USAGE_FIXTURE_ROLES.membershipRuntime)
+    );
+  }
+  if (mutation === "wrong-grantor") {
+    return statement.replace(
+      /GRANTED BY "[a-z0-9_]+"/,
+      `GRANTED BY ${quoteIdentifier(USAGE_FIXTURE_ROLES.deniedRuntime)}`
+    );
+  }
+  if (mutation === "wrong-privilege-order") {
+    return statement.replace("GRANT SELECT, UPDATE", "GRANT UPDATE, SELECT");
+  }
+  if (mutation === "wrong-statement-order") {
+    return statement.split(";\n").reverse().join(";\n");
+  }
+  if (mutation === "prefix-only") return statement.split(";\n")[0];
+  if (mutation === "query-config-values") return statement;
+  return `${statement};\nSELECT 1`;
+}
+
+async function executeUsageBodyObjectAclStatements(
+  client,
+  action,
+  grantorName,
+  testOnlyMutation = null
+) {
+  const statement = mutateUsageBodyAclStatementForTest(
+    usageBodyObjectAclStatement(action, grantorName),
+    action,
+    testOnlyMutation
+  );
+  const query =
+    testOnlyMutation === "query-config-values"
+      ? { text: statement, values: ["unexpected"] }
+      : statement;
+  await client.query(query, []);
+}
+
+function usageBodyAclExpectedRows(grantorName) {
+  requireHarness(
+    SAFE_IDENTIFIER.test(grantorName),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_GRANTOR_INVALID"
+  );
+  const rows = [];
+  for (const entry of USAGE_BODY_OBJECT_ACL_MANIFEST) {
+    for (const granteeName of USAGE_BODY_ACL_RECIPIENTS) {
+      for (const privilegeType of entry.privileges) {
+        rows.push(
+          Object.freeze({
+            authority_kind: "explicit_acl",
+            recipient_relation:
+              granteeName === USAGE_FIXTURE_ROLES.explicitRuntime
+                ? "explicit_direct"
+                : "membership_group_direct",
+            grantor_name: grantorName,
+            grantee_name: granteeName,
+            object_kind: entry.objectKind,
+            schema_name: entry.schemaName,
+            object_name: entry.objectName,
+            privilege_type: privilegeType,
+            grant_option: false,
+            shared_dependency_covered: true,
+          })
+        );
+      }
+    }
+  }
+  return Object.freeze(rows.sort(compareUsageBodyAclRows));
+}
+
+function compareUsageBodyAclRows(left, right) {
+  for (const key of USAGE_BODY_ACL_ROW_KEYS) {
+    const comparison = String(left[key]).localeCompare(String(right[key]));
+    if (comparison !== 0) return comparison;
+  }
+  return 0;
+}
+
+function assertUsageBodyAclInventoryRows(rows, grantorName, expectedGranted) {
+  requireHarness(
+    Array.isArray(rows) &&
+      rows.every(
+        (row) =>
+          row !== null &&
+          typeof row === "object" &&
+          exactOwnKeys(row, USAGE_BODY_ACL_ROW_KEYS)
+      ),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_INVENTORY_INVALID"
+  );
+  const normalized = rows.map((row) => Object.freeze({ ...row }));
+  const uniqueKeys = new Set(normalized.map((row) => JSON.stringify(row)));
+  requireHarness(
+    uniqueKeys.size === normalized.length,
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_INVENTORY_MISMATCH"
+  );
+  if (!expectedGranted) {
+    requireHarness(
+      normalized.length === 0,
+      "EXTERNAL_FIXTURE_USAGE_BODY_ACL_RESIDUE"
+    );
+    return;
+  }
+  const expected = usageBodyAclExpectedRows(grantorName);
+  requireHarness(
+    JSON.stringify([...normalized].sort(compareUsageBodyAclRows)) ===
+      JSON.stringify(expected),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_INVENTORY_MISMATCH"
+  );
+}
+
+async function assertUsageBodyAclInventory(
+  client,
+  grantorName,
+  expectedGranted
+) {
+  const result = await client.query(USAGE_BODY_ACL_INVENTORY_SQL, [
+    USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,
+  ]);
+  assertUsageBodyAclInventoryRows(
+    result.rows,
+    grantorName,
+    expectedGranted
+  );
+}
+
+async function runTemporaryUsageBodyAclWindow({
+  context,
+  clientFactory,
+  configuration,
+  identityAuthority,
+  observedSessionIdentity,
+  verificationOperation,
+  grantMutationForTest = null,
+  revokeMutationForTest = null,
+}) {
+  requireOriginalObservedSessionIdentity(
+    identityAuthority,
+    observedSessionIdentity
+  );
+  requireHarness(
+    typeof verificationOperation === "function",
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_OPERATION_INVALID"
+  );
+  const grantorName = observedSessionIdentity.sessionRole;
+  let verificationResult;
+  let primaryFailure;
+  let primaryFailed = false;
+  try {
+    await runMigrationUsageBodyAclGrantPhase(context, () =>
+      withClient(
+        context,
+        clientFactory,
+        fixtureCredentials(configuration),
+        (client) =>
+          executeUsageBodyObjectAclStatements(
+            client,
+            "GRANT",
+            grantorName,
+            grantMutationForTest
+          )
+      )
+    );
+    await runMigrationUsageBodyAclGrantInventoryPhase(context, () =>
+      withClient(
+        context,
+        clientFactory,
+        fixtureCredentials(configuration),
+        (client) => assertUsageBodyAclInventory(client, grantorName, true)
+      )
+    );
+    verificationResult = await verificationOperation();
+  } catch (error) {
+    primaryFailed = true;
+    primaryFailure = error;
+  }
+
+  let cleanupFailure;
+  let cleanupFailed = false;
+  try {
+    await runMigrationUsageBodyAclRevokePhase(context, () =>
+      withClient(
+        context,
+        clientFactory,
+        fixtureCredentials(configuration),
+        (client) =>
+          executeUsageBodyObjectAclStatements(
+            client,
+            "REVOKE",
+            grantorName,
+            revokeMutationForTest
+          )
+      )
+    );
+    await runMigrationUsageBodyAclZeroResiduePhase(context, () =>
+      withClient(
+        context,
+        clientFactory,
+        fixtureCredentials(configuration),
+        (client) => assertUsageBodyAclInventory(client, grantorName, false)
+      )
+    );
+  } catch (error) {
+    cleanupFailed = true;
+    cleanupFailure = error;
+  }
+
+  if (primaryFailed) throw primaryFailure;
+  if (cleanupFailed) throw cleanupFailure;
+  return verificationResult;
+}
+
 async function configureRuntimeAcl(client, configuration) {
   await client.query(`
     REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM
@@ -4289,21 +4832,30 @@ async function applyMigrationsAndRuntimeAcl(
   if (internalProbeState) {
     internalProbeState.laterVerificationStubInvocations += 1;
   } else {
-    await runMigrationUsageAclInheritancePhase(context, () =>
-      verifyUsageAclInheritance(
-        context,
-        clientFactory,
-        configuration,
-        legacyAclHash,
-        configuration.role
-      )
-    );
-    await runMigrationPlanResolutionPhase(context, () =>
-      verifyPlanResolution(context, clientFactory, configuration)
-    );
-    await runMigrationReservationLifecyclePhase(context, () =>
-      verifyReservationLifecycle(context, clientFactory, configuration)
-    );
+    await runTemporaryUsageBodyAclWindow({
+      context,
+      clientFactory,
+      configuration,
+      identityAuthority,
+      observedSessionIdentity: identityAuthority.observedSessionIdentity,
+      async verificationOperation() {
+        await runMigrationUsageAclInheritancePhase(context, () =>
+          verifyUsageAclInheritance(
+            context,
+            clientFactory,
+            configuration,
+            legacyAclHash,
+            identityAuthority.observedSessionIdentity.sessionRole
+          )
+        );
+        await runMigrationPlanResolutionPhase(context, () =>
+          verifyPlanResolution(context, clientFactory, configuration)
+        );
+        await runMigrationReservationLifecyclePhase(context, () =>
+          verifyReservationLifecycle(context, clientFactory, configuration)
+        );
+      },
+    });
     await runMigrationRuntimeAclConfigurationPhase(context, () =>
       withClient(
         context,
@@ -4423,6 +4975,21 @@ async function queryAsUsageRole(
         throw error;
       }
     }
+  );
+}
+
+function assertMissingUserUsageExecutionResult(result) {
+  requireHarness(
+    result !== null &&
+      typeof result === "object" &&
+      Array.isArray(result.rows) &&
+      result.rows.length === 1 &&
+      result.rows[0] !== null &&
+      typeof result.rows[0] === "object" &&
+      exactOwnKeys(result.rows[0], ["allowed"]) &&
+      typeof result.rows[0].allowed === "boolean" &&
+      result.rows[0].allowed === false,
+    "EXTERNAL_FIXTURE_USAGE_RUNTIME_EXECUTION_MISMATCH"
   );
 }
 
@@ -4581,6 +5148,18 @@ async function verifyUsageAclInheritance(
     }
   );
 
+  await verifyUsageRuntimeExecutionRoles(
+    context,
+    clientFactory,
+    configuration
+  );
+}
+
+async function verifyUsageRuntimeExecutionRoles(
+  context,
+  clientFactory,
+  configuration
+) {
   const nonExistingUser = "10000000-0000-4000-8000-000000000001";
   const executeAllowedRole = (executionRole) => async () => {
       const result = await queryAsUsageRole(
@@ -4594,10 +5173,7 @@ async function verifyUsageAclInheritance(
          )`,
         [nonExistingUser]
       );
-      requireHarness(
-        result.rows?.[0]?.allowed === false,
-        "EXTERNAL_FIXTURE_USAGE_RUNTIME_EXECUTION_MISMATCH"
-      );
+      assertMissingUserUsageExecutionResult(result);
     };
   await runMigrationUsageExplicitRuntimeExecutionPhase(
     context,
@@ -5187,6 +5763,121 @@ export function validateIndependentExtensionInventoryForTests(rows) {
 
 /**
  * @param {{
+ *   initialIdentityClient: object,
+ *   clientFactory: Function,
+ *   unrelatedClient?: object | null,
+ *   expectedSessionRole: string,
+ *   deadlineLimits?: object,
+ *   grantMutationForTest?: string | null,
+ *   revokeMutationForTest?: string | null,
+ * }} options
+ */
+export async function runUsageBodyAclBoundaryProbeForTests({
+  initialIdentityClient,
+  clientFactory,
+  unrelatedClient = null,
+  expectedSessionRole,
+  deadlineLimits,
+  grantMutationForTest = null,
+  revokeMutationForTest = null,
+}) {
+  assertUsageFixtureRoleSeparation(expectedSessionRole);
+  requireHarness(
+    typeof clientFactory === "function",
+    "EXTERNAL_FIXTURE_CONNECTION_FACTORY_INVALID"
+  );
+  const context = createDeadlineContext(deadlineLimits);
+  const unrelatedContext = unrelatedClient
+    ? createDeadlineContext(deadlineLimits)
+    : null;
+  const phaseTrace = [];
+  const phaseProbeState = {
+    targetPhase: null,
+    targetHitCount: 0,
+    operationStartCount: 0,
+    skippedOperationCount: 0,
+    postflightStartCount: 0,
+    connectionFactoryCallCount: 0,
+    phaseTrace,
+  };
+  INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.set(context, phaseProbeState);
+  EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.add(context);
+  let unrelatedOwnedClient = null;
+  let failureMarker = null;
+  let bodyAclWindowComplete = false;
+  let observedIdentityReference = null;
+  try {
+    if (unrelatedContext) {
+      unrelatedOwnedClient = await openClient(
+        unrelatedContext,
+        () => unrelatedClient,
+        {}
+      );
+    }
+    const preMutationBoundary = await runPreMutationSessionIdentityBoundary({
+      context,
+      clientFactory: () => initialIdentityClient,
+      credentials: {},
+      expectedSessionRole,
+      operation(_client, observedSessionIdentity) {
+        observedIdentityReference = observedSessionIdentity;
+      },
+    });
+    const { identityAuthority } = preMutationBoundary;
+    await runTemporaryUsageBodyAclWindow({
+      context,
+      clientFactory,
+      configuration: Object.freeze({
+        host: "127.0.0.1",
+        port: 5432,
+        database: "actustube_ci_fixture",
+        role: expectedSessionRole,
+      }),
+      identityAuthority,
+      observedSessionIdentity: identityAuthority.observedSessionIdentity,
+      grantMutationForTest,
+      revokeMutationForTest,
+      verificationOperation: () =>
+        verifyUsageRuntimeExecutionRoles(
+          context,
+          clientFactory,
+          Object.freeze({
+            host: "127.0.0.1",
+            port: 5432,
+            database: "actustube_ci_fixture",
+            role: expectedSessionRole,
+          })
+        ),
+    });
+    bodyAclWindowComplete = true;
+  } catch (error) {
+    failureMarker = externalFixtureFailureMarker(error);
+  } finally {
+    EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.delete(context);
+    INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.delete(context);
+    if (unrelatedContext && unrelatedOwnedClient) {
+      await closeOwnedClient(unrelatedContext, unrelatedOwnedClient);
+    }
+  }
+  return Object.freeze({
+    failureMarker,
+    bodyAclWindowComplete,
+    timedOut: context.timedOut,
+    activeClientCount: context.activeClients.size,
+    observedIdentityFrozen:
+      observedIdentityReference !== null &&
+      Object.isFrozen(observedIdentityReference) &&
+      exactOwnKeys(observedIdentityReference, ["sessionRole"]),
+    phaseTrace: Object.freeze([...phaseTrace]),
+    operationStarts: Object.freeze({ ...context.operationStarts }),
+    unrelatedActiveClientCount: unrelatedContext?.activeClients.size ?? 0,
+    unrelatedUsable: unrelatedOwnedClient?.usable === true,
+    unrelatedDestroyed: unrelatedOwnedClient?.destroyed === true,
+  });
+}
+
+/**
+ * @param {{
  *   client: object,
  *   unrelatedClient?: object | null,
  *   expectedSessionRole: string,
@@ -5691,6 +6382,22 @@ const INTERNAL_PHASE_PROBE_SCENARIOS = Object.freeze({
   "migration-replay-owner-postcondition-failure": Object.freeze({
     kind: "phase",
     phase: EXTERNAL_FIXTURE_PHASES.migrationReplayOwnerPostcondition,
+  }),
+  "migration-usage-body-acl-grant-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclGrant,
+  }),
+  "migration-usage-body-acl-grant-inventory-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclGrantInventory,
+  }),
+  "migration-usage-body-acl-revoke-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclRevoke,
+  }),
+  "migration-usage-body-acl-zero-residue-failure": Object.freeze({
+    kind: "phase",
+    phase: EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclZeroResidue,
   }),
   "migration-usage-acl-inheritance-failure": Object.freeze({
     kind: "phase",

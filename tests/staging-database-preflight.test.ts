@@ -33,6 +33,7 @@ import {
   runHarnessTransactionBoundaryProbeForTests,
   runMigrationOwnerBoundaryProbeForTests,
   runOwnershipCanonicalizationProbeForTests,
+  runUsageBodyAclBoundaryProbeForTests,
   validateExternalFixtureConfigurationForTests,
   validateIndependentExtensionInventoryForTests,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
@@ -166,6 +167,18 @@ const externalFixturePhaseMarkerOracle = Object.freeze([
     phase: "MIGRATION_REPLAY_OWNER_POSTCONDITION",
     marker:
       "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY_OWNER_POSTCONDITION",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-body-acl-grant-failure",
+    phase: "MIGRATION_USAGE_BODY_ACL_GRANT",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-body-acl-grant-inventory-failure",
+    phase: "MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY",
   }),
   Object.freeze({
     scenario: "migration-usage-acl-inheritance-failure",
@@ -408,6 +421,18 @@ const externalFixturePhaseMarkerOracle = Object.freeze([
       "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_LIFECYCLE_CLEANUP",
   }),
   Object.freeze({
+    scenario: "migration-usage-body-acl-revoke-failure",
+    phase: "MIGRATION_USAGE_BODY_ACL_REVOKE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_REVOKE",
+  }),
+  Object.freeze({
+    scenario: "migration-usage-body-acl-zero-residue-failure",
+    phase: "MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE",
+    marker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE",
+  }),
+  Object.freeze({
     scenario: "migration-runtime-acl-configuration-failure",
     phase: "MIGRATION_RUNTIME_ACL_CONFIGURATION",
     marker:
@@ -517,6 +542,8 @@ const externalFixtureProductionPhaseOrder = Object.freeze([
   "MIGRATION_REPLAY",
   "MIGRATION_REPLAY_OWNER_POSTCONDITION",
   "MIGRATION_CLIENT_CLOSE",
+  "MIGRATION_USAGE_BODY_ACL_GRANT",
+  "MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY",
   "MIGRATION_USAGE_ACL_INHERITANCE",
   "MIGRATION_USAGE_OWNER_POSTCONDITION",
   "MIGRATION_USAGE_OWNER_INHERITANCE",
@@ -557,6 +584,8 @@ const externalFixtureProductionPhaseOrder = Object.freeze([
   "MIGRATION_RESERVATION_STALE_SETUP",
   "MIGRATION_RESERVATION_STALE_RECOVERY",
   "MIGRATION_RESERVATION_LIFECYCLE_CLEANUP",
+  "MIGRATION_USAGE_BODY_ACL_REVOKE",
+  "MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE",
   "MIGRATION_RUNTIME_ACL_CONFIGURATION",
   "TRANSACTION_ROLLBACK_CONTROL",
   "CLEANUP_CLIENT_CONNECT",
@@ -2215,6 +2244,376 @@ function createObservedSessionIdentityFakeClient({
   return { client, state };
 }
 
+const testUsageBodyAclRoles = {
+  explicit: "actustube_ci_usage_explicit",
+  group: "actustube_ci_usage_group",
+  member: "actustube_ci_usage_member",
+  denied: "actustube_ci_usage_denied",
+  publicProbe: "actustube_ci_usage_public_probe",
+  migrationExecutor: testMigrationExecutor,
+  legacyOwner: testLegacyOwner,
+  productionRuntime: "actustube_ci_fixture_runtime",
+} as const;
+
+const testUsageBodyAclManifest = [
+  {
+    objectName: "users",
+    privileges: ["SELECT", "UPDATE"],
+  },
+  {
+    objectName: "user_plan_assignments",
+    privileges: ["SELECT"],
+  },
+  {
+    objectName: "plans",
+    privileges: ["SELECT"],
+  },
+  {
+    objectName: "user_usage_buckets",
+    privileges: ["SELECT", "INSERT", "UPDATE"],
+  },
+  {
+    objectName: "usage_reservation_leases",
+    privileges: ["SELECT", "INSERT"],
+  },
+] as const;
+
+const testUsageBodyAclRecipients = [
+  testUsageBodyAclRoles.explicit,
+  testUsageBodyAclRoles.group,
+] as const;
+
+const testUsageBodyAclInventoryRoleScope = [
+  ...testUsageBodyAclRecipients,
+  testUsageBodyAclRoles.member,
+  testUsageBodyAclRoles.denied,
+  testUsageBodyAclRoles.publicProbe,
+  testUsageBodyAclRoles.migrationExecutor,
+  testUsageBodyAclRoles.legacyOwner,
+  testUsageBodyAclRoles.productionRuntime,
+] as const;
+
+const exactUsageBodyAclGrantContract = testUsageBodyAclManifest
+  .map(
+    (entry) =>
+      `GRANT ${entry.privileges.join(", ")} ON TABLE "public"."${entry.objectName}" TO "${testUsageBodyAclRoles.explicit}", "${testUsageBodyAclRoles.group}" GRANTED BY "${testFixtureSessionRole}"`
+  )
+  .join(";\n");
+
+const exactUsageBodyAclRevokeContract = testUsageBodyAclManifest
+  .map(
+    (entry) =>
+      `REVOKE ${entry.privileges.join(", ")} ON TABLE "public"."${entry.objectName}" FROM "${testUsageBodyAclRoles.explicit}", "${testUsageBodyAclRoles.group}" GRANTED BY "${testFixtureSessionRole}"`
+  )
+  .join(";\n");
+
+const exactMissingUserUsageExecutionContract = `SELECT allowed FROM public.reserve_usage_limits_v2(
+  $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+  statement_timestamp()
+)`;
+const exactDeniedUsageExecutionContract = `SELECT * FROM public.reserve_usage_limits_v2(
+  $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+  statement_timestamp()
+)`;
+const exactMissingUserUsageExecutionParameters = [
+  "10000000-0000-4000-8000-000000000001",
+] as const;
+
+type TestUsageBodyAclRow = {
+  authority_kind: string;
+  recipient_relation: string;
+  grantor_name: string;
+  grantee_name: string;
+  object_kind: string;
+  schema_name: string;
+  object_name: string;
+  privilege_type: string;
+  grant_option: boolean;
+  shared_dependency_covered: boolean;
+};
+
+const testUsageBodyAclRowKeys = [
+  "authority_kind",
+  "recipient_relation",
+  "grantor_name",
+  "grantee_name",
+  "object_kind",
+  "schema_name",
+  "object_name",
+  "privilege_type",
+  "grant_option",
+  "shared_dependency_covered",
+] as const;
+
+function sortTestUsageBodyAclRows(rows: TestUsageBodyAclRow[]) {
+  return [...rows].sort((left, right) => {
+    for (const key of testUsageBodyAclRowKeys) {
+      const comparison = String(left[key]).localeCompare(String(right[key]));
+      if (comparison !== 0) return comparison;
+    }
+    return 0;
+  });
+}
+
+function validTestUsageBodyAclRows({
+  grantorName = testFixtureSessionRole,
+}: {
+  grantorName?: string;
+} = {}): TestUsageBodyAclRow[] {
+  const rows: TestUsageBodyAclRow[] = [];
+  for (const entry of testUsageBodyAclManifest) {
+    for (const granteeName of testUsageBodyAclRecipients) {
+      for (const privilegeType of entry.privileges) {
+        rows.push({
+          authority_kind: "explicit_acl",
+          recipient_relation:
+            granteeName === testUsageBodyAclRoles.explicit
+              ? "explicit_direct"
+              : "membership_group_direct",
+          grantor_name: grantorName,
+          grantee_name: granteeName,
+          object_kind: "table",
+          schema_name: "public",
+          object_name: entry.objectName,
+          privilege_type: privilegeType,
+          grant_option: false,
+          shared_dependency_covered: true,
+        });
+      }
+    }
+  }
+  return sortTestUsageBodyAclRows(rows);
+}
+
+function testUsageBodyAclResidueRow(
+  overrides: Partial<TestUsageBodyAclRow> = {}
+): TestUsageBodyAclRow {
+  return {
+    authority_kind: "explicit_acl",
+    recipient_relation: "explicit_direct",
+    grantor_name: testFixtureSessionRole,
+    grantee_name: testUsageBodyAclRoles.explicit,
+    object_kind: "table",
+    schema_name: "public",
+    object_name: "users",
+    privilege_type: "SELECT",
+    grant_option: false,
+    shared_dependency_covered: true,
+    ...overrides,
+  };
+}
+
+type UsageBodyAclFakeOptions = {
+  grantedRows?: TestUsageBodyAclRow[];
+  executionRows?: TestUsageBodyAclRow[];
+  postRevokeRows?: TestUsageBodyAclRow[];
+  schemaUsageRecipients?: string[];
+  functionExecuteRecipients?: string[];
+  explicitResultRows?: Array<Record<string, unknown>>;
+  membershipResultRows?: Array<Record<string, unknown>>;
+  rejectOnLabel?: string | null;
+  hangOnLabel?: string | null;
+};
+
+function createUsageBodyAclFakeHarness({
+  grantedRows = validTestUsageBodyAclRows(),
+  executionRows = grantedRows,
+  postRevokeRows = [],
+  schemaUsageRecipients = [
+    testUsageBodyAclRoles.explicit,
+    testUsageBodyAclRoles.group,
+    testUsageBodyAclRoles.denied,
+    testUsageBodyAclRoles.publicProbe,
+  ],
+  functionExecuteRecipients = [
+    testUsageBodyAclRoles.explicit,
+    testUsageBodyAclRoles.group,
+  ],
+  explicitResultRows = [{ allowed: false }],
+  membershipResultRows = [{ allowed: false }],
+  rejectOnLabel = null,
+  hangOnLabel = null,
+}: UsageBodyAclFakeOptions = {}) {
+  const state = {
+    aclRows: [] as TestUsageBodyAclRow[],
+    queryLog: [] as Array<{
+      statement: string;
+      parameters: unknown[];
+      label: string;
+    }>,
+    grantAttemptCount: 0,
+    exactGrantCount: 0,
+    revokeAttemptCount: 0,
+    exactRevokeCount: 0,
+    inventoryCount: 0,
+    executionCount: 0,
+    connectCount: 0,
+    endCount: 0,
+    destroyCount: 0,
+  };
+
+  function hasCompleteBodyAuthority(granteeName: string) {
+    return (
+      schemaUsageRecipients.includes(granteeName) &&
+      functionExecuteRecipients.includes(granteeName) &&
+      testUsageBodyAclManifest.every((entry) =>
+        entry.privileges.every((privilegeType) =>
+          executionRows.some(
+            (row) =>
+              row.authority_kind === "explicit_acl" &&
+              row.grantee_name === granteeName &&
+              row.object_kind === "table" &&
+              row.schema_name === "public" &&
+              row.object_name === entry.objectName &&
+              row.privilege_type === privilegeType &&
+              row.grant_option === false &&
+              row.shared_dependency_covered === true
+          )
+        )
+      )
+    );
+  }
+
+  function createClient() {
+    let activeRole = testFixtureSessionRole;
+    let destroyed = false;
+    return {
+      connection: {
+        stream: {
+          destroy() {
+            if (!destroyed) state.destroyCount += 1;
+            destroyed = true;
+          },
+        },
+      },
+      connect() {
+        state.connectCount += 1;
+        return Promise.resolve();
+      },
+      query(
+        statementOrConfiguration: string | { text: string; values?: unknown[] },
+        parameters: unknown[] = []
+      ) {
+        const statement =
+          typeof statementOrConfiguration === "string"
+            ? statementOrConfiguration
+            : statementOrConfiguration.text;
+        const effectiveParameters =
+          typeof statementOrConfiguration === "string"
+            ? parameters
+            : Array.isArray(statementOrConfiguration.values)
+              ? statementOrConfiguration.values
+              : parameters;
+        const normalized = normalizeExactRevokeSql(statement);
+        let label = "other";
+        if (normalized.startsWith("GRANT ")) {
+          label = "body-acl-grant";
+          state.grantAttemptCount += 1;
+          if (
+            normalized === normalizeExactRevokeSql(exactUsageBodyAclGrantContract) &&
+            JSON.stringify(effectiveParameters) === "[]"
+          ) {
+            label = "body-acl-grant-exact";
+            state.exactGrantCount += 1;
+            state.aclRows = grantedRows.map((row) => ({ ...row }));
+          }
+        } else if (normalized.startsWith("REVOKE ")) {
+          label = "body-acl-revoke";
+          state.revokeAttemptCount += 1;
+          if (
+            normalized === normalizeExactRevokeSql(exactUsageBodyAclRevokeContract) &&
+            JSON.stringify(effectiveParameters) === "[]"
+          ) {
+            label = "body-acl-revoke-exact";
+            state.exactRevokeCount += 1;
+            state.aclRows = postRevokeRows.map((row) => ({ ...row }));
+          }
+        } else if (
+          statement.includes("target_objects(object_name, ordinal)") &&
+          statement.includes("shared_dependency_covered")
+        ) {
+          label = "body-acl-inventory";
+          state.inventoryCount += 1;
+          if (
+            JSON.stringify(effectiveParameters) !==
+            JSON.stringify([[...testUsageBodyAclInventoryRoleScope]])
+          ) {
+            return Promise.reject(new Error("fixed-body-acl-parameter-mismatch"));
+          }
+        } else if (normalized === "BEGIN") {
+          label = "begin";
+        } else if (normalized === "ROLLBACK") {
+          label = "rollback";
+        } else if (normalized.startsWith("SET LOCAL ROLE ")) {
+          label = "set-role";
+          const roleMatch = normalized.match(/^SET LOCAL ROLE "([a-z0-9_]+)"$/);
+          activeRole = roleMatch?.[1] ?? "invalid_role";
+        } else if (
+          normalized ===
+            normalizeExactRevokeSql(exactMissingUserUsageExecutionContract) ||
+          normalized === normalizeExactRevokeSql(exactDeniedUsageExecutionContract)
+        ) {
+          label = "missing-user-execution";
+          state.executionCount += 1;
+        }
+        state.queryLog.push({
+          statement,
+          parameters: [...effectiveParameters],
+          label,
+        });
+        if (label === hangOnLabel) return new Promise(() => undefined);
+        if (label === rejectOnLabel) {
+          return Promise.reject(new Error("fixed-body-acl-failure"));
+        }
+        if (label === "body-acl-inventory") {
+          return Promise.resolve({ rows: state.aclRows.map((row) => ({ ...row })) });
+        }
+        if (label === "missing-user-execution") {
+          if (
+            JSON.stringify(effectiveParameters) !==
+            JSON.stringify([...exactMissingUserUsageExecutionParameters])
+          ) {
+            return Promise.reject({ code: "42501" });
+          }
+          const authorityGrantee =
+            activeRole === testUsageBodyAclRoles.explicit
+              ? testUsageBodyAclRoles.explicit
+              : activeRole === testUsageBodyAclRoles.member
+                ? testUsageBodyAclRoles.group
+                : null;
+          if (
+            normalized === normalizeExactRevokeSql(exactDeniedUsageExecutionContract)
+          ) {
+            return Promise.reject({ code: "42501" });
+          }
+          if (
+            authorityGrantee === null ||
+            !hasCompleteBodyAuthority(authorityGrantee)
+          ) {
+            return Promise.reject({ code: "42501" });
+          }
+          return Promise.resolve({
+            rows:
+              activeRole === testUsageBodyAclRoles.explicit
+                ? explicitResultRows
+                : membershipResultRows,
+          });
+        }
+        return Promise.resolve({ rows: [] });
+      },
+      end() {
+        state.endCount += 1;
+        return Promise.resolve();
+      },
+    };
+  }
+
+  return {
+    state,
+    clientFactory: () => createClient(),
+  };
+}
+
 const testRepositoryTables = [
   "analysis_runs",
   "improvement_actions",
@@ -2960,6 +3359,441 @@ async function runDirectHarnessInvocation(
   );
 }
 
+describe("temporary usage body-object ACL boundary", () => {
+  async function runBodyAclProbe({
+    fakeOptions,
+    grantMutationForTest = null,
+    revokeMutationForTest = null,
+    deadlineLimits,
+    unrelatedClient = null,
+  }: {
+    fakeOptions?: UsageBodyAclFakeOptions;
+    grantMutationForTest?: string | null;
+    revokeMutationForTest?: string | null;
+    deadlineLimits?: Record<string, number>;
+    unrelatedClient?: ReturnType<
+      typeof createObservedSessionIdentityFakeClient
+    >["client"] | null;
+  } = {}) {
+    const initial = createObservedSessionIdentityFakeClient();
+    const fake = createUsageBodyAclFakeHarness(fakeOptions);
+    const result = await runUsageBodyAclBoundaryProbeForTests({
+      initialIdentityClient: initial.client,
+      clientFactory: fake.clientFactory,
+      unrelatedClient,
+      expectedSessionRole: testFixtureSessionRole,
+      deadlineLimits,
+      grantMutationForTest,
+      revokeMutationForTest,
+    });
+    return { initial, fake, result };
+  }
+
+  it("uses exact body-object ACL grants for explicit runtime and membership runtime inheritance, then proves zero residue", async () => {
+    const { fake, result } = await runBodyAclProbe();
+
+    expect(result).toMatchObject({
+      failureMarker: null,
+      bodyAclWindowComplete: true,
+      timedOut: false,
+      activeClientCount: 0,
+      observedIdentityFrozen: true,
+    });
+    expect(fake.state.exactGrantCount).toBe(1);
+    expect(fake.state.exactRevokeCount).toBe(1);
+    expect(fake.state.inventoryCount).toBe(2);
+    expect(fake.state.executionCount).toBe(4);
+    expect(fake.state.aclRows).toEqual([]);
+    expect(exactUsageBodyAclGrantContract.split(";\n")).toHaveLength(5);
+    expect(exactUsageBodyAclRevokeContract.split(";\n")).toHaveLength(5);
+    expect(
+      fake.state.queryLog.filter((entry) => entry.label === "body-acl-grant-exact")
+    ).toEqual([
+      expect.objectContaining({
+        statement: exactUsageBodyAclGrantContract,
+        parameters: [],
+      }),
+    ]);
+    expect(
+      fake.state.queryLog.filter((entry) => entry.label === "body-acl-revoke-exact")
+    ).toEqual([
+      expect.objectContaining({
+        statement: exactUsageBodyAclRevokeContract,
+        parameters: [],
+      }),
+    ]);
+    const phaseOrder = [
+      "MIGRATION_USAGE_BODY_ACL_GRANT",
+      "MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY",
+      "MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+      "MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+      "MIGRATION_USAGE_DENIED_RUNTIME_EXECUTION",
+      "MIGRATION_USAGE_PUBLIC_RUNTIME_EXECUTION",
+      "MIGRATION_USAGE_BODY_ACL_REVOKE",
+      "MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE",
+    ];
+    expect(
+      result.phaseTrace.filter((phase) => phaseOrder.includes(phase))
+    ).toEqual(phaseOrder);
+  });
+
+  it.each([
+    "wrong-object",
+    "wrong-privilege",
+    "wrong-recipient",
+    "wrong-grantor",
+    "wrong-privilege-order",
+    "wrong-statement-order",
+    "prefix-only",
+    "trailing-sql",
+    "query-config-values",
+  ])(
+    "rejects the independent exact body-object ACL SQL oracle mutation %s",
+    async (grantMutationForTest) => {
+      const { fake, result } = await runBodyAclProbe({ grantMutationForTest });
+
+      expect(result.bodyAclWindowComplete).toBe(false);
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+      );
+      expect(fake.state.exactGrantCount).toBe(0);
+      expect(fake.state.executionCount).toBe(0);
+      expect(fake.state.exactRevokeCount).toBe(1);
+      expect(fake.state.aclRows).toEqual([]);
+    }
+  );
+
+  it.each([
+    [
+      "explicit schema lookup",
+      { schemaUsageRecipients: [testUsageBodyAclRoles.group] },
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+    ],
+    [
+      "explicit function execution",
+      { functionExecuteRecipients: [testUsageBodyAclRoles.group] },
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+    ],
+    [
+      "membership group schema lookup",
+      { schemaUsageRecipients: [testUsageBodyAclRoles.explicit] },
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+    ],
+    [
+      "membership group function execution",
+      { functionExecuteRecipients: [testUsageBodyAclRoles.explicit] },
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+    ],
+  ])(
+    "rejects missing independent %s authority before returning a fake result",
+    async (_label, fakeOptions, expectedMarker) => {
+      const { fake, result } = await runBodyAclProbe({ fakeOptions });
+
+      expect(result.failureMarker).toBe(expectedMarker);
+      expect(fake.state.exactRevokeCount).toBe(1);
+      expect(fake.state.aclRows).toEqual([]);
+    }
+  );
+
+  it.each(
+    testUsageBodyAclManifest.flatMap((entry) =>
+      entry.privileges.map((privilegeType) => [entry.objectName, privilegeType])
+    )
+  )(
+    "fails explicit runtime execution when body-object ACL %s %s is absent even after the catalog oracle passed",
+    async (objectName, privilegeType) => {
+      const executionRows = validTestUsageBodyAclRows().filter(
+        (row) =>
+          !(
+            row.grantee_name === testUsageBodyAclRoles.explicit &&
+            row.object_name === objectName &&
+            row.privilege_type === privilegeType
+          )
+      );
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { executionRows },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION"
+      );
+      expect(fake.state.executionCount).toBe(1);
+      expect(fake.state.exactRevokeCount).toBe(1);
+      expect(fake.state.inventoryCount).toBe(2);
+      expect(fake.state.aclRows).toEqual([]);
+    }
+  );
+
+  it.each([
+    [
+      "missing membership group grant",
+      validTestUsageBodyAclRows().filter(
+        (row) => row.grantee_name !== testUsageBodyAclRoles.group
+      ),
+    ],
+    [
+      "membership leaf direct grants only",
+      validTestUsageBodyAclRows().map((row) =>
+        row.grantee_name === testUsageBodyAclRoles.group
+          ? {
+              ...row,
+              recipient_relation: "unexpected",
+              grantee_name: testUsageBodyAclRoles.member,
+            }
+          : row
+      ),
+    ],
+  ])("rejects membership runtime execution with %s", async (_label, executionRows) => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { executionRows },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION"
+    );
+    expect(fake.state.executionCount).toBe(2);
+    expect(fake.state.exactRevokeCount).toBe(1);
+    expect(fake.state.aclRows).toEqual([]);
+  });
+
+  it.each([
+    [
+      "wrong grantor",
+      validTestUsageBodyAclRows().map((row, index) =>
+        index === 0 ? { ...row, grantor_name: "wrong_fixture_grantor" } : row
+      ),
+    ],
+    [
+      "wrong grantee",
+      validTestUsageBodyAclRows().map((row, index) =>
+        index === 0
+          ? { ...row, grantee_name: testUsageBodyAclRoles.denied }
+          : row
+      ),
+    ],
+    [
+      "denied recipient",
+      [
+        ...validTestUsageBodyAclRows(),
+        testUsageBodyAclResidueRow({
+          recipient_relation: "unexpected",
+          grantee_name: testUsageBodyAclRoles.denied,
+        }),
+      ],
+    ],
+    [
+      "PUBLIC recipient",
+      [
+        ...validTestUsageBodyAclRows(),
+        testUsageBodyAclResidueRow({
+          recipient_relation: "unexpected",
+          grantee_name: "PUBLIC",
+        }),
+      ],
+    ],
+    [
+      "uncovered dependency",
+      [
+        ...validTestUsageBodyAclRows(),
+        testUsageBodyAclResidueRow({
+          authority_kind: "uncovered_acl_dependency",
+          recipient_relation: "unexpected",
+          grantor_name: "UNRESOLVED",
+          privilege_type: "ACL_DEPENDENCY",
+          shared_dependency_covered: false,
+        }),
+      ],
+    ],
+  ])("fails the post-GRANT exact catalog inventory for %s", async (_label, grantedRows) => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { grantedRows },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+    );
+    expect(fake.state.executionCount).toBe(0);
+    expect(fake.state.exactRevokeCount).toBe(1);
+    expect(fake.state.aclRows).toEqual([]);
+  });
+
+  it.each([
+    ["zero rows", []],
+    ["two rows", [{ allowed: false }, { allowed: false }]],
+    ["missing key", [{}]],
+    ["extra key", [{ allowed: false, extra: false }]],
+    ["null", [{ allowed: null }]],
+    ["string", [{ allowed: "false" }]],
+    ["boolean true", [{ allowed: true }]],
+  ])("rejects the strict missing-user result contract for %s", async (_label, explicitResultRows) => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { explicitResultRows },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION"
+    );
+    expect(fake.state.exactRevokeCount).toBe(1);
+    expect(fake.state.aclRows).toEqual([]);
+  });
+
+  it("does not replace a primary usage failure with a later bounded REVOKE failure", async () => {
+    const executionRows = validTestUsageBodyAclRows().filter(
+      (row) =>
+        !(
+          row.grantee_name === testUsageBodyAclRoles.explicit &&
+          row.object_name === "users" &&
+          row.privilege_type === "SELECT"
+        )
+    );
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: {
+        executionRows,
+        rejectOnLabel: "body-acl-revoke-exact",
+      },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION"
+    );
+    expect(fake.state.revokeAttemptCount).toBe(1);
+    expect(fake.state.exactRevokeCount).toBe(1);
+  });
+
+  it("reports an exact bounded REVOKE failure when verification succeeded", async () => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { rejectOnLabel: "body-acl-revoke-exact" },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_REVOKE"
+    );
+    expect(result.bodyAclWindowComplete).toBe(false);
+    expect(fake.state.revokeAttemptCount).toBe(1);
+  });
+
+  it("keeps authority residue when the bounded REVOKE SQL is incomplete", async () => {
+    const { fake, result } = await runBodyAclProbe({
+      revokeMutationForTest: "prefix-only",
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+    );
+    expect(fake.state.revokeAttemptCount).toBe(1);
+    expect(fake.state.exactRevokeCount).toBe(0);
+    expect(fake.state.aclRows).toHaveLength(18);
+  });
+
+  it.each([
+    ["grantor residue", testUsageBodyAclResidueRow()],
+    [
+      "grantee residue",
+      testUsageBodyAclResidueRow({
+        grantee_name: testUsageBodyAclRoles.group,
+        recipient_relation: "membership_group_direct",
+      }),
+    ],
+    [
+      "dependency residue",
+      testUsageBodyAclResidueRow({
+        authority_kind: "uncovered_acl_dependency",
+        recipient_relation: "unexpected",
+        grantor_name: "UNRESOLVED",
+        privilege_type: "ACL_DEPENDENCY",
+        shared_dependency_covered: false,
+      }),
+    ],
+  ])("rejects post-REVOKE %s before later runtime ACL work", async (_label, residue) => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { postRevokeRows: [residue] },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+    );
+    expect(fake.state.inventoryCount).toBe(2);
+    expect(fake.state.aclRows).toHaveLength(1);
+  });
+
+  it("attempts bounded cleanup after a usage timeout and leaves an unrelated Client undestroyed", async () => {
+    const unrelated = createObservedSessionIdentityFakeClient();
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { hangOnLabel: "missing-user-execution" },
+      deadlineLimits: {
+        totalMilliseconds: 100,
+        connectMilliseconds: 20,
+        queryMilliseconds: 5,
+        closeMilliseconds: 20,
+      },
+      unrelatedClient: unrelated.client,
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION"
+    );
+    expect(result.timedOut).toBe(true);
+    expect(result.phaseTrace).toContain("MIGRATION_USAGE_BODY_ACL_REVOKE");
+    expect(fake.state.exactRevokeCount).toBe(0);
+    expect(fake.state.destroyCount).toBeGreaterThanOrEqual(1);
+    expect(result.unrelatedDestroyed).toBe(false);
+    expect(result.unrelatedActiveClientCount).toBe(0);
+  });
+
+  it("keeps the body-object ACL manifest fixed, least-privilege, invoker-only, and ahead of runtime ACL configuration", async () => {
+    const source = await readFile(
+      resolve(repositoryRoot, "scripts/test-staging-database-preflight-postgres.mjs"),
+      "utf8"
+    );
+    const boundaryStart = source.indexOf(
+      "async function runTemporaryUsageBodyAclWindow({"
+    );
+    const boundaryEnd = source.indexOf(
+      "async function configureRuntimeAcl",
+      boundaryStart
+    );
+    const boundarySource = source.slice(boundaryStart, boundaryEnd);
+    const applyStart = source.indexOf(
+      "async function applyMigrationsAndRuntimeAcl("
+    );
+    const applyEnd = source.indexOf("function usageSignatureArraySql", applyStart);
+    const applySource = source.slice(applyStart, applyEnd);
+    const grantWindowIndex = applySource.indexOf(
+      "await runTemporaryUsageBodyAclWindow({"
+    );
+    const runtimeAclIndex = applySource.indexOf(
+      "await runMigrationRuntimeAclConfigurationPhase",
+      grantWindowIndex
+    );
+    const revokeIndex = boundarySource.indexOf(
+      "await runMigrationUsageBodyAclRevokePhase"
+    );
+    const zeroResidueIndex = boundarySource.indexOf(
+      "runMigrationUsageBodyAclZeroResiduePhase",
+      revokeIndex
+    );
+    const boundaryReturnIndex = boundarySource.indexOf("return verificationResult");
+
+    expect(source).toContain("const USAGE_BODY_OBJECT_ACL_MANIFEST = Object.freeze([");
+    expect(source).toContain("dependency_entry.deptype = 'a'");
+    expect(source).toContain("shared_dependency_covered");
+    expect(source).toContain("assertMissingUserUsageExecutionResult(result)");
+    expect(source).toContain("GRANTED BY ${grantor}");
+    expect(source).not.toMatch(/GRANT\s+ALL\s+ON\s+TABLE/i);
+    expect(exactUsageBodyAclGrantContract).not.toContain("PUBLIC");
+    expect(exactUsageBodyAclGrantContract).not.toContain(testUsageBodyAclRoles.denied);
+    expect(exactUsageBodyAclGrantContract).not.toContain(testUsageBodyAclRoles.member);
+    expect(exactUsageBodyAclGrantContract).not.toContain(
+      testUsageBodyAclRoles.productionRuntime
+    );
+    expect(grantWindowIndex).toBeGreaterThan(-1);
+    expect(revokeIndex).toBeGreaterThan(-1);
+    expect(zeroResidueIndex).toBeGreaterThan(revokeIndex);
+    expect(boundaryReturnIndex).toBeGreaterThan(zeroResidueIndex);
+    expect(runtimeAclIndex).toBeGreaterThan(grantWindowIndex);
+  });
+});
+
 describe("connection-only external fixture boundary", () => {
   it("has no database lifecycle authority or lifecycle adapter seam", async () => {
     expect(harnessAuthorityBoundaryForTests()).toEqual({
@@ -3023,6 +3857,7 @@ describe("connection-only external fixture boundary", () => {
         "runHarnessTransactionBoundaryProbeForTests",
         "runMigrationOwnerBoundaryProbeForTests",
         "runOwnershipCanonicalizationProbeForTests",
+        "runUsageBodyAclBoundaryProbeForTests",
         "validateExternalFixtureConfigurationForTests",
         "validateIndependentExtensionInventoryForTests",
       ].sort()
@@ -6200,16 +7035,16 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
   ].sort();
 
   it("keeps the independent literal oracle complete and duplicate-free", () => {
-    expect(externalFixturePhaseMarkerOracle).toHaveLength(74);
+    expect(externalFixturePhaseMarkerOracle).toHaveLength(78);
     expect(
       new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.scenario)).size
-    ).toBe(74);
+    ).toBe(78);
     expect(
       new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.phase)).size
-    ).toBe(74);
+    ).toBe(78);
     expect(
       new Set(externalFixturePhaseMarkerOracle.map((entry) => entry.marker)).size
-    ).toBe(74);
+    ).toBe(78);
     expect(externalFixtureUnknownMarkerOracle).toHaveLength(5);
     expect(
       new Set(externalFixtureUnknownMarkerOracle.map((entry) => entry.scenario))
@@ -6237,6 +7072,14 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
         "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_REPLAY_OWNER_POSTCONDITION",
       ],
       [
+        "migration-usage-body-acl-grant-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT",
+      ],
+      [
+        "migration-usage-body-acl-grant-inventory-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY",
+      ],
+      [
         "migration-usage-acl-inheritance-failure",
         "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_ACL_INHERITANCE",
       ],
@@ -6247,6 +7090,14 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       [
         "migration-reservation-lifecycle-failure",
         "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_LIFECYCLE",
+      ],
+      [
+        "migration-usage-body-acl-revoke-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_REVOKE",
+      ],
+      [
+        "migration-usage-body-acl-zero-residue-failure",
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE",
       ],
       [
         "migration-runtime-acl-configuration-failure",
@@ -6275,6 +7126,25 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
         0,
         targetIndex + 1
       );
+      const bodyAclGrantIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "MIGRATION_USAGE_BODY_ACL_GRANT"
+      );
+      const bodyAclRevokeIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "MIGRATION_USAGE_BODY_ACL_REVOKE"
+      );
+      const bodyAclZeroResidueIndex = externalFixtureProductionPhaseOrder.indexOf(
+        "MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+      );
+      const bodyAclCleanupRunsAfterPrimaryFailure =
+        targetIndex >= bodyAclGrantIndex && targetIndex < bodyAclRevokeIndex;
+      if (bodyAclCleanupRunsAfterPrimaryFailure) {
+        expectedTrace.push(
+          ...externalFixtureProductionPhaseOrder.slice(
+            bodyAclRevokeIndex,
+            bodyAclZeroResidueIndex + 1
+          )
+        );
+      }
       const fixtureCloseIndex = externalFixtureProductionPhaseOrder.indexOf(
         "FIXTURE_CLIENT_CLOSE"
       );
@@ -6319,7 +7189,7 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
               !actualLifecyclePhases.includes(candidate) &&
               !probeContainerPhases.includes(candidate)
           )
-          .length;
+          .length + (bodyAclCleanupRunsAfterPrimaryFailure ? 2 : 0);
       const expectedClientCount =
         1 +
         (targetIndex >= preMutationConnectIndex ? 1 : 0) +
@@ -6424,7 +7294,7 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       phaseStartCount: externalFixtureProductionPhaseOrder.length,
       targetHitCount: 0,
       operationStartCount: 9,
-      skippedOperationCount: 66,
+      skippedOperationCount: 70,
       postflightStartCount: 2,
       connectionFactoryCallCount: 4,
       targetConnectCount: 4,
