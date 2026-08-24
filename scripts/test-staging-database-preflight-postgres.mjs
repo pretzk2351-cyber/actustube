@@ -1161,6 +1161,10 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
     SELECT role_entry.oid, role_entry.rolname
     FROM pg_catalog.pg_roles AS role_entry
     WHERE role_entry.rolname = ANY($1::text[])
+  ), observed_grantor AS (
+    SELECT role_entry.oid, role_entry.rolname
+    FROM pg_catalog.pg_roles AS role_entry
+    WHERE role_entry.rolname = $2::text
   ), target_objects(object_name, ordinal) AS (
     VALUES
       ('users'::text, 1),
@@ -1177,6 +1181,7 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
       relation_entry.oid,
       namespace_entry.nspname,
       relation_entry.relname,
+      relation_entry.relowner,
       target_object.ordinal
     FROM target_objects AS target_object
     INNER JOIN pg_catalog.pg_namespace AS namespace_entry
@@ -1185,11 +1190,12 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
       ON relation_entry.relnamespace = namespace_entry.oid
       AND relation_entry.relname = target_object.object_name
       AND relation_entry.relkind IN ('r', 'p')
-  ), explicit_acl AS (
+  ), all_explicit_acl AS (
     SELECT
       relation_entry.oid AS relation_oid,
       relation_entry.nspname,
       relation_entry.relname,
+      relation_entry.relowner,
       relation_entry.ordinal,
       acl.grantor,
       acl.grantee,
@@ -1210,9 +1216,14 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
       ON grantor_identity.oid = acl.grantor
     LEFT JOIN pg_catalog.pg_roles AS grantee_identity
       ON grantee_identity.oid = acl.grantee
-    WHERE acl.grantee = 0
-       OR acl.grantee IN (SELECT oid FROM target_roles)
-       OR acl.grantor IN (SELECT oid FROM target_roles)
+  ), explicit_acl AS (
+    SELECT all_explicit_acl.*
+    FROM all_explicit_acl
+    WHERE all_explicit_acl.grantee IN (SELECT oid FROM target_roles)
+       OR (
+         all_explicit_acl.grantor = (SELECT oid FROM observed_grantor)
+         AND all_explicit_acl.grantee <> all_explicit_acl.relowner
+       )
   ), relevant_dependencies AS (
     SELECT
       dependency_entry.dbid,
@@ -1220,12 +1231,12 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
       dependency_entry.objid,
       dependency_entry.objsubid,
       dependency_entry.refobjid,
-      target_role.rolname AS referenced_role,
+      referenced_role.rolname AS referenced_role,
       relation_entry.nspname,
       relation_entry.relname
     FROM pg_catalog.pg_shdepend AS dependency_entry
-    INNER JOIN target_roles AS target_role
-      ON target_role.oid = dependency_entry.refobjid
+    LEFT JOIN pg_catalog.pg_roles AS referenced_role
+      ON referenced_role.oid = dependency_entry.refobjid
     LEFT JOIN relevant_relations AS relation_entry
       ON dependency_entry.classid = 'pg_catalog.pg_class'::regclass
       AND dependency_entry.objid = relation_entry.oid
@@ -1256,7 +1267,10 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
           AND dependency_entry.classid = 'pg_catalog.pg_class'::regclass
           AND dependency_entry.objid = explicit_acl.relation_oid
           AND dependency_entry.objsubid = 0
-          AND dependency_entry.refobjid = explicit_acl.grantee
+          AND dependency_entry.refobjid IN (
+            explicit_acl.grantee,
+            explicit_acl.grantor
+          )
       ) AS shared_dependency_covered,
       explicit_acl.ordinal
     FROM explicit_acl
@@ -1285,9 +1299,12 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
       AND dependency_entry.objsubid = 0
       AND NOT EXISTS (
         SELECT 1
-        FROM explicit_acl
-        WHERE explicit_acl.relation_oid = dependency_entry.objid
-          AND explicit_acl.grantee = dependency_entry.refobjid
+        FROM all_explicit_acl
+        WHERE all_explicit_acl.relation_oid = dependency_entry.objid
+          AND dependency_entry.refobjid IN (
+            all_explicit_acl.grantee,
+            all_explicit_acl.grantor
+          )
       )
   )
   SELECT
@@ -1332,6 +1349,13 @@ const HARNESS_DEADLINE_LIMITS = Object.freeze({
   closeMilliseconds: 5_000,
   phaseMilliseconds: 120_000,
   migrationMilliseconds: 180_000,
+});
+const USAGE_BODY_ACL_CLEANUP_OPERATION_COUNTS = Object.freeze({
+  connect: 1,
+  identityQuery: 1,
+  revokeQuery: 1,
+  zeroResidueQuery: 1,
+  close: 1,
 });
 const INTERNAL_PRODUCTION_WRAPPER_PROBE_STATES = new WeakMap();
 const INTERNAL_PRODUCTION_WRAPPER_PROBE_SPECIFICATION = Object.freeze({
@@ -1794,6 +1818,50 @@ function createDeadlineContext(overrides) {
       migration: 0,
     },
   };
+}
+
+function usageBodyAclCleanupReserveMilliseconds(limits) {
+  return (
+    USAGE_BODY_ACL_CLEANUP_OPERATION_COUNTS.connect *
+      limits.connectMilliseconds +
+    (USAGE_BODY_ACL_CLEANUP_OPERATION_COUNTS.identityQuery +
+      USAGE_BODY_ACL_CLEANUP_OPERATION_COUNTS.revokeQuery +
+      USAGE_BODY_ACL_CLEANUP_OPERATION_COUNTS.zeroResidueQuery) *
+      limits.queryMilliseconds +
+    USAGE_BODY_ACL_CLEANUP_OPERATION_COUNTS.close * limits.closeMilliseconds
+  );
+}
+
+function createReservedDeadlineContext(parentContext, absoluteDeadline) {
+  requireHarness(
+    Number.isFinite(absoluteDeadline) &&
+      absoluteDeadline <= parentContext.absoluteDeadline &&
+      absoluteDeadline > performance.now(),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_CLEANUP_RESERVE_UNAVAILABLE"
+  );
+  const context = {
+    limits: parentContext.limits,
+    absoluteDeadline,
+    timedOut: false,
+    activeClients: new Set(),
+    ownedClients: new Set(),
+    operationStarts: parentContext.operationStarts,
+  };
+  const probeState = INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.get(parentContext);
+  if (probeState) INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.set(context, probeState);
+  if (EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.has(parentContext)) {
+    EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.add(context);
+  }
+  return context;
+}
+
+function releaseReservedDeadlineContext(context) {
+  requireHarness(
+    context.activeClients.size === 0,
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_RESERVED_CLIENT_RESIDUE"
+  );
+  INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.delete(context);
+  EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.delete(context);
 }
 
 function remainingTotalMilliseconds(context) {
@@ -4318,50 +4386,124 @@ function usageBodyObjectAclStatement(action, grantorName) {
   ).join(";\n");
 }
 
-function mutateUsageBodyAclStatementForTest(statement, action, mutation) {
-  if (mutation === null) return statement;
+function mutateUsageBodyAclQueryForTest(statement, action, mutation) {
+  if (mutation === null) {
+    return Object.freeze({ statementOrConfiguration: statement, parameters: [] });
+  }
   requireHarness(
     (action === "GRANT" || action === "REVOKE") &&
       [
         "wrong-object",
+        "wrong-object-kind",
         "wrong-privilege",
+        "wrong-privilege-set",
         "wrong-recipient",
         "wrong-grantor",
         "wrong-privilege-order",
         "wrong-statement-order",
         "prefix-only",
+        "missing-suffix",
         "trailing-sql",
-        "query-config-values",
+        "unexpected-separate-parameter",
+        "non-array-parameter",
+        "query-config-values-nonempty",
+        "query-config-values-conflict",
+        "action-swap",
+        "duplicate-statement",
+        "missing-statement",
       ].includes(mutation),
     "EXTERNAL_FIXTURE_USAGE_BODY_ACL_TEST_MUTATION_INVALID"
   );
+  let mutatedStatement = statement;
   if (mutation === "wrong-object") {
-    return statement.replace('"public"."users"', '"public"."oauth_accounts"');
-  }
-  if (mutation === "wrong-privilege") {
-    return statement.replace("GRANT SELECT, UPDATE", "GRANT SELECT, DELETE");
-  }
-  if (mutation === "wrong-recipient") {
-    return statement.replace(
+    mutatedStatement = statement.replace(
+      '"public"."users"',
+      '"public"."oauth_accounts"'
+    );
+  } else if (mutation === "wrong-object-kind") {
+    mutatedStatement = statement.replace(" ON TABLE ", " ON SEQUENCE ");
+  } else if (mutation === "wrong-privilege") {
+    mutatedStatement = statement.replace(
+      `${action} SELECT, UPDATE`,
+      `${action} SELECT, DELETE`
+    );
+  } else if (mutation === "wrong-privilege-set") {
+    mutatedStatement = statement.replace(
+      `${action} SELECT, UPDATE`,
+      `${action} SELECT`
+    );
+  } else if (mutation === "wrong-recipient") {
+    mutatedStatement = statement.replace(
       quoteIdentifier(USAGE_FIXTURE_ROLES.runtimeGroup),
       quoteIdentifier(USAGE_FIXTURE_ROLES.membershipRuntime)
     );
-  }
-  if (mutation === "wrong-grantor") {
-    return statement.replace(
+  } else if (mutation === "wrong-grantor") {
+    mutatedStatement = statement.replace(
       /GRANTED BY "[a-z0-9_]+"/,
       `GRANTED BY ${quoteIdentifier(USAGE_FIXTURE_ROLES.deniedRuntime)}`
     );
+  } else if (mutation === "wrong-privilege-order") {
+    mutatedStatement = statement.replace(
+      `${action} SELECT, UPDATE`,
+      `${action} UPDATE, SELECT`
+    );
+  } else if (mutation === "wrong-statement-order") {
+    mutatedStatement = statement.split(";\n").reverse().join(";\n");
+  } else if (mutation === "prefix-only") {
+    mutatedStatement = statement.split(";\n")[0];
+  } else if (mutation === "missing-suffix") {
+    mutatedStatement = statement.replace(/ GRANTED BY "[a-z0-9_]+"$/, "");
+  } else if (mutation === "trailing-sql") {
+    mutatedStatement = `${statement};\nSELECT 1`;
+  } else if (mutation === "action-swap") {
+    const replacementAction = action === "GRANT" ? "REVOKE" : "GRANT";
+    const replacementRecipient = action === "GRANT" ? "FROM" : "TO";
+    mutatedStatement = statement
+      .replaceAll(`${action} `, `${replacementAction} `)
+      .replaceAll(action === "GRANT" ? " TO " : " FROM ", ` ${replacementRecipient} `);
+  } else if (mutation === "duplicate-statement") {
+    mutatedStatement = `${statement};\n${statement}`;
+  } else if (mutation === "missing-statement") {
+    mutatedStatement = statement.split(";\n").slice(0, -1).join(";\n");
   }
-  if (mutation === "wrong-privilege-order") {
-    return statement.replace("GRANT SELECT, UPDATE", "GRANT UPDATE, SELECT");
+  if (mutation === "unexpected-separate-parameter") {
+    return Object.freeze({
+      statementOrConfiguration: statement,
+      parameters: ["unexpected"],
+    });
   }
-  if (mutation === "wrong-statement-order") {
-    return statement.split(";\n").reverse().join(";\n");
+  if (mutation === "non-array-parameter") {
+    return Object.freeze({
+      statementOrConfiguration: statement,
+      parameters: "unexpected",
+    });
   }
-  if (mutation === "prefix-only") return statement.split(";\n")[0];
-  if (mutation === "query-config-values") return statement;
-  return `${statement};\nSELECT 1`;
+  if (mutation === "query-config-values-nonempty") {
+    return Object.freeze({
+      statementOrConfiguration: Object.freeze({
+        text: statement,
+        values: Object.freeze(["unexpected"]),
+      }),
+      parameters: [],
+    });
+  }
+  if (mutation === "query-config-values-conflict") {
+    return Object.freeze({
+      statementOrConfiguration: Object.freeze({
+        text: statement,
+        values: Object.freeze(["query-config"]),
+      }),
+      parameters: ["separate-argument"],
+    });
+  }
+  requireHarness(
+    mutatedStatement !== statement,
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_TEST_MUTATION_UNCHANGED"
+  );
+  return Object.freeze({
+    statementOrConfiguration: mutatedStatement,
+    parameters: [],
+  });
 }
 
 async function executeUsageBodyObjectAclStatements(
@@ -4370,16 +4512,15 @@ async function executeUsageBodyObjectAclStatements(
   grantorName,
   testOnlyMutation = null
 ) {
-  const statement = mutateUsageBodyAclStatementForTest(
+  const queryContract = mutateUsageBodyAclQueryForTest(
     usageBodyObjectAclStatement(action, grantorName),
     action,
     testOnlyMutation
   );
-  const query =
-    testOnlyMutation === "query-config-values"
-      ? { text: statement, values: ["unexpected"] }
-      : statement;
-  await client.query(query, []);
+  await client.query(
+    queryContract.statementOrConfiguration,
+    queryContract.parameters
+  );
 }
 
 function usageBodyAclExpectedRows(grantorName) {
@@ -4461,11 +4602,33 @@ async function assertUsageBodyAclInventory(
 ) {
   const result = await client.query(USAGE_BODY_ACL_INVENTORY_SQL, [
     USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,
+    grantorName,
   ]);
   assertUsageBodyAclInventoryRows(
     result.rows,
     grantorName,
     expectedGranted
+  );
+}
+
+async function assertUsageBodyAclMutationClientIdentity(
+  client,
+  identityAuthority,
+  observedSessionIdentity,
+  code
+) {
+  const originalSessionRole = requireOriginalObservedSessionIdentity(
+    identityAuthority,
+    observedSessionIdentity
+  );
+  const freshObservedIdentity = await observeSessionIdentity(
+    client,
+    originalSessionRole,
+    code
+  );
+  requireHarness(
+    freshObservedIdentity.sessionRole === originalSessionRole,
+    code
   );
 }
 
@@ -4478,43 +4641,73 @@ async function runTemporaryUsageBodyAclWindow({
   verificationOperation,
   grantMutationForTest = null,
   revokeMutationForTest = null,
+  grantObservedSessionIdentityForTest = observedSessionIdentity,
+  revokeObservedSessionIdentityForTest = observedSessionIdentity,
+  deadlineStateObserverForTest = null,
 }) {
   requireOriginalObservedSessionIdentity(
     identityAuthority,
     observedSessionIdentity
   );
   requireHarness(
-    typeof verificationOperation === "function",
+    typeof verificationOperation === "function" &&
+      (deadlineStateObserverForTest === null ||
+        typeof deadlineStateObserverForTest === "function"),
     "EXTERNAL_FIXTURE_USAGE_BODY_ACL_OPERATION_INVALID"
   );
   const grantorName = observedSessionIdentity.sessionRole;
+  const cleanupReserveMilliseconds =
+    usageBodyAclCleanupReserveMilliseconds(context.limits);
+  const originalAbsoluteDeadline = context.absoluteDeadline;
+  const businessAbsoluteDeadline =
+    originalAbsoluteDeadline - cleanupReserveMilliseconds;
+  const businessContext = createReservedDeadlineContext(
+    context,
+    businessAbsoluteDeadline
+  );
+  const cleanupContext = createReservedDeadlineContext(
+    context,
+    originalAbsoluteDeadline
+  );
+  const productionGraphProbe =
+    INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.get(context)
+      ?.productionGraph === true;
   let verificationResult;
   let primaryFailure;
   let primaryFailed = false;
+  let grantAttempted = productionGraphProbe;
   try {
-    await runMigrationUsageBodyAclGrantPhase(context, () =>
+    await runMigrationUsageBodyAclGrantPhase(businessContext, () =>
       withClient(
-        context,
+        businessContext,
         clientFactory,
         fixtureCredentials(configuration),
-        (client) =>
-          executeUsageBodyObjectAclStatements(
+        async (client) => {
+          await assertUsageBodyAclMutationClientIdentity(
+            client,
+            identityAuthority,
+            grantObservedSessionIdentityForTest,
+            "EXTERNAL_FIXTURE_USAGE_BODY_ACL_GRANT_IDENTITY_MISMATCH"
+          );
+          grantAttempted = true;
+          await executeUsageBodyObjectAclStatements(
             client,
             "GRANT",
             grantorName,
             grantMutationForTest
-          )
+          );
+        }
       )
     );
-    await runMigrationUsageBodyAclGrantInventoryPhase(context, () =>
+    await runMigrationUsageBodyAclGrantInventoryPhase(businessContext, () =>
       withClient(
-        context,
+        businessContext,
         clientFactory,
         fixtureCredentials(configuration),
         (client) => assertUsageBodyAclInventory(client, grantorName, true)
       )
     );
-    verificationResult = await verificationOperation();
+    verificationResult = await verificationOperation(businessContext);
   } catch (error) {
     primaryFailed = true;
     primaryFailure = error;
@@ -4522,32 +4715,66 @@ async function runTemporaryUsageBodyAclWindow({
 
   let cleanupFailure;
   let cleanupFailed = false;
-  try {
-    await runMigrationUsageBodyAclRevokePhase(context, () =>
-      withClient(
-        context,
-        clientFactory,
-        fixtureCredentials(configuration),
-        (client) =>
-          executeUsageBodyObjectAclStatements(
-            client,
-            "REVOKE",
-            grantorName,
-            revokeMutationForTest
+  if (grantAttempted) {
+    try {
+      if (productionGraphProbe) {
+        await runMigrationUsageBodyAclRevokePhase(cleanupContext, () =>
+          Promise.resolve()
+        );
+        await runMigrationUsageBodyAclZeroResiduePhase(cleanupContext, () =>
+          Promise.resolve()
+        );
+      } else {
+        await runMigrationUsageBodyAclRevokePhase(cleanupContext, () =>
+          withClient(
+            cleanupContext,
+            clientFactory,
+            fixtureCredentials(configuration),
+            async (client) => {
+              await assertUsageBodyAclMutationClientIdentity(
+                client,
+                identityAuthority,
+                revokeObservedSessionIdentityForTest,
+                "EXTERNAL_FIXTURE_USAGE_BODY_ACL_REVOKE_IDENTITY_MISMATCH"
+              );
+              await executeUsageBodyObjectAclStatements(
+                client,
+                "REVOKE",
+                grantorName,
+                revokeMutationForTest
+              );
+              await runMigrationUsageBodyAclZeroResiduePhase(
+                cleanupContext,
+                () => assertUsageBodyAclInventory(client, grantorName, false)
+              );
+            }
           )
-      )
+        );
+      }
+    } catch (error) {
+      cleanupFailed = true;
+      cleanupFailure = error;
+    }
+  }
+
+  context.timedOut =
+    context.timedOut || businessContext.timedOut || cleanupContext.timedOut;
+  try {
+    deadlineStateObserverForTest?.(
+      Object.freeze({
+        cleanupReserveMilliseconds,
+        originalAbsoluteDeadline,
+        businessAbsoluteDeadline,
+        cleanupAbsoluteDeadline: cleanupContext.absoluteDeadline,
+        businessTimedOut: businessContext.timedOut,
+        cleanupTimedOut: cleanupContext.timedOut,
+        businessActiveClientCount: businessContext.activeClients.size,
+        cleanupActiveClientCount: cleanupContext.activeClients.size,
+      })
     );
-    await runMigrationUsageBodyAclZeroResiduePhase(context, () =>
-      withClient(
-        context,
-        clientFactory,
-        fixtureCredentials(configuration),
-        (client) => assertUsageBodyAclInventory(client, grantorName, false)
-      )
-    );
-  } catch (error) {
-    cleanupFailed = true;
-    cleanupFailure = error;
+  } finally {
+    releaseReservedDeadlineContext(businessContext);
+    releaseReservedDeadlineContext(cleanupContext);
   }
 
   if (primaryFailed) throw primaryFailure;
@@ -4838,21 +5065,25 @@ async function applyMigrationsAndRuntimeAcl(
       configuration,
       identityAuthority,
       observedSessionIdentity: identityAuthority.observedSessionIdentity,
-      async verificationOperation() {
-        await runMigrationUsageAclInheritancePhase(context, () =>
+      async verificationOperation(businessContext) {
+        await runMigrationUsageAclInheritancePhase(businessContext, () =>
           verifyUsageAclInheritance(
-            context,
+            businessContext,
             clientFactory,
             configuration,
             legacyAclHash,
             identityAuthority.observedSessionIdentity.sessionRole
           )
         );
-        await runMigrationPlanResolutionPhase(context, () =>
-          verifyPlanResolution(context, clientFactory, configuration)
+        await runMigrationPlanResolutionPhase(businessContext, () =>
+          verifyPlanResolution(businessContext, clientFactory, configuration)
         );
-        await runMigrationReservationLifecyclePhase(context, () =>
-          verifyReservationLifecycle(context, clientFactory, configuration)
+        await runMigrationReservationLifecyclePhase(businessContext, () =>
+          verifyReservationLifecycle(
+            businessContext,
+            clientFactory,
+            configuration
+          )
         );
       },
     });
@@ -5770,6 +6001,8 @@ export function validateIndependentExtensionInventoryForTests(rows) {
  *   deadlineLimits?: object,
  *   grantMutationForTest?: string | null,
  *   revokeMutationForTest?: string | null,
+ *   replaceGrantObservedSessionIdentityForTest?: boolean,
+ *   replaceRevokeObservedSessionIdentityForTest?: boolean,
  * }} options
  */
 export async function runUsageBodyAclBoundaryProbeForTests({
@@ -5780,6 +6013,8 @@ export async function runUsageBodyAclBoundaryProbeForTests({
   deadlineLimits,
   grantMutationForTest = null,
   revokeMutationForTest = null,
+  replaceGrantObservedSessionIdentityForTest = false,
+  replaceRevokeObservedSessionIdentityForTest = false,
 }) {
   assertUsageFixtureRoleSeparation(expectedSessionRole);
   requireHarness(
@@ -5806,6 +6041,7 @@ export async function runUsageBodyAclBoundaryProbeForTests({
   let failureMarker = null;
   let bodyAclWindowComplete = false;
   let observedIdentityReference = null;
+  let deadlineState = null;
   try {
     if (unrelatedContext) {
       unrelatedOwnedClient = await openClient(
@@ -5837,9 +6073,26 @@ export async function runUsageBodyAclBoundaryProbeForTests({
       observedSessionIdentity: identityAuthority.observedSessionIdentity,
       grantMutationForTest,
       revokeMutationForTest,
-      verificationOperation: () =>
+      grantObservedSessionIdentityForTest:
+        replaceGrantObservedSessionIdentityForTest
+          ? Object.freeze({
+              sessionRole:
+                identityAuthority.observedSessionIdentity.sessionRole,
+            })
+          : identityAuthority.observedSessionIdentity,
+      revokeObservedSessionIdentityForTest:
+        replaceRevokeObservedSessionIdentityForTest
+          ? Object.freeze({
+              sessionRole:
+                identityAuthority.observedSessionIdentity.sessionRole,
+            })
+          : identityAuthority.observedSessionIdentity,
+      deadlineStateObserverForTest(observedDeadlineState) {
+        deadlineState = observedDeadlineState;
+      },
+      verificationOperation: (businessContext) =>
         verifyUsageRuntimeExecutionRoles(
-          context,
+          businessContext,
           clientFactory,
           Object.freeze({
             host: "127.0.0.1",
@@ -5870,6 +6123,28 @@ export async function runUsageBodyAclBoundaryProbeForTests({
       exactOwnKeys(observedIdentityReference, ["sessionRole"]),
     phaseTrace: Object.freeze([...phaseTrace]),
     operationStarts: Object.freeze({ ...context.operationStarts }),
+    cleanupReserveMilliseconds:
+      deadlineState?.cleanupReserveMilliseconds ?? null,
+    businessTimedOut: deadlineState?.businessTimedOut === true,
+    cleanupTimedOut: deadlineState?.cleanupTimedOut === true,
+    businessActiveClientCount:
+      deadlineState?.businessActiveClientCount ?? null,
+    cleanupActiveClientCount:
+      deadlineState?.cleanupActiveClientCount ?? null,
+    cleanupSharesOriginalDeadline:
+      deadlineState !== null &&
+      deadlineState.cleanupAbsoluteDeadline ===
+        deadlineState.originalAbsoluteDeadline,
+    businessReservesCleanupDeadline:
+      deadlineState !== null &&
+      deadlineState.businessAbsoluteDeadline ===
+        deadlineState.originalAbsoluteDeadline -
+          deadlineState.cleanupReserveMilliseconds,
+    postflightStartCount: phaseProbeState.postflightStartCount,
+    runtimeAclConfigurationStartCount: phaseTrace.filter(
+      (phase) =>
+        phase === EXTERNAL_FIXTURE_PHASES.migrationRuntimeAclConfiguration
+    ).length,
     unrelatedActiveClientCount: unrelatedContext?.activeClients.size ?? 0,
     unrelatedUsable: unrelatedOwnedClient?.usable === true,
     unrelatedDestroyed: unrelatedOwnedClient?.destroyed === true,

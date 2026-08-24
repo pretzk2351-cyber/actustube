@@ -2306,6 +2306,9 @@ const exactUsageBodyAclRevokeContract = testUsageBodyAclManifest
       `REVOKE ${entry.privileges.join(", ")} ON TABLE "public"."${entry.objectName}" FROM "${testUsageBodyAclRoles.explicit}", "${testUsageBodyAclRoles.group}" GRANTED BY "${testFixtureSessionRole}"`
   )
   .join(";\n");
+const exactUsageBodyAclIdentityContract = `SELECT
+session_user AS session_role,
+current_user AS effective_role`;
 
 const exactMissingUserUsageExecutionContract = `SELECT allowed FROM public.reserve_usage_limits_v2(
   $1::uuid, 1, 'channel_analysis'::public.usage_metric,
@@ -2413,6 +2416,9 @@ type UsageBodyAclFakeOptions = {
   membershipResultRows?: Array<Record<string, unknown>>;
   rejectOnLabel?: string | null;
   hangOnLabel?: string | null;
+  grantIdentityRows?: Array<Record<string, unknown>>;
+  revokeIdentityRows?: Array<Record<string, unknown>>;
+  unrelatedAuthorityRows?: Array<Record<string, unknown>>;
 };
 
 function createUsageBodyAclFakeHarness({
@@ -2433,14 +2439,20 @@ function createUsageBodyAclFakeHarness({
   membershipResultRows = [{ allowed: false }],
   rejectOnLabel = null,
   hangOnLabel = null,
+  grantIdentityRows = validObservedSessionIdentityRows(),
+  revokeIdentityRows = validObservedSessionIdentityRows(),
+  unrelatedAuthorityRows = [{ fixed_unrelated_authority: true }],
 }: UsageBodyAclFakeOptions = {}) {
   const state = {
     aclRows: [] as TestUsageBodyAclRow[],
     queryLog: [] as Array<{
       statement: string;
-      parameters: unknown[];
+      parameters: unknown;
+      separateParameters: unknown;
+      queryConfigValues: unknown;
       label: string;
     }>,
+    unrelatedAuthorityRows: unrelatedAuthorityRows.map((row) => ({ ...row })),
     grantAttemptCount: 0,
     exactGrantCount: 0,
     revokeAttemptCount: 0,
@@ -2450,6 +2462,15 @@ function createUsageBodyAclFakeHarness({
     connectCount: 0,
     endCount: 0,
     destroyCount: 0,
+    grantIdentityQueryCount: 0,
+    revokeIdentityQueryCount: 0,
+    zeroResidueInventoryCount: 0,
+    clients: [] as Array<{
+      connect: number;
+      end: number;
+      destroy: number;
+      queryLabels: string[];
+    }>,
   };
 
   function hasCompleteBodyAuthority(granteeName: string) {
@@ -2477,27 +2498,40 @@ function createUsageBodyAclFakeHarness({
   function createClient() {
     let activeRole = testFixtureSessionRole;
     let destroyed = false;
+    const clientState = {
+      connect: 0,
+      end: 0,
+      destroy: 0,
+      queryLabels: [] as string[],
+    };
+    state.clients.push(clientState);
     return {
       connection: {
         stream: {
           destroy() {
             if (!destroyed) state.destroyCount += 1;
+            if (!destroyed) clientState.destroy += 1;
             destroyed = true;
           },
         },
       },
       connect() {
         state.connectCount += 1;
+        clientState.connect += 1;
         return Promise.resolve();
       },
       query(
         statementOrConfiguration: string | { text: string; values?: unknown[] },
-        parameters: unknown[] = []
+        parameters: unknown[] | string = []
       ) {
         const statement =
           typeof statementOrConfiguration === "string"
             ? statementOrConfiguration
             : statementOrConfiguration.text;
+        const queryConfigValues =
+          typeof statementOrConfiguration === "string"
+            ? undefined
+            : statementOrConfiguration.values;
         const effectiveParameters =
           typeof statementOrConfiguration === "string"
             ? parameters
@@ -2506,27 +2540,43 @@ function createUsageBodyAclFakeHarness({
               : parameters;
         const normalized = normalizeExactRevokeSql(statement);
         let label = "other";
-        if (normalized.startsWith("GRANT ")) {
+        let exactGrantMatched = false;
+        let exactRevokeMatched = false;
+        if (
+          normalized === normalizeExactRevokeSql(exactUsageBodyAclIdentityContract)
+        ) {
+          const identityOrdinal =
+            state.grantIdentityQueryCount + state.revokeIdentityQueryCount;
+          if (identityOrdinal === 0) {
+            label = "body-acl-grant-identity";
+            state.grantIdentityQueryCount += 1;
+          } else {
+            label = "body-acl-revoke-identity";
+            state.revokeIdentityQueryCount += 1;
+          }
+        } else if (normalized.startsWith("GRANT ")) {
           label = "body-acl-grant";
           state.grantAttemptCount += 1;
           if (
+            typeof statementOrConfiguration === "string" &&
             normalized === normalizeExactRevokeSql(exactUsageBodyAclGrantContract) &&
-            JSON.stringify(effectiveParameters) === "[]"
+            Array.isArray(parameters) &&
+            parameters.length === 0
           ) {
             label = "body-acl-grant-exact";
-            state.exactGrantCount += 1;
-            state.aclRows = grantedRows.map((row) => ({ ...row }));
+            exactGrantMatched = true;
           }
         } else if (normalized.startsWith("REVOKE ")) {
           label = "body-acl-revoke";
           state.revokeAttemptCount += 1;
           if (
+            typeof statementOrConfiguration === "string" &&
             normalized === normalizeExactRevokeSql(exactUsageBodyAclRevokeContract) &&
-            JSON.stringify(effectiveParameters) === "[]"
+            Array.isArray(parameters) &&
+            parameters.length === 0
           ) {
             label = "body-acl-revoke-exact";
-            state.exactRevokeCount += 1;
-            state.aclRows = postRevokeRows.map((row) => ({ ...row }));
+            exactRevokeMatched = true;
           }
         } else if (
           statement.includes("target_objects(object_name, ordinal)") &&
@@ -2536,7 +2586,10 @@ function createUsageBodyAclFakeHarness({
           state.inventoryCount += 1;
           if (
             JSON.stringify(effectiveParameters) !==
-            JSON.stringify([[...testUsageBodyAclInventoryRoleScope]])
+            JSON.stringify([
+              [...testUsageBodyAclInventoryRoleScope],
+              testFixtureSessionRole,
+            ])
           ) {
             return Promise.reject(new Error("fixed-body-acl-parameter-mismatch"));
           }
@@ -2558,15 +2611,62 @@ function createUsageBodyAclFakeHarness({
         }
         state.queryLog.push({
           statement,
-          parameters: [...effectiveParameters],
+          parameters: Array.isArray(effectiveParameters)
+            ? [...effectiveParameters]
+            : effectiveParameters,
+          separateParameters: Array.isArray(parameters)
+            ? [...parameters]
+            : parameters,
+          queryConfigValues: Array.isArray(queryConfigValues)
+            ? [...queryConfigValues]
+            : queryConfigValues,
           label,
         });
+        clientState.queryLabels.push(label);
         if (label === hangOnLabel) return new Promise(() => undefined);
         if (label === rejectOnLabel) {
           return Promise.reject(new Error("fixed-body-acl-failure"));
         }
+        if (exactGrantMatched) {
+          state.exactGrantCount += 1;
+          state.aclRows = grantedRows.map((row) => ({ ...row }));
+        }
+        if (exactRevokeMatched) {
+          state.exactRevokeCount += 1;
+          state.aclRows = state.aclRows.filter(
+            (row) =>
+              !(
+                row.authority_kind === "explicit_acl" &&
+                row.grantor_name === testFixtureSessionRole &&
+                testUsageBodyAclRecipients.some(
+                  (recipient) => recipient === row.grantee_name
+                ) &&
+                testUsageBodyAclManifest.some(
+                  (entry) =>
+                    entry.objectName === row.object_name &&
+                    entry.privileges.some(
+                      (privilege) => privilege === row.privilege_type
+                    )
+                )
+              )
+          );
+          state.aclRows.push(...postRevokeRows.map((row) => ({ ...row })));
+        }
         if (label === "body-acl-inventory") {
+          if (state.revokeIdentityQueryCount > 0) {
+            state.zeroResidueInventoryCount += 1;
+          }
           return Promise.resolve({ rows: state.aclRows.map((row) => ({ ...row })) });
+        }
+        if (label === "body-acl-grant-identity") {
+          return Promise.resolve({
+            rows: grantIdentityRows.map((row) => ({ ...row })),
+          });
+        }
+        if (label === "body-acl-revoke-identity") {
+          return Promise.resolve({
+            rows: revokeIdentityRows.map((row) => ({ ...row })),
+          });
         }
         if (label === "missing-user-execution") {
           if (
@@ -2603,6 +2703,7 @@ function createUsageBodyAclFakeHarness({
       },
       end() {
         state.endCount += 1;
+        clientState.end += 1;
         return Promise.resolve();
       },
     };
@@ -3366,6 +3467,8 @@ describe("temporary usage body-object ACL boundary", () => {
     revokeMutationForTest = null,
     deadlineLimits,
     unrelatedClient = null,
+    replaceGrantObservedSessionIdentityForTest = false,
+    replaceRevokeObservedSessionIdentityForTest = false,
   }: {
     fakeOptions?: UsageBodyAclFakeOptions;
     grantMutationForTest?: string | null;
@@ -3374,6 +3477,8 @@ describe("temporary usage body-object ACL boundary", () => {
     unrelatedClient?: ReturnType<
       typeof createObservedSessionIdentityFakeClient
     >["client"] | null;
+    replaceGrantObservedSessionIdentityForTest?: boolean;
+    replaceRevokeObservedSessionIdentityForTest?: boolean;
   } = {}) {
     const initial = createObservedSessionIdentityFakeClient();
     const fake = createUsageBodyAclFakeHarness(fakeOptions);
@@ -3385,6 +3490,8 @@ describe("temporary usage body-object ACL boundary", () => {
       deadlineLimits,
       grantMutationForTest,
       revokeMutationForTest,
+      replaceGrantObservedSessionIdentityForTest,
+      replaceRevokeObservedSessionIdentityForTest,
     });
     return { initial, fake, result };
   }
@@ -3404,6 +3511,36 @@ describe("temporary usage body-object ACL boundary", () => {
     expect(fake.state.inventoryCount).toBe(2);
     expect(fake.state.executionCount).toBe(4);
     expect(fake.state.aclRows).toEqual([]);
+    expect(result.cleanupReserveMilliseconds).toBe(
+      HARNESS_DEADLINE_LIMITS_FOR_TESTS.connectMilliseconds +
+        3 * HARNESS_DEADLINE_LIMITS_FOR_TESTS.queryMilliseconds +
+        HARNESS_DEADLINE_LIMITS_FOR_TESTS.closeMilliseconds
+    );
+    expect(result.cleanupReserveMilliseconds).toBe(105_000);
+    expect(result.cleanupSharesOriginalDeadline).toBe(true);
+    expect(result.businessReservesCleanupDeadline).toBe(true);
+    const grantClient = fake.state.clients.find(
+      (client) => client.queryLabels[0] === "body-acl-grant-identity"
+    );
+    const revokeClient = fake.state.clients.find(
+      (client) => client.queryLabels[0] === "body-acl-revoke-identity"
+    );
+    expect(grantClient).toMatchObject({
+      connect: 1,
+      end: 1,
+      destroy: 0,
+      queryLabels: ["body-acl-grant-identity", "body-acl-grant-exact"],
+    });
+    expect(revokeClient).toMatchObject({
+      connect: 1,
+      end: 1,
+      destroy: 0,
+      queryLabels: [
+        "body-acl-revoke-identity",
+        "body-acl-revoke-exact",
+        "body-acl-inventory",
+      ],
+    });
     expect(exactUsageBodyAclGrantContract.split(";\n")).toHaveLength(5);
     expect(exactUsageBodyAclRevokeContract.split(";\n")).toHaveLength(5);
     expect(
@@ -3437,6 +3574,193 @@ describe("temporary usage body-object ACL boundary", () => {
     ).toEqual(phaseOrder);
   });
 
+  const invalidMutationIdentityRows = [
+    ["zero rows", []],
+    [
+      "two rows",
+      [
+        ...validObservedSessionIdentityRows(),
+        ...validObservedSessionIdentityRows(),
+      ],
+    ],
+    ["missing key", [{ session_role: testFixtureSessionRole }]],
+    [
+      "extra key",
+      [
+        {
+          ...validObservedSessionIdentityRows()[0],
+          extra: "fixed",
+        },
+      ],
+    ],
+    [
+      "null",
+      [{ session_role: null, effective_role: testFixtureSessionRole }],
+    ],
+    [
+      "non-string",
+      [{ session_role: 7, effective_role: testFixtureSessionRole }],
+    ],
+    ["empty", [{ session_role: "", effective_role: "" }]],
+    [
+      "unsafe identifier",
+      [{ session_role: "unsafe-role!", effective_role: "unsafe-role!" }],
+    ],
+    [
+      "session/current mismatch",
+      [
+        {
+          session_role: testFixtureSessionRole,
+          effective_role: "different_fixture_session",
+        },
+      ],
+    ],
+    [
+      "original identity mismatch",
+      [
+        {
+          session_role: "different_fixture_session",
+          effective_role: "different_fixture_session",
+        },
+      ],
+    ],
+  ] as const;
+
+  it.each(invalidMutationIdentityRows)(
+    "rejects GRANT Client identity %s before mutation",
+    async (_label, grantIdentityRows) => {
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { grantIdentityRows: [...grantIdentityRows] },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT"
+      );
+      expect(fake.state.grantAttemptCount).toBe(0);
+      expect(fake.state.revokeAttemptCount).toBe(0);
+      expect(fake.state.inventoryCount).toBe(0);
+      expect(fake.state.executionCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it.each(invalidMutationIdentityRows)(
+    "rejects REVOKE Client identity %s before cleanup mutation",
+    async (_label, revokeIdentityRows) => {
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { revokeIdentityRows: [...revokeIdentityRows] },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_REVOKE"
+      );
+      expect(fake.state.exactGrantCount).toBe(1);
+      expect(fake.state.revokeAttemptCount).toBe(0);
+      expect(fake.state.inventoryCount).toBe(1);
+      expect(fake.state.zeroResidueInventoryCount).toBe(0);
+      expect(fake.state.aclRows).toHaveLength(18);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it.each([
+    ["query rejection", { rejectOnLabel: "body-acl-grant-identity" }],
+    ["query timeout", { hangOnLabel: "body-acl-grant-identity" }],
+  ])("rejects GRANT Client identity %s with mutation zero", async (_label, fakeOptions) => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions,
+      deadlineLimits: {
+        totalMilliseconds: 100,
+        connectMilliseconds: 20,
+        queryMilliseconds: 5,
+        closeMilliseconds: 20,
+      },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT"
+    );
+    expect(fake.state.grantAttemptCount).toBe(0);
+    expect(fake.state.revokeAttemptCount).toBe(0);
+    expect(fake.state.inventoryCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
+  });
+
+  it.each([
+    ["query rejection", { rejectOnLabel: "body-acl-revoke-identity" }],
+    ["query timeout", { hangOnLabel: "body-acl-revoke-identity" }],
+  ])("rejects REVOKE Client identity %s with cleanup mutation zero", async (_label, fakeOptions) => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions,
+      deadlineLimits: {
+        totalMilliseconds: 100,
+        connectMilliseconds: 20,
+        queryMilliseconds: 5,
+        closeMilliseconds: 20,
+      },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_REVOKE"
+    );
+    expect(fake.state.exactGrantCount).toBe(1);
+    expect(fake.state.revokeAttemptCount).toBe(0);
+    expect(fake.state.zeroResidueInventoryCount).toBe(0);
+    expect(fake.state.aclRows).toHaveLength(18);
+    expect(result.postflightStartCount).toBe(0);
+  });
+
+  it("rejects a same-value replacement authority object before the GRANT Client identity query", async () => {
+    const { fake, result } = await runBodyAclProbe({
+      replaceGrantObservedSessionIdentityForTest: true,
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT"
+    );
+    expect(fake.state.grantIdentityQueryCount).toBe(0);
+    expect(fake.state.grantAttemptCount).toBe(0);
+  });
+
+  it("rejects a same-value replacement authority object before the REVOKE Client identity query", async () => {
+    const { fake, result } = await runBodyAclProbe({
+      replaceRevokeObservedSessionIdentityForTest: true,
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_REVOKE"
+    );
+    expect(fake.state.revokeIdentityQueryCount).toBe(0);
+    expect(fake.state.revokeAttemptCount).toBe(0);
+    expect(fake.state.aclRows).toHaveLength(18);
+  });
+
+  it("keeps GRANT and REVOKE Client identity failures public-safe", async () => {
+    const wrongIdentity = "different_fixture_session";
+    const grantFailure = await runBodyAclProbe({
+      fakeOptions: {
+        grantIdentityRows: [
+          { session_role: wrongIdentity, effective_role: wrongIdentity },
+        ],
+      },
+    });
+    const revokeFailure = await runBodyAclProbe({
+      fakeOptions: {
+        revokeIdentityRows: [
+          { session_role: wrongIdentity, effective_role: wrongIdentity },
+        ],
+      },
+    });
+
+    for (const result of [grantFailure.result, revokeFailure.result]) {
+      const publicResult = JSON.stringify(result);
+      expect(publicResult).not.toContain(wrongIdentity);
+      expect(publicResult).not.toContain(testFixtureSessionRole);
+      expect(publicResult).not.toContain("session_role");
+      expect(publicResult).not.toContain("effective_role");
+    }
+  });
+
   it.each([
     "wrong-object",
     "wrong-privilege",
@@ -3446,7 +3770,7 @@ describe("temporary usage body-object ACL boundary", () => {
     "wrong-statement-order",
     "prefix-only",
     "trailing-sql",
-    "query-config-values",
+    "query-config-values-nonempty",
   ])(
     "rejects the independent exact body-object ACL SQL oracle mutation %s",
     async (grantMutationForTest) => {
@@ -3614,8 +3938,119 @@ describe("temporary usage body-object ACL boundary", () => {
     );
     expect(fake.state.executionCount).toBe(0);
     expect(fake.state.exactRevokeCount).toBe(1);
-    expect(fake.state.aclRows).toEqual([]);
+    expect(fake.state.aclRows).toEqual(
+      grantedRows.filter(
+        (row) =>
+          row.grantor_name !== testFixtureSessionRole ||
+          !testUsageBodyAclRecipients.some(
+            (recipient) => recipient === row.grantee_name
+          ) ||
+          row.authority_kind !== "explicit_acl"
+      )
+    );
   });
+
+  it.each([
+    [
+      "observed grantor to unknown third recipient",
+      testUsageBodyAclResidueRow({
+        recipient_relation: "unexpected",
+        grantee_name: "unknown_fixture_recipient",
+      }),
+    ],
+    [
+      "observed grantor to unknown third recipient with an expected privilege",
+      testUsageBodyAclResidueRow({
+        recipient_relation: "unexpected",
+        grantee_name: "unknown_fixture_recipient",
+        privilege_type: "UPDATE",
+      }),
+    ],
+    [
+      "observed grantor to unknown third recipient with an unexpected privilege",
+      testUsageBodyAclResidueRow({
+        recipient_relation: "unexpected",
+        grantee_name: "unknown_fixture_recipient",
+        privilege_type: "DELETE",
+      }),
+    ],
+    [
+      "expected grantor with a wrong grantee",
+      testUsageBodyAclResidueRow({
+        recipient_relation: "unexpected",
+        grantee_name: "wrong_fixture_grantee",
+      }),
+    ],
+    [
+      "target as both grantee and grantor",
+      testUsageBodyAclResidueRow({
+        grantor_name: testUsageBodyAclRoles.explicit,
+        grantee_name: testUsageBodyAclRoles.explicit,
+      }),
+    ],
+    [
+      "grantor-side shared dependency",
+      testUsageBodyAclResidueRow({
+        authority_kind: "uncovered_acl_dependency",
+        recipient_relation: "unexpected",
+        grantee_name: "unknown_fixture_recipient",
+        privilege_type: "ACL_DEPENDENCY",
+        shared_dependency_covered: false,
+      }),
+    ],
+  ])(
+    "rejects unknown third recipient inventory case %s",
+    async (_label, unexpectedRow) => {
+      const grantedRows = [...validTestUsageBodyAclRows(), unexpectedRow];
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { grantedRows },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+      );
+      expect(fake.state.executionCount).toBe(0);
+      expect(fake.state.exactRevokeCount).toBe(1);
+      expect(fake.state.aclRows).toEqual([unexpectedRow]);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it.each([
+    [
+      "unknown third recipient ACL only",
+      testUsageBodyAclResidueRow({
+        recipient_relation: "unexpected",
+        grantee_name: "unknown_fixture_recipient",
+      }),
+    ],
+    [
+      "unknown third recipient dependency only",
+      testUsageBodyAclResidueRow({
+        authority_kind: "uncovered_acl_dependency",
+        recipient_relation: "unexpected",
+        grantor_name: "UNRESOLVED",
+        grantee_name: "unknown_fixture_recipient",
+        privilege_type: "ACL_DEPENDENCY",
+        shared_dependency_covered: false,
+      }),
+    ],
+  ])(
+    "rejects cleanup residue for %s at the zero-residue gate",
+    async (_label, residue) => {
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { postRevokeRows: [residue] },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+      );
+      expect(fake.state.aclRows).toEqual([residue]);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
 
   it.each([
     ["zero rows", []],
@@ -3657,7 +4092,8 @@ describe("temporary usage body-object ACL boundary", () => {
       "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION"
     );
     expect(fake.state.revokeAttemptCount).toBe(1);
-    expect(fake.state.exactRevokeCount).toBe(1);
+    expect(fake.state.exactRevokeCount).toBe(0);
+    expect(fake.state.aclRows).toHaveLength(18);
   });
 
   it("reports an exact bounded REVOKE failure when verification succeeded", async () => {
@@ -3670,7 +4106,62 @@ describe("temporary usage body-object ACL boundary", () => {
     );
     expect(result.bodyAclWindowComplete).toBe(false);
     expect(fake.state.revokeAttemptCount).toBe(1);
+    expect(fake.state.exactRevokeCount).toBe(0);
+    expect(fake.state.aclRows).toHaveLength(18);
   });
+
+  it.each([
+    "wrong-object",
+    "wrong-object-kind",
+    "wrong-privilege",
+    "wrong-privilege-set",
+    "wrong-privilege-order",
+    "wrong-recipient",
+    "wrong-grantor",
+    "wrong-statement-order",
+    "prefix-only",
+    "missing-suffix",
+    "trailing-sql",
+    "unexpected-separate-parameter",
+    "non-array-parameter",
+    "query-config-values-nonempty",
+    "query-config-values-conflict",
+    "action-swap",
+    "duplicate-statement",
+    "missing-statement",
+  ])(
+    "rejects the independent action-aware REVOKE exact oracle mutation %s",
+    async (revokeMutationForTest) => {
+      const { fake, result } = await runBodyAclProbe({ revokeMutationForTest });
+      const cleanupIdentityIndex = fake.state.queryLog.findIndex(
+        (entry) => entry.label === "body-acl-revoke-identity"
+      );
+      const mutationEntry = fake.state.queryLog[cleanupIdentityIndex + 1];
+      const sqlChanged =
+        normalizeExactRevokeSql(mutationEntry.statement) !==
+        normalizeExactRevokeSql(exactUsageBodyAclRevokeContract);
+      const parameterContractChanged =
+        JSON.stringify(mutationEntry.separateParameters) !== "[]" ||
+        mutationEntry.queryConfigValues !== undefined;
+
+      expect(sqlChanged || parameterContractChanged).toBe(true);
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+      );
+      expect(fake.state.exactRevokeCount).toBe(0);
+      expect(fake.state.aclRows).toHaveLength(18);
+      expect(fake.state.unrelatedAuthorityRows).toEqual([
+        { fixed_unrelated_authority: true },
+      ]);
+      expect(fake.state.zeroResidueInventoryCount).toBe(1);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+      const publicResult = JSON.stringify(result);
+      expect(publicResult).not.toContain(exactUsageBodyAclRevokeContract);
+      expect(publicResult).not.toContain(testFixtureSessionRole);
+      expect(publicResult).not.toContain("unexpected");
+    }
+  );
 
   it("keeps authority residue when the bounded REVOKE SQL is incomplete", async () => {
     const { fake, result } = await runBodyAclProbe({
@@ -3733,11 +4224,89 @@ describe("temporary usage body-object ACL boundary", () => {
       "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION"
     );
     expect(result.timedOut).toBe(true);
+    expect(result.businessTimedOut).toBe(true);
+    expect(result.cleanupTimedOut).toBe(false);
+    expect(result.cleanupSharesOriginalDeadline).toBe(true);
+    expect(result.businessReservesCleanupDeadline).toBe(true);
     expect(result.phaseTrace).toContain("MIGRATION_USAGE_BODY_ACL_REVOKE");
-    expect(fake.state.exactRevokeCount).toBe(0);
-    expect(fake.state.destroyCount).toBeGreaterThanOrEqual(1);
+    expect(fake.state.exactRevokeCount).toBe(1);
+    expect(fake.state.zeroResidueInventoryCount).toBe(1);
+    expect(fake.state.destroyCount).toBe(1);
+    const timedOutBusinessClient = fake.state.clients.find((client) =>
+      client.queryLabels.includes("missing-user-execution")
+    );
+    const cleanupClient = fake.state.clients.find(
+      (client) => client.queryLabels[0] === "body-acl-revoke-identity"
+    );
+    expect(timedOutBusinessClient).toMatchObject({
+      destroy: 1,
+      end: 0,
+    });
+    expect(cleanupClient).toMatchObject({
+      connect: 1,
+      destroy: 0,
+      end: 1,
+      queryLabels: [
+        "body-acl-revoke-identity",
+        "body-acl-revoke-exact",
+        "body-acl-inventory",
+      ],
+    });
+    const timeoutCleanupRevoke = fake.state.queryLog.find(
+      (entry) => entry.label === "body-acl-revoke-exact"
+    );
+    expect(timeoutCleanupRevoke?.statement.split(";\n")).toHaveLength(5);
+    expect(timeoutCleanupRevoke?.separateParameters).toEqual([]);
+    expect(result.businessActiveClientCount).toBe(0);
+    expect(result.cleanupActiveClientCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
     expect(result.unrelatedDestroyed).toBe(false);
     expect(result.unrelatedActiveClientCount).toBe(0);
+    expect(unrelated.state.destroy).toBe(0);
+    expect(unrelated.state.end).toBe(1);
+  });
+
+  it("fails closed before GRANT when the cleanup reserve cannot fit inside the original deadline", async () => {
+    const { fake, result } = await runBodyAclProbe({
+      deadlineLimits: {
+        totalMilliseconds: 50,
+        connectMilliseconds: 20,
+        queryMilliseconds: 5,
+        closeMilliseconds: 20,
+      },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN"
+    );
+    expect(result.bodyAclWindowComplete).toBe(false);
+    expect(result.cleanupReserveMilliseconds).toBeNull();
+    expect(fake.state.connectCount).toBe(0);
+    expect(fake.state.grantAttemptCount).toBe(0);
+    expect(fake.state.revokeAttemptCount).toBe(0);
+    expect(fake.state.inventoryCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
+  });
+
+  it("fails closed when the cleanup reserve is exhausted during an actual REVOKE query", async () => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { hangOnLabel: "body-acl-revoke-exact" },
+      deadlineLimits: {
+        totalMilliseconds: 100,
+        connectMilliseconds: 20,
+        queryMilliseconds: 5,
+        closeMilliseconds: 20,
+      },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_REVOKE"
+    );
+    expect(result.cleanupTimedOut).toBe(true);
+    expect(fake.state.revokeAttemptCount).toBe(1);
+    expect(fake.state.zeroResidueInventoryCount).toBe(0);
+    expect(fake.state.aclRows).toHaveLength(18);
+    expect(result.postflightStartCount).toBe(0);
   });
 
   it("keeps the body-object ACL manifest fixed, least-privilege, invoker-only, and ahead of runtime ACL configuration", async () => {
@@ -3777,6 +4346,19 @@ describe("temporary usage body-object ACL boundary", () => {
     expect(source).toContain("const USAGE_BODY_OBJECT_ACL_MANIFEST = Object.freeze([");
     expect(source).toContain("dependency_entry.deptype = 'a'");
     expect(source).toContain("shared_dependency_covered");
+    expect(source).toContain("observed_grantor AS (");
+    expect(source).toContain("role_entry.rolname = $2::text");
+    expect(source).toContain(
+      "all_explicit_acl.grantor = (SELECT oid FROM observed_grantor)"
+    );
+    expect(source).toContain(
+      "all_explicit_acl.grantee <> all_explicit_acl.relowner"
+    );
+    expect(source).toContain("FROM all_explicit_acl");
+    expect(source).toContain("dependency_entry.refobjid IN (");
+    expect(source).toContain(
+      "USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,\n    grantorName"
+    );
     expect(source).toContain("assertMissingUserUsageExecutionResult(result)");
     expect(source).toContain("GRANTED BY ${grantor}");
     expect(source).not.toMatch(/GRANT\s+ALL\s+ON\s+TABLE/i);
@@ -3791,6 +4373,28 @@ describe("temporary usage body-object ACL boundary", () => {
     expect(zeroResidueIndex).toBeGreaterThan(revokeIndex);
     expect(boundaryReturnIndex).toBeGreaterThan(zeroResidueIndex);
     expect(runtimeAclIndex).toBeGreaterThan(grantWindowIndex);
+    expect(boundarySource).toContain(
+      "assertUsageBodyAclMutationClientIdentity("
+    );
+    expect(boundarySource).toContain(
+      "usageBodyAclCleanupReserveMilliseconds(context.limits)"
+    );
+    expect(boundarySource).toContain("createReservedDeadlineContext(");
+    expect(boundarySource).not.toContain("createDeadlineContext(");
+    expect(boundarySource).not.toContain("performance.now() +");
+    expect(boundarySource).not.toContain("configuration.role");
+    expect(applySource).toContain(
+      "async verificationOperation(businessContext)"
+    );
+    expect(applySource).toContain(
+      "verifyUsageAclInheritance(\n            businessContext"
+    );
+    expect(applySource).toContain(
+      "verifyPlanResolution(businessContext, clientFactory, configuration)"
+    );
+    expect(applySource).toContain(
+      "verifyReservationLifecycle(\n            businessContext"
+    );
   });
 });
 
