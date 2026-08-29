@@ -2332,7 +2332,8 @@ type TestUsageBodyAclRow = {
   object_name: string;
   privilege_type: string;
   grant_option: boolean;
-  shared_dependency_covered: boolean;
+  grantee_dependency_count: number;
+  grantor_dependency_count: number;
 };
 
 const testUsageBodyAclRowKeys = [
@@ -2345,7 +2346,8 @@ const testUsageBodyAclRowKeys = [
   "object_name",
   "privilege_type",
   "grant_option",
-  "shared_dependency_covered",
+  "grantee_dependency_count",
+  "grantor_dependency_count",
 ] as const;
 
 function sortTestUsageBodyAclRows(rows: TestUsageBodyAclRow[]) {
@@ -2380,7 +2382,8 @@ function validTestUsageBodyAclRows({
           object_name: entry.objectName,
           privilege_type: privilegeType,
           grant_option: false,
-          shared_dependency_covered: true,
+          grantee_dependency_count: 1,
+          grantor_dependency_count: 1,
         });
       }
     }
@@ -2401,7 +2404,166 @@ function testUsageBodyAclResidueRow(
     object_name: "users",
     privilege_type: "SELECT",
     grant_option: false,
-    shared_dependency_covered: true,
+    grantee_dependency_count: 1,
+    grantor_dependency_count: 1,
+    ...overrides,
+  };
+}
+
+const testSystemWideAclRecipients = ["PUBLIC"] as const;
+const testTargetAsGrantorRoles = [
+  "actustube_ci_usage_explicit",
+  "actustube_ci_usage_group",
+  "actustube_ci_usage_member",
+  "actustube_ci_usage_denied",
+  "actustube_ci_usage_public_probe",
+  "actustube_ci_usage_migration_executor",
+  "actustube_ci_usage_legacy_owner",
+  "actustube_ci_fixture_runtime",
+] as const;
+
+type TestUsageBodyAclCatalogRow = {
+  physical_key: string;
+  owner_name: string;
+  grantor_name: string;
+  grantee_name: string;
+  object_kind: string;
+  schema_name: string;
+  object_name: string;
+  privilege_type: string;
+  grant_option: boolean;
+};
+
+type TestUsageBodyAclDependencyCatalogRow = {
+  physical_key: string;
+  role_name: string;
+  object_name: string;
+  dependency_type: string;
+  database_boundary: string;
+  class_boundary: string;
+};
+
+type TestUsageBodyAclSelectionArm =
+  | "system-wide-recipient"
+  | "target-as-grantor"
+  | "observed-grantor";
+
+function testUsageBodyAclCatalogRow(
+  overrides: Partial<TestUsageBodyAclCatalogRow> = {}
+): TestUsageBodyAclCatalogRow {
+  return {
+    physical_key: "fixed-acl-row",
+    owner_name: "fixed_object_owner",
+    grantor_name: testFixtureSessionRole,
+    grantee_name: testUsageBodyAclRoles.explicit,
+    object_kind: "table",
+    schema_name: "public",
+    object_name: "users",
+    privilege_type: "SELECT",
+    grant_option: false,
+    ...overrides,
+  };
+}
+
+function testLocalUsageBodyAclSelectionArms(
+  row: TestUsageBodyAclCatalogRow,
+  observedGrantorName = testFixtureSessionRole
+): TestUsageBodyAclSelectionArm[] {
+  const fixedObject =
+    row.object_kind === "table" &&
+    row.schema_name === "public" &&
+    testUsageBodyAclManifest.some((entry) => entry.objectName === row.object_name);
+  if (!fixedObject) return [];
+
+  const arms: TestUsageBodyAclSelectionArm[] = [];
+  if (
+    testSystemWideAclRecipients.some(
+      (recipientName) => recipientName === row.grantee_name
+    )
+  ) {
+    arms.push("system-wide-recipient");
+  }
+  if (
+    testTargetAsGrantorRoles.some(
+      (targetRoleName) => targetRoleName === row.grantor_name
+    )
+  ) {
+    arms.push("target-as-grantor");
+  }
+  if (
+    row.grantor_name === observedGrantorName &&
+    row.grantee_name !== row.owner_name
+  ) {
+    arms.push("observed-grantor");
+  }
+  return arms;
+}
+
+function testLocalSelectedUsageBodyAclRows(
+  rows: TestUsageBodyAclCatalogRow[],
+  observedGrantorName = testFixtureSessionRole
+) {
+  return rows.filter(
+    (row) =>
+      testLocalUsageBodyAclSelectionArms(row, observedGrantorName).length > 0
+  );
+}
+
+function testLocalUsageBodyAclDependencyCounts(
+  row: TestUsageBodyAclCatalogRow,
+  dependencies: TestUsageBodyAclDependencyCatalogRow[]
+) {
+  const matchingDependencies = dependencies.filter(
+    (dependency) =>
+      dependency.dependency_type === "a" &&
+      dependency.database_boundary === "current" &&
+      dependency.class_boundary === "relation" &&
+      dependency.object_name === row.object_name
+  );
+  return {
+    grantee_dependency_count: matchingDependencies.filter(
+      (dependency) => dependency.role_name === row.grantee_name
+    ).length,
+    grantor_dependency_count: matchingDependencies.filter(
+      (dependency) => dependency.role_name === row.grantor_name
+    ).length,
+  };
+}
+
+function materializeTestUsageBodyAclCatalogRow(
+  row: TestUsageBodyAclCatalogRow,
+  dependencies: TestUsageBodyAclDependencyCatalogRow[]
+): TestUsageBodyAclRow {
+  const dependencyCounts = testLocalUsageBodyAclDependencyCounts(row, dependencies);
+  return {
+    authority_kind: "explicit_acl",
+    recipient_relation:
+      row.grantee_name === testUsageBodyAclRoles.explicit
+        ? "explicit_direct"
+        : row.grantee_name === testUsageBodyAclRoles.group
+          ? "membership_group_direct"
+          : "unexpected",
+    grantor_name: row.grantor_name,
+    grantee_name: row.grantee_name,
+    object_kind: row.object_kind,
+    schema_name: row.schema_name,
+    object_name: row.object_name,
+    privilege_type: row.privilege_type,
+    grant_option: row.grant_option,
+    ...dependencyCounts,
+  };
+}
+
+function testUsageBodyAclDependencyCatalogRow(
+  overrides: Partial<TestUsageBodyAclDependencyCatalogRow> = {}
+): TestUsageBodyAclDependencyCatalogRow {
+  return {
+    physical_key: "fixed-dependency-row",
+    role_name: testUsageBodyAclRoles.explicit,
+    object_name: "users",
+    dependency_type: "a",
+    database_boundary: "current",
+    class_boundary: "relation",
     ...overrides,
   };
 }
@@ -2488,7 +2650,8 @@ function createUsageBodyAclFakeHarness({
               row.object_name === entry.objectName &&
               row.privilege_type === privilegeType &&
               row.grant_option === false &&
-              row.shared_dependency_covered === true
+              row.grantee_dependency_count === 1 &&
+              row.grantor_dependency_count === 1
           )
         )
       )
@@ -2580,7 +2743,8 @@ function createUsageBodyAclFakeHarness({
           }
         } else if (
           statement.includes("target_objects(object_name, ordinal)") &&
-          statement.includes("shared_dependency_covered")
+          statement.includes("grantee_dependency_count") &&
+          statement.includes("grantor_dependency_count")
         ) {
           label = "body-acl-inventory";
           state.inventoryCount += 1;
@@ -3924,7 +4088,8 @@ describe("temporary usage body-object ACL boundary", () => {
           recipient_relation: "unexpected",
           grantor_name: "UNRESOLVED",
           privilege_type: "ACL_DEPENDENCY",
-          shared_dependency_covered: false,
+          grantee_dependency_count: 0,
+          grantor_dependency_count: 0,
         }),
       ],
     ],
@@ -3995,7 +4160,8 @@ describe("temporary usage body-object ACL boundary", () => {
         recipient_relation: "unexpected",
         grantee_name: "unknown_fixture_recipient",
         privilege_type: "ACL_DEPENDENCY",
-        shared_dependency_covered: false,
+        grantee_dependency_count: 0,
+        grantor_dependency_count: 0,
       }),
     ],
   ])(
@@ -4033,7 +4199,8 @@ describe("temporary usage body-object ACL boundary", () => {
         grantor_name: "UNRESOLVED",
         grantee_name: "unknown_fixture_recipient",
         privilege_type: "ACL_DEPENDENCY",
-        shared_dependency_covered: false,
+        grantee_dependency_count: 0,
+        grantor_dependency_count: 0,
       }),
     ],
   ])(
@@ -4047,6 +4214,478 @@ describe("temporary usage body-object ACL boundary", () => {
         "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
       );
       expect(fake.state.aclRows).toEqual([residue]);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it.each([
+    ["expected privilege", {}, true],
+    ["unexpected privilege", { privilege_type: "DELETE" }, true],
+    ["wrong object", { object_name: "outside_fixed_scope" }, false],
+    ["wrong object kind", { object_kind: "sequence" }, false],
+  ] as const)(
+    "system-wide recipient ACL coverage rejects %s without silent inventory acceptance",
+    async (_label, overrides, selectedByCoverage) => {
+      const catalogRow = testUsageBodyAclCatalogRow({
+        grantor_name: "fixed_unrelated_grantor",
+        grantee_name: "PUBLIC",
+        ...overrides,
+      });
+      const dependencies = [
+        testUsageBodyAclDependencyCatalogRow({
+          role_name: catalogRow.grantor_name,
+          object_name: catalogRow.object_name,
+        }),
+      ];
+      const reportedRow = materializeTestUsageBodyAclCatalogRow(
+        catalogRow,
+        dependencies
+      );
+      const selectedRows = testLocalSelectedUsageBodyAclRows([catalogRow]);
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: {
+          grantedRows: [...validTestUsageBodyAclRows(), reportedRow],
+        },
+      });
+
+      expect(selectedRows).toHaveLength(selectedByCoverage ? 1 : 0);
+      expect(testLocalUsageBodyAclSelectionArms(catalogRow)).toEqual(
+        selectedByCoverage ? ["system-wide-recipient"] : []
+      );
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+      );
+      expect(fake.state.executionCount).toBe(0);
+      expect(fake.state.exactRevokeCount).toBe(1);
+      expect(fake.state.inventoryCount).toBe(2);
+      expect(
+        fake.state.queryLog.filter((entry) => entry.label === "body-acl-inventory")
+      ).toHaveLength(2);
+      expect(fake.state.aclRows).toContainEqual(reportedRow);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+      const publicResult = JSON.stringify(result);
+      expect(publicResult).not.toContain(catalogRow.grantor_name);
+      expect(publicResult).not.toContain(catalogRow.grantee_name);
+    }
+  );
+
+  it.each(testTargetAsGrantorRoles)(
+    "target-as-grantor ACL coverage rejects unknown recipient authority from target class %s",
+    async (grantorName) => {
+      const catalogRow = testUsageBodyAclCatalogRow({
+        grantor_name: grantorName,
+        grantee_name: "unknown_fixture_recipient",
+      });
+      const dependencies = [
+        testUsageBodyAclDependencyCatalogRow({
+          physical_key: "target-grantee-dependency",
+          role_name: catalogRow.grantee_name,
+        }),
+        testUsageBodyAclDependencyCatalogRow({
+          physical_key: "target-grantor-dependency",
+          role_name: catalogRow.grantor_name,
+        }),
+      ];
+      const reportedRow = materializeTestUsageBodyAclCatalogRow(
+        catalogRow,
+        dependencies
+      );
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: {
+          grantedRows: [...validTestUsageBodyAclRows(), reportedRow],
+        },
+      });
+
+      expect(testLocalUsageBodyAclSelectionArms(catalogRow)).toEqual([
+        "target-as-grantor",
+      ]);
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+      );
+      expect(fake.state.executionCount).toBe(0);
+      expect(fake.state.exactRevokeCount).toBe(1);
+      expect(fake.state.inventoryCount).toBe(2);
+      expect(
+        fake.state.queryLog.filter((entry) => entry.label === "body-acl-inventory")
+      ).toHaveLength(2);
+      expect(fake.state.aclRows).toContainEqual(reportedRow);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it.each([
+    ["expected privilege", {}, true],
+    ["unexpected privilege", { privilege_type: "DELETE" }, true],
+    ["wrong object", { object_name: "outside_fixed_scope" }, false],
+    ["wrong object kind", { object_kind: "sequence" }, false],
+  ] as const)(
+    "target-as-grantor ACL coverage preserves fixed-object boundary for %s",
+    async (_label, overrides, selectedByCoverage) => {
+      const catalogRow = testUsageBodyAclCatalogRow({
+        grantor_name: testUsageBodyAclRoles.denied,
+        grantee_name: "unknown_fixture_recipient",
+        ...overrides,
+      });
+      const reportedRow = materializeTestUsageBodyAclCatalogRow(catalogRow, [
+        testUsageBodyAclDependencyCatalogRow({
+          physical_key: "target-grantee-dependency",
+          role_name: catalogRow.grantee_name,
+          object_name: catalogRow.object_name,
+        }),
+        testUsageBodyAclDependencyCatalogRow({
+          physical_key: "target-grantor-dependency",
+          role_name: catalogRow.grantor_name,
+          object_name: catalogRow.object_name,
+        }),
+      ]);
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: {
+          grantedRows: [...validTestUsageBodyAclRows(), reportedRow],
+        },
+      });
+
+      expect(testLocalSelectedUsageBodyAclRows([catalogRow])).toHaveLength(
+        selectedByCoverage ? 1 : 0
+      );
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+      );
+      expect(fake.state.exactRevokeCount).toBe(1);
+      expect(fake.state.inventoryCount).toBe(2);
+      expect(fake.state.aclRows).toContainEqual(reportedRow);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it("deduplicates overlapping system-wide recipient ACL coverage and target-as-grantor ACL coverage arms without hiding distinct rows", () => {
+    const systemAndTarget = testUsageBodyAclCatalogRow({
+      physical_key: "system-and-target",
+      grantor_name: testUsageBodyAclRoles.denied,
+      grantee_name: "PUBLIC",
+    });
+    const targetAndObserved = testUsageBodyAclCatalogRow({
+      physical_key: "target-and-observed",
+      grantor_name: testUsageBodyAclRoles.explicit,
+      grantee_name: "unknown_fixture_recipient",
+    });
+    const targetOnBothSides = testUsageBodyAclCatalogRow({
+      physical_key: "target-on-both-sides",
+      grantor_name: testUsageBodyAclRoles.group,
+      grantee_name: testUsageBodyAclRoles.group,
+    });
+    const distinctPrivilege = testUsageBodyAclCatalogRow({
+      ...systemAndTarget,
+      physical_key: "system-and-target-distinct",
+      privilege_type: "UPDATE",
+    });
+
+    expect(testLocalUsageBodyAclSelectionArms(systemAndTarget)).toEqual([
+      "system-wide-recipient",
+      "target-as-grantor",
+    ]);
+    expect(
+      testLocalUsageBodyAclSelectionArms(
+        targetAndObserved,
+        testUsageBodyAclRoles.explicit
+      )
+    ).toEqual(["target-as-grantor", "observed-grantor"]);
+    expect(testLocalUsageBodyAclSelectionArms(targetOnBothSides)).toEqual([
+      "target-as-grantor",
+    ]);
+    expect(
+      testLocalSelectedUsageBodyAclRows([systemAndTarget, distinctPrivilege])
+    ).toEqual([systemAndTarget, distinctPrivilege]);
+    expect(testLocalSelectedUsageBodyAclRows([systemAndTarget])).toEqual([
+      systemAndTarget,
+    ]);
+  });
+
+  it.each([
+    [
+      "system-wide recipient ACL coverage residue",
+      testUsageBodyAclResidueRow({
+        recipient_relation: "unexpected",
+        grantor_name: "fixed_unrelated_grantor",
+        grantee_name: "PUBLIC",
+        grantee_dependency_count: 0,
+      }),
+    ],
+    [
+      "target-as-grantor ACL coverage residue",
+      testUsageBodyAclResidueRow({
+        recipient_relation: "unexpected",
+        grantor_name: testUsageBodyAclRoles.denied,
+        grantee_name: "unknown_fixture_recipient",
+      }),
+    ],
+    [
+      "observed-grantor ACL coverage residue",
+      testUsageBodyAclResidueRow({
+        recipient_relation: "unexpected",
+        grantee_name: "unknown_fixture_recipient",
+      }),
+    ],
+  ])("rejects cleanup-only %s before runtime work", async (_label, residue) => {
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { postRevokeRows: [residue] },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+    );
+    expect(fake.state.aclRows).toEqual([residue]);
+    expect(fake.state.inventoryCount).toBe(2);
+    expect(
+      fake.state.queryLog.filter((entry) => entry.label === "body-acl-inventory")
+    ).toHaveLength(2);
+    expect(result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
+  });
+
+  const dependencyCatalogAclRow = testUsageBodyAclCatalogRow();
+  const granteeDependencyCatalogRow = testUsageBodyAclDependencyCatalogRow({
+    physical_key: "grantee-dependency",
+    role_name: dependencyCatalogAclRow.grantee_name,
+  });
+  const grantorDependencyCatalogRow = testUsageBodyAclDependencyCatalogRow({
+    physical_key: "grantor-dependency",
+    role_name: dependencyCatalogAclRow.grantor_name,
+  });
+
+  it.each([
+    ["valid grantee-side dependency only", [granteeDependencyCatalogRow], 1, 0],
+    ["valid grantor-side dependency only", [grantorDependencyCatalogRow], 0, 1],
+    ["grantor-side row reused as grantee-side dependency", [grantorDependencyCatalogRow], 0, 1],
+    ["grantee-side row reused as grantor-side dependency", [granteeDependencyCatalogRow], 1, 0],
+    [
+      "correct grantee role with wrong dependency type",
+      [
+        testUsageBodyAclDependencyCatalogRow({
+          role_name: dependencyCatalogAclRow.grantee_name,
+          dependency_type: "o",
+        }),
+        grantorDependencyCatalogRow,
+      ],
+      0,
+      1,
+    ],
+    [
+      "correct grantee role with wrong object",
+      [
+        testUsageBodyAclDependencyCatalogRow({
+          role_name: dependencyCatalogAclRow.grantee_name,
+          object_name: "plans",
+        }),
+        grantorDependencyCatalogRow,
+      ],
+      0,
+      1,
+    ],
+    [
+      "correct grantee role with wrong database boundary",
+      [
+        testUsageBodyAclDependencyCatalogRow({
+          role_name: dependencyCatalogAclRow.grantee_name,
+          database_boundary: "other",
+        }),
+        grantorDependencyCatalogRow,
+      ],
+      0,
+      1,
+    ],
+    [
+      "correct grantor role with wrong class boundary",
+      [
+        granteeDependencyCatalogRow,
+        testUsageBodyAclDependencyCatalogRow({
+          role_name: dependencyCatalogAclRow.grantor_name,
+          class_boundary: "other",
+        }),
+      ],
+      1,
+      0,
+    ],
+    [
+      "unrelated shared dependency",
+      [
+        testUsageBodyAclDependencyCatalogRow({
+          role_name: "unrelated_fixture_role",
+        }),
+      ],
+      0,
+      0,
+    ],
+    [
+      "duplicate grantee-side dependency",
+      [
+        granteeDependencyCatalogRow,
+        { ...granteeDependencyCatalogRow, physical_key: "grantee-dependency-2" },
+        grantorDependencyCatalogRow,
+      ],
+      2,
+      1,
+    ],
+    [
+      "duplicate grantor-side dependency",
+      [
+        granteeDependencyCatalogRow,
+        grantorDependencyCatalogRow,
+        { ...grantorDependencyCatalogRow, physical_key: "grantor-dependency-2" },
+      ],
+      1,
+      2,
+    ],
+  ] as const)(
+    "dependency side separation rejects %s",
+    async (_label, dependencies, expectedGranteeCount, expectedGrantorCount) => {
+      const actualRow = materializeTestUsageBodyAclCatalogRow(
+        dependencyCatalogAclRow,
+        [...dependencies]
+      );
+      const grantedRows = validTestUsageBodyAclRows().map((row) =>
+        row.grantor_name === dependencyCatalogAclRow.grantor_name &&
+        row.grantee_name === dependencyCatalogAclRow.grantee_name &&
+        row.object_name === dependencyCatalogAclRow.object_name &&
+        row.privilege_type === dependencyCatalogAclRow.privilege_type
+          ? actualRow
+          : row
+      );
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { grantedRows },
+      });
+
+      expect(actualRow.grantee_dependency_count).toBe(expectedGranteeCount);
+      expect(actualRow.grantor_dependency_count).toBe(expectedGrantorCount);
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+      );
+      expect(fake.state.executionCount).toBe(0);
+      expect(fake.state.exactRevokeCount).toBe(1);
+      expect(fake.state.inventoryCount).toBe(2);
+      expect(fake.state.aclRows).toEqual([]);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it("keeps grantee-side dependency and grantor-side dependency provenance when one physical dependency serves the same identity on both sides", () => {
+    const sameIdentityAcl = testUsageBodyAclCatalogRow({
+      grantor_name: testUsageBodyAclRoles.explicit,
+      grantee_name: testUsageBodyAclRoles.explicit,
+    });
+    const sharedPhysicalDependency = testUsageBodyAclDependencyCatalogRow({
+      role_name: testUsageBodyAclRoles.explicit,
+    });
+
+    expect(
+      testLocalUsageBodyAclDependencyCounts(sameIdentityAcl, [
+        sharedPhysicalDependency,
+      ])
+    ).toEqual({
+      grantee_dependency_count: 1,
+      grantor_dependency_count: 1,
+    });
+  });
+
+  it("rejects crossed grantee-side dependency and grantor-side dependency ACL identities", async () => {
+    const crossedAcl = testUsageBodyAclCatalogRow({
+      grantor_name: testUsageBodyAclRoles.explicit,
+      grantee_name: testFixtureSessionRole,
+    });
+    const crossedRow = materializeTestUsageBodyAclCatalogRow(crossedAcl, [
+      testUsageBodyAclDependencyCatalogRow({
+        physical_key: "crossed-grantee",
+        role_name: crossedAcl.grantee_name,
+      }),
+      testUsageBodyAclDependencyCatalogRow({
+        physical_key: "crossed-grantor",
+        role_name: crossedAcl.grantor_name,
+      }),
+    ]);
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: {
+        grantedRows: [...validTestUsageBodyAclRows(), crossedRow],
+      },
+    });
+
+    expect(crossedRow).toMatchObject({
+      grantee_dependency_count: 1,
+      grantor_dependency_count: 1,
+    });
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+    );
+    expect(fake.state.exactRevokeCount).toBe(1);
+    expect(fake.state.inventoryCount).toBe(2);
+    expect(fake.state.aclRows).toContainEqual(crossedRow);
+    expect(result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
+  });
+
+  it.each([
+    [
+      "grantee-side dependency residue",
+      1,
+      0,
+      testUsageBodyAclRoles.explicit,
+    ],
+    [
+      "grantor-side dependency residue",
+      0,
+      1,
+      testFixtureSessionRole,
+    ],
+    [
+      "system-wide-recipient grantee-side dependency residue",
+      1,
+      0,
+      testUsageBodyAclRoles.publicProbe,
+    ],
+    [
+      "target-as-grantor grantor-side dependency residue",
+      0,
+      1,
+      testUsageBodyAclRoles.denied,
+    ],
+    [
+      "observed-grantor grantor-side dependency residue",
+      0,
+      1,
+      testFixtureSessionRole,
+    ],
+  ] as const)(
+    "rejects one-side-only %s at zero residue when ACL authority is otherwise absent",
+    async (
+      _label,
+      granteeDependencyCount,
+      grantorDependencyCount,
+      referencedRoleName
+    ) => {
+      const dependencyResidue = testUsageBodyAclResidueRow({
+        authority_kind: "uncovered_acl_dependency",
+        recipient_relation: "unexpected",
+        grantor_name: "UNRESOLVED",
+        grantee_name: referencedRoleName,
+        privilege_type: "ACL_DEPENDENCY",
+        grantee_dependency_count: granteeDependencyCount,
+        grantor_dependency_count: grantorDependencyCount,
+      });
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { postRevokeRows: [dependencyResidue] },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+      );
+      expect(fake.state.aclRows).toEqual([dependencyResidue]);
+      expect(fake.state.inventoryCount).toBe(2);
+      expect(
+        fake.state.queryLog.filter((entry) => entry.label === "body-acl-inventory")
+      ).toHaveLength(2);
       expect(result.runtimeAclConfigurationStartCount).toBe(0);
       expect(result.postflightStartCount).toBe(0);
     }
@@ -4192,7 +4831,8 @@ describe("temporary usage body-object ACL boundary", () => {
         recipient_relation: "unexpected",
         grantor_name: "UNRESOLVED",
         privilege_type: "ACL_DEPENDENCY",
-        shared_dependency_covered: false,
+        grantee_dependency_count: 0,
+        grantor_dependency_count: 0,
       }),
     ],
   ])("rejects post-REVOKE %s before later runtime ACL work", async (_label, residue) => {
@@ -4322,6 +4962,17 @@ describe("temporary usage body-object ACL boundary", () => {
       boundaryStart
     );
     const boundarySource = source.slice(boundaryStart, boundaryEnd);
+    const inventoryQueryStart = source.indexOf(
+      "const USAGE_BODY_ACL_INVENTORY_SQL = `"
+    );
+    const inventoryQueryEnd = source.indexOf(
+      "const FIXTURE_EXTENSION_CONTRACT",
+      inventoryQueryStart
+    );
+    const inventoryQuerySource = source.slice(
+      inventoryQueryStart,
+      inventoryQueryEnd
+    );
     const applyStart = source.indexOf(
       "async function applyMigrationsAndRuntimeAcl("
     );
@@ -4344,18 +4995,35 @@ describe("temporary usage body-object ACL boundary", () => {
     const boundaryReturnIndex = boundarySource.indexOf("return verificationResult");
 
     expect(source).toContain("const USAGE_BODY_OBJECT_ACL_MANIFEST = Object.freeze([");
-    expect(source).toContain("dependency_entry.deptype = 'a'");
-    expect(source).toContain("shared_dependency_covered");
-    expect(source).toContain("observed_grantor AS (");
-    expect(source).toContain("role_entry.rolname = $2::text");
-    expect(source).toContain(
+    expect(inventoryQuerySource).toContain("dependency_entry.deptype = 'a'");
+    expect(inventoryQuerySource).toContain("observed_grantor AS (");
+    expect(inventoryQuerySource).toContain("role_entry.rolname = $2::text");
+    expect(inventoryQuerySource).toContain("all_explicit_acl.grantee = 0");
+    expect(inventoryQuerySource).toContain(
+      "all_explicit_acl.grantee IN (SELECT oid FROM target_roles)"
+    );
+    expect(inventoryQuerySource).toContain(
+      "all_explicit_acl.grantor IN (SELECT oid FROM target_roles)"
+    );
+    expect(inventoryQuerySource).toContain(
       "all_explicit_acl.grantor = (SELECT oid FROM observed_grantor)"
     );
-    expect(source).toContain(
+    expect(inventoryQuerySource).toContain(
       "all_explicit_acl.grantee <> all_explicit_acl.relowner"
     );
-    expect(source).toContain("FROM all_explicit_acl");
-    expect(source).toContain("dependency_entry.refobjid IN (");
+    expect(inventoryQuerySource).toContain("explicit_acl_dependency_sides AS (");
+    expect(inventoryQuerySource).toContain("'grantee'::text AS dependency_side");
+    expect(inventoryQuerySource).toContain("'grantor'::text AS dependency_side");
+    expect(inventoryQuerySource).toContain(
+      "dependency_entry.refobjid = explicit_acl.grantee"
+    );
+    expect(inventoryQuerySource).toContain(
+      "dependency_entry.refobjid = explicit_acl.grantor"
+    );
+    expect(inventoryQuerySource).toContain("grantee_dependency_count");
+    expect(inventoryQuerySource).toContain("grantor_dependency_count");
+    expect(inventoryQuerySource).not.toContain("shared_dependency_covered");
+    expect(inventoryQuerySource).not.toContain("dependency_entry.refobjid IN (");
     expect(source).toContain(
       "USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,\n    grantorName"
     );

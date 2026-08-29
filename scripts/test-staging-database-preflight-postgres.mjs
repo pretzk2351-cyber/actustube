@@ -90,7 +90,8 @@ const USAGE_BODY_ACL_ROW_KEYS = Object.freeze([
   "object_name",
   "privilege_type",
   "grant_option",
-  "shared_dependency_covered",
+  "grantee_dependency_count",
+  "grantor_dependency_count",
 ]);
 const USAGE_MIGRATION_BOUNDARY_ROLES = Object.freeze({
   legacyOwner: "actustube_ci_usage_legacy_owner",
@@ -1219,11 +1220,27 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
   ), explicit_acl AS (
     SELECT all_explicit_acl.*
     FROM all_explicit_acl
-    WHERE all_explicit_acl.grantee IN (SELECT oid FROM target_roles)
+    WHERE all_explicit_acl.grantee = 0
+       OR all_explicit_acl.grantee IN (SELECT oid FROM target_roles)
+       OR all_explicit_acl.grantor IN (SELECT oid FROM target_roles)
        OR (
          all_explicit_acl.grantor = (SELECT oid FROM observed_grantor)
          AND all_explicit_acl.grantee <> all_explicit_acl.relowner
        )
+  ), explicit_acl_dependency_sides AS (
+    SELECT
+      all_explicit_acl.relation_oid,
+      all_explicit_acl.grantee AS referenced_role_oid,
+      'grantee'::text AS dependency_side
+    FROM all_explicit_acl
+
+    UNION ALL
+
+    SELECT
+      all_explicit_acl.relation_oid,
+      all_explicit_acl.grantor AS referenced_role_oid,
+      'grantor'::text AS dependency_side
+    FROM all_explicit_acl
   ), relevant_dependencies AS (
     SELECT
       dependency_entry.dbid,
@@ -1259,19 +1276,26 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
       explicit_acl.relname::text AS object_name,
       explicit_acl.privilege_type::text AS privilege_type,
       explicit_acl.is_grantable AS grant_option,
-      EXISTS (
-        SELECT 1
+      (
+        SELECT COUNT(*)::integer
         FROM relevant_dependencies AS dependency_entry
         CROSS JOIN current_database_identity
         WHERE dependency_entry.dbid = current_database_identity.oid
           AND dependency_entry.classid = 'pg_catalog.pg_class'::regclass
           AND dependency_entry.objid = explicit_acl.relation_oid
           AND dependency_entry.objsubid = 0
-          AND dependency_entry.refobjid IN (
-            explicit_acl.grantee,
-            explicit_acl.grantor
-          )
-      ) AS shared_dependency_covered,
+          AND dependency_entry.refobjid = explicit_acl.grantee
+      ) AS grantee_dependency_count,
+      (
+        SELECT COUNT(*)::integer
+        FROM relevant_dependencies AS dependency_entry
+        CROSS JOIN current_database_identity
+        WHERE dependency_entry.dbid = current_database_identity.oid
+          AND dependency_entry.classid = 'pg_catalog.pg_class'::regclass
+          AND dependency_entry.objid = explicit_acl.relation_oid
+          AND dependency_entry.objsubid = 0
+          AND dependency_entry.refobjid = explicit_acl.grantor
+      ) AS grantor_dependency_count,
       explicit_acl.ordinal
     FROM explicit_acl
 
@@ -1287,7 +1311,8 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
       COALESCE(dependency_entry.relname, 'UNRESOLVED')::text,
       'ACL_DEPENDENCY'::text,
       false,
-      false,
+      0,
+      0,
       COALESCE(
         (SELECT ordinal FROM target_objects
          WHERE object_name = dependency_entry.relname),
@@ -1299,12 +1324,10 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
       AND dependency_entry.objsubid = 0
       AND NOT EXISTS (
         SELECT 1
-        FROM all_explicit_acl
-        WHERE all_explicit_acl.relation_oid = dependency_entry.objid
-          AND dependency_entry.refobjid IN (
-            all_explicit_acl.grantee,
-            all_explicit_acl.grantor
-          )
+        FROM explicit_acl_dependency_sides AS dependency_side
+        WHERE dependency_side.relation_oid = dependency_entry.objid
+          AND dependency_side.referenced_role_oid = dependency_entry.refobjid
+          AND dependency_side.dependency_side IN ('grantee', 'grantor')
       )
   )
   SELECT
@@ -1317,7 +1340,8 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
     object_name,
     privilege_type,
     grant_option,
-    shared_dependency_covered
+    grantee_dependency_count,
+    grantor_dependency_count
   FROM inventory
   ORDER BY
     ordinal,
@@ -4546,7 +4570,8 @@ function usageBodyAclExpectedRows(grantorName) {
             object_name: entry.objectName,
             privilege_type: privilegeType,
             grant_option: false,
-            shared_dependency_covered: true,
+            grantee_dependency_count: 1,
+            grantor_dependency_count: 1,
           })
         );
       }
