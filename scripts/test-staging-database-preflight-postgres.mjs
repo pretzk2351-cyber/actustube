@@ -1220,27 +1220,30 @@ const USAGE_BODY_ACL_INVENTORY_SQL = `
   ), explicit_acl AS (
     SELECT all_explicit_acl.*
     FROM all_explicit_acl
-    WHERE all_explicit_acl.grantee = 0
-       OR all_explicit_acl.grantee IN (SELECT oid FROM target_roles)
-       OR all_explicit_acl.grantor IN (SELECT oid FROM target_roles)
-       OR (
-         all_explicit_acl.grantor = (SELECT oid FROM observed_grantor)
-         AND all_explicit_acl.grantee <> all_explicit_acl.relowner
-       )
+    WHERE NOT (
+      all_explicit_acl.grantee = all_explicit_acl.relowner
+      AND all_explicit_acl.grantor = all_explicit_acl.relowner
+    )
+      AND (
+        all_explicit_acl.grantee = 0
+        OR all_explicit_acl.grantee IN (SELECT oid FROM target_roles)
+        OR all_explicit_acl.grantor IN (SELECT oid FROM target_roles)
+        OR all_explicit_acl.grantor = (SELECT oid FROM observed_grantor)
+      )
   ), explicit_acl_dependency_sides AS (
     SELECT
-      all_explicit_acl.relation_oid,
-      all_explicit_acl.grantee AS referenced_role_oid,
+      explicit_acl.relation_oid,
+      explicit_acl.grantee AS referenced_role_oid,
       'grantee'::text AS dependency_side
-    FROM all_explicit_acl
+    FROM explicit_acl
 
     UNION ALL
 
     SELECT
-      all_explicit_acl.relation_oid,
-      all_explicit_acl.grantor AS referenced_role_oid,
+      explicit_acl.relation_oid,
+      explicit_acl.grantor AS referenced_role_oid,
       'grantor'::text AS dependency_side
-    FROM all_explicit_acl
+    FROM explicit_acl
   ), relevant_dependencies AS (
     SELECT
       dependency_entry.dbid,

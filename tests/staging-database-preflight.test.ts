@@ -2434,6 +2434,13 @@ type TestUsageBodyAclCatalogRow = {
   grant_option: boolean;
 };
 
+type TestUsageBodyAclObjectOwner = {
+  object_kind: "table";
+  schema_name: "public";
+  object_name: string;
+  owner_name: string;
+};
+
 type TestUsageBodyAclDependencyCatalogRow = {
   physical_key: string;
   role_name: string;
@@ -2448,12 +2455,20 @@ type TestUsageBodyAclSelectionArm =
   | "target-as-grantor"
   | "observed-grantor";
 
+const testUsageBodyAclObjectOwners: TestUsageBodyAclObjectOwner[] =
+  testUsageBodyAclManifest.map((entry) => ({
+    object_kind: "table",
+    schema_name: "public",
+    object_name: entry.objectName,
+    owner_name: testFixtureSessionRole,
+  }));
+
 function testUsageBodyAclCatalogRow(
   overrides: Partial<TestUsageBodyAclCatalogRow> = {}
 ): TestUsageBodyAclCatalogRow {
   return {
     physical_key: "fixed-acl-row",
-    owner_name: "fixed_object_owner",
+    owner_name: testFixtureSessionRole,
     grantor_name: testFixtureSessionRole,
     grantee_name: testUsageBodyAclRoles.explicit,
     object_kind: "table",
@@ -2465,7 +2480,32 @@ function testUsageBodyAclCatalogRow(
   };
 }
 
-function testLocalUsageBodyAclSelectionArms(
+function testLocalIsExactOwnerSelfAcl(row: TestUsageBodyAclCatalogRow) {
+  return (
+    row.grantee_name === row.owner_name && row.grantor_name === row.owner_name
+  );
+}
+
+function testLocalIsExactTemporaryUsageBodyAcl(row: TestUsageBodyAclCatalogRow) {
+  return (
+    row.object_kind === "table" &&
+    row.schema_name === "public" &&
+    row.grantor_name === testFixtureSessionRole &&
+    row.grant_option === false &&
+    testUsageBodyAclRecipients.some(
+      (recipientName) => recipientName === row.grantee_name
+    ) &&
+    testUsageBodyAclManifest.some(
+      (entry) =>
+        entry.objectName === row.object_name &&
+        entry.privileges.some(
+          (privilegeType) => privilegeType === row.privilege_type
+        )
+    )
+  );
+}
+
+function testLocalUsageBodyAclSemanticUnionArms(
   row: TestUsageBodyAclCatalogRow,
   observedGrantorName = testFixtureSessionRole
 ): TestUsageBodyAclSelectionArm[] {
@@ -2491,12 +2531,26 @@ function testLocalUsageBodyAclSelectionArms(
     arms.push("target-as-grantor");
   }
   if (
-    row.grantor_name === observedGrantorName &&
-    row.grantee_name !== row.owner_name
+    row.grantor_name === observedGrantorName
   ) {
     arms.push("observed-grantor");
   }
   return arms;
+}
+
+function testLocalUsageBodyAclSelectionArms(
+  row: TestUsageBodyAclCatalogRow,
+  observedGrantorName = testFixtureSessionRole
+): TestUsageBodyAclSelectionArm[] {
+  const fixedObject =
+    row.object_kind === "table" &&
+    row.schema_name === "public" &&
+    testUsageBodyAclManifest.some((entry) => entry.objectName === row.object_name);
+  if (!fixedObject) return [];
+
+  if (testLocalIsExactOwnerSelfAcl(row)) return [];
+
+  return testLocalUsageBodyAclSemanticUnionArms(row, observedGrantorName);
 }
 
 function testLocalSelectedUsageBodyAclRows(
@@ -2568,10 +2622,105 @@ function testUsageBodyAclDependencyCatalogRow(
   };
 }
 
+function testUsageBodyAclOwnerForObject(
+  objectName: string,
+  objectOwners: TestUsageBodyAclObjectOwner[] = testUsageBodyAclObjectOwners
+) {
+  const matches = objectOwners.filter(
+    (entry) =>
+      entry.object_kind === "table" &&
+      entry.schema_name === "public" &&
+      entry.object_name === objectName
+  );
+  expect(matches).toHaveLength(1);
+  return matches[0].owner_name;
+}
+
+function testUsageBodyAclOwnerDefaultCatalogRows(
+  objectOwners: TestUsageBodyAclObjectOwner[] = testUsageBodyAclObjectOwners
+): TestUsageBodyAclCatalogRow[] {
+  return objectOwners.map((entry, index) =>
+    testUsageBodyAclCatalogRow({
+      physical_key: `owner-default-${index}`,
+      owner_name: entry.owner_name,
+      grantor_name: entry.owner_name,
+      grantee_name: entry.owner_name,
+      object_kind: entry.object_kind,
+      schema_name: entry.schema_name,
+      object_name: entry.object_name,
+      privilege_type: "SELECT",
+    })
+  );
+}
+
+function testUsageBodyAclTemporaryCatalogRows(
+  objectOwners: TestUsageBodyAclObjectOwner[] = testUsageBodyAclObjectOwners,
+  grantorName = testFixtureSessionRole
+): TestUsageBodyAclCatalogRow[] {
+  return validTestUsageBodyAclRows({ grantorName }).map((row, index) =>
+    testUsageBodyAclCatalogRow({
+      physical_key: `temporary-acl-${index}`,
+      owner_name: testUsageBodyAclOwnerForObject(row.object_name, objectOwners),
+      grantor_name: row.grantor_name,
+      grantee_name: row.grantee_name,
+      object_kind: row.object_kind,
+      schema_name: row.schema_name,
+      object_name: row.object_name,
+      privilege_type: row.privilege_type,
+      grant_option: row.grant_option,
+    })
+  );
+}
+
+function testUsageBodyAclDefaultCatalogDependencies(
+  rows: TestUsageBodyAclCatalogRow[]
+): TestUsageBodyAclDependencyCatalogRow[] {
+  const dependencies = new Map<string, TestUsageBodyAclDependencyCatalogRow>();
+  for (const row of rows) {
+    for (const [side, roleName] of [
+      ["grantee", row.grantee_name],
+      ["grantor", row.grantor_name],
+    ] as const) {
+      const key = `${row.object_name}:${roleName}`;
+      if (!dependencies.has(key)) {
+        dependencies.set(
+          key,
+          testUsageBodyAclDependencyCatalogRow({
+            physical_key: `${side}-dependency-${dependencies.size}`,
+            role_name: roleName,
+            object_name: row.object_name,
+          })
+        );
+      }
+    }
+  }
+  return [...dependencies.values()];
+}
+
+function testUsageBodyAclCatalogInventoryRows({
+  rows,
+  dependencies,
+  observedGrantorName = testFixtureSessionRole,
+}: {
+  rows: TestUsageBodyAclCatalogRow[];
+  dependencies: TestUsageBodyAclDependencyCatalogRow[];
+  observedGrantorName?: string;
+}) {
+  return sortTestUsageBodyAclRows(
+    testLocalSelectedUsageBodyAclRows(rows, observedGrantorName).map((row) =>
+      materializeTestUsageBodyAclCatalogRow(row, dependencies)
+    )
+  );
+}
+
 type UsageBodyAclFakeOptions = {
   grantedRows?: TestUsageBodyAclRow[];
   executionRows?: TestUsageBodyAclRow[];
   postRevokeRows?: TestUsageBodyAclRow[];
+  rawGrantedCatalogRows?: TestUsageBodyAclCatalogRow[];
+  rawPostRevokeCatalogRows?: TestUsageBodyAclCatalogRow[];
+  rawCatalogDependencies?: TestUsageBodyAclDependencyCatalogRow[];
+  objectOwners?: TestUsageBodyAclObjectOwner[];
   schemaUsageRecipients?: string[];
   functionExecuteRecipients?: string[];
   explicitResultRows?: Array<Record<string, unknown>>;
@@ -2583,30 +2732,64 @@ type UsageBodyAclFakeOptions = {
   unrelatedAuthorityRows?: Array<Record<string, unknown>>;
 };
 
-function createUsageBodyAclFakeHarness({
-  grantedRows = validTestUsageBodyAclRows(),
-  executionRows = grantedRows,
-  postRevokeRows = [],
-  schemaUsageRecipients = [
+function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
+  const hasGrantedRowsOverride = Object.prototype.hasOwnProperty.call(
+    options,
+    "grantedRows"
+  );
+  const grantedRows = options.grantedRows ?? validTestUsageBodyAclRows();
+  const executionRows = options.executionRows ?? grantedRows;
+  const postRevokeRows = options.postRevokeRows ?? [];
+  const objectOwners = (options.objectOwners ?? testUsageBodyAclObjectOwners).map(
+    (entry) => ({ ...entry })
+  );
+  const defaultTemporaryCatalogRows = testUsageBodyAclTemporaryCatalogRows(
+    objectOwners
+  );
+  const rawGrantedCatalogRows = (
+    options.rawGrantedCatalogRows ?? [
+      ...testUsageBodyAclOwnerDefaultCatalogRows(objectOwners),
+      ...defaultTemporaryCatalogRows,
+    ]
+  ).map((row) => ({ ...row }));
+  const rawPostRevokeCatalogRows = (
+    options.rawPostRevokeCatalogRows ?? []
+  ).map((row) => ({ ...row }));
+  const rawCatalogDependencies = (
+    options.rawCatalogDependencies ??
+    testUsageBodyAclDefaultCatalogDependencies(defaultTemporaryCatalogRows)
+  ).map((row) => ({ ...row }));
+  const schemaUsageRecipients = options.schemaUsageRecipients ?? [
     testUsageBodyAclRoles.explicit,
     testUsageBodyAclRoles.group,
     testUsageBodyAclRoles.denied,
     testUsageBodyAclRoles.publicProbe,
-  ],
-  functionExecuteRecipients = [
+  ];
+  const functionExecuteRecipients = options.functionExecuteRecipients ?? [
     testUsageBodyAclRoles.explicit,
     testUsageBodyAclRoles.group,
-  ],
-  explicitResultRows = [{ allowed: false }],
-  membershipResultRows = [{ allowed: false }],
-  rejectOnLabel = null,
-  hangOnLabel = null,
-  grantIdentityRows = validObservedSessionIdentityRows(),
-  revokeIdentityRows = validObservedSessionIdentityRows(),
-  unrelatedAuthorityRows = [{ fixed_unrelated_authority: true }],
-}: UsageBodyAclFakeOptions = {}) {
+  ];
+  const explicitResultRows = options.explicitResultRows ?? [{ allowed: false }];
+  const membershipResultRows = options.membershipResultRows ?? [{ allowed: false }];
+  const rejectOnLabel = options.rejectOnLabel ?? null;
+  const hangOnLabel = options.hangOnLabel ?? null;
+  const grantIdentityRows =
+    options.grantIdentityRows ?? validObservedSessionIdentityRows();
+  const revokeIdentityRows =
+    options.revokeIdentityRows ?? validObservedSessionIdentityRows();
+  const unrelatedAuthorityRows = options.unrelatedAuthorityRows ?? [
+    { fixed_unrelated_authority: true },
+  ];
   const state = {
     aclRows: [] as TestUsageBodyAclRow[],
+    rawAclCatalogRows: [] as TestUsageBodyAclCatalogRow[],
+    objectOwners,
+    inventorySnapshots: [] as Array<{
+      rawCount: number;
+      ownerSelfCount: number;
+      filteredCount: number;
+    }>,
+    ownerAclMutationCount: 0,
     queryLog: [] as Array<{
       statement: string;
       parameters: unknown;
@@ -2634,6 +2817,13 @@ function createUsageBodyAclFakeHarness({
       queryLabels: string[];
     }>,
   };
+
+  function currentRawCatalogInventoryRows() {
+    return testUsageBodyAclCatalogInventoryRows({
+      rows: state.rawAclCatalogRows,
+      dependencies: rawCatalogDependencies,
+    });
+  }
 
   function hasCompleteBodyAuthority(granteeName: string) {
     return (
@@ -2793,30 +2983,59 @@ function createUsageBodyAclFakeHarness({
         }
         if (exactGrantMatched) {
           state.exactGrantCount += 1;
-          state.aclRows = grantedRows.map((row) => ({ ...row }));
+          state.rawAclCatalogRows = rawGrantedCatalogRows.map((row) => ({ ...row }));
+          state.aclRows = hasGrantedRowsOverride
+            ? grantedRows.map((row) => ({ ...row }))
+            : currentRawCatalogInventoryRows();
         }
         if (exactRevokeMatched) {
           state.exactRevokeCount += 1;
-          state.aclRows = state.aclRows.filter(
-            (row) =>
-              !(
-                row.authority_kind === "explicit_acl" &&
-                row.grantor_name === testFixtureSessionRole &&
-                testUsageBodyAclRecipients.some(
-                  (recipient) => recipient === row.grantee_name
-                ) &&
-                testUsageBodyAclManifest.some(
-                  (entry) =>
-                    entry.objectName === row.object_name &&
-                    entry.privileges.some(
-                      (privilege) => privilege === row.privilege_type
-                    )
-                )
-              )
+          const ownerSelfBefore = state.rawAclCatalogRows.filter(
+            testLocalIsExactOwnerSelfAcl
           );
+          state.rawAclCatalogRows = state.rawAclCatalogRows.filter(
+            (row) => !testLocalIsExactTemporaryUsageBodyAcl(row)
+          );
+          state.rawAclCatalogRows.push(
+            ...rawPostRevokeCatalogRows.map((row) => ({ ...row }))
+          );
+          const ownerSelfAfterKeys = new Set(
+            state.rawAclCatalogRows
+              .filter(testLocalIsExactOwnerSelfAcl)
+              .map((row) => row.physical_key)
+          );
+          state.ownerAclMutationCount += ownerSelfBefore.filter(
+            (row) => !ownerSelfAfterKeys.has(row.physical_key)
+          ).length;
+          state.aclRows = hasGrantedRowsOverride
+            ? state.aclRows.filter(
+                (row) =>
+                  !(
+                    row.authority_kind === "explicit_acl" &&
+                    row.grantor_name === testFixtureSessionRole &&
+                    testUsageBodyAclRecipients.some(
+                      (recipient) => recipient === row.grantee_name
+                    ) &&
+                    testUsageBodyAclManifest.some(
+                      (entry) =>
+                        entry.objectName === row.object_name &&
+                        entry.privileges.some(
+                          (privilege) => privilege === row.privilege_type
+                        )
+                    )
+                  )
+              )
+            : currentRawCatalogInventoryRows();
           state.aclRows.push(...postRevokeRows.map((row) => ({ ...row })));
         }
         if (label === "body-acl-inventory") {
+          state.inventorySnapshots.push({
+            rawCount: state.rawAclCatalogRows.length,
+            ownerSelfCount: state.rawAclCatalogRows.filter(
+              testLocalIsExactOwnerSelfAcl
+            ).length,
+            filteredCount: state.aclRows.length,
+          });
           if (state.revokeIdentityQueryCount > 0) {
             state.zeroResidueInventoryCount += 1;
           }
@@ -3737,6 +3956,337 @@ describe("temporary usage body-object ACL boundary", () => {
       result.phaseTrace.filter((phase) => phaseOrder.includes(phase))
     ).toEqual(phaseOrder);
   });
+
+  it("owner-default catalog fixture keeps independent owner metadata for every fixed object", () => {
+    const ownerRows = testUsageBodyAclOwnerDefaultCatalogRows();
+    const temporaryRows = testUsageBodyAclTemporaryCatalogRows();
+
+    expect(testUsageBodyAclObjectOwners).toHaveLength(5);
+    expect(
+      new Set(testUsageBodyAclObjectOwners.map((row) => row.object_name)).size
+    ).toBe(5);
+    expect(ownerRows).toHaveLength(5);
+    expect(ownerRows.every(testLocalIsExactOwnerSelfAcl)).toBe(true);
+    expect(temporaryRows).toHaveLength(18);
+    for (const ownerRow of ownerRows) {
+      expect(ownerRow.owner_name).toBe(
+        testUsageBodyAclOwnerForObject(ownerRow.object_name)
+      );
+      expect(ownerRow.grantor_name).toBe(ownerRow.owner_name);
+      expect(ownerRow.grantee_name).toBe(ownerRow.owner_name);
+    }
+  });
+
+  it("owner-self ACL exclusion filters owner defaults from both inventory phases without mutating them", async () => {
+    const { fake, result } = await runBodyAclProbe();
+
+    expect(result.failureMarker).toBeNull();
+    expect(result.bodyAclWindowComplete).toBe(true);
+    expect(fake.state.inventorySnapshots).toEqual([
+      { rawCount: 23, ownerSelfCount: 5, filteredCount: 18 },
+      { rawCount: 5, ownerSelfCount: 5, filteredCount: 0 },
+    ]);
+    expect(fake.state.rawAclCatalogRows).toHaveLength(5);
+    expect(fake.state.rawAclCatalogRows.every(testLocalIsExactOwnerSelfAcl)).toBe(
+      true
+    );
+    expect(fake.state.ownerAclMutationCount).toBe(0);
+    expect(fake.state.aclRows).toEqual([]);
+    expect(result.phaseTrace).toEqual(
+      expect.arrayContaining([
+        "MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION",
+        "MIGRATION_USAGE_MEMBERSHIP_RUNTIME_EXECUTION",
+        "MIGRATION_USAGE_BODY_ACL_REVOKE",
+        "MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE",
+      ])
+    );
+    expect(JSON.stringify(result)).not.toContain(testFixtureSessionRole);
+  });
+
+  it("owner-as-grantor preservation keeps owner to non-owner authority in the inventory", async () => {
+    const ownerAsGrantor = testUsageBodyAclCatalogRow({
+      physical_key: "owner-to-unknown-recipient",
+      owner_name: testFixtureSessionRole,
+      grantor_name: testFixtureSessionRole,
+      grantee_name: "unknown_fixture_recipient",
+    });
+    const rawGrantedCatalogRows = [
+      ...testUsageBodyAclOwnerDefaultCatalogRows(),
+      ...testUsageBodyAclTemporaryCatalogRows(),
+      ownerAsGrantor,
+    ];
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { rawGrantedCatalogRows },
+    });
+
+    expect(testLocalUsageBodyAclSelectionArms(ownerAsGrantor)).toEqual([
+      "observed-grantor",
+    ]);
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+    );
+    expect(fake.state.aclRows).toContainEqual(
+      expect.objectContaining({ grantee_name: ownerAsGrantor.grantee_name })
+    );
+    expect(fake.state.executionCount).toBe(0);
+    expect(result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
+  });
+
+  it("owner-as-grantee preservation keeps non-owner target grantor authority in the inventory", async () => {
+    const ownerAsGrantee = testUsageBodyAclCatalogRow({
+      physical_key: "target-grantor-to-owner",
+      owner_name: testFixtureSessionRole,
+      grantor_name: testUsageBodyAclRoles.denied,
+      grantee_name: testFixtureSessionRole,
+    });
+    const rawGrantedCatalogRows = [
+      ...testUsageBodyAclOwnerDefaultCatalogRows(),
+      ...testUsageBodyAclTemporaryCatalogRows(),
+      ownerAsGrantee,
+    ];
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { rawGrantedCatalogRows },
+    });
+
+    expect(testLocalUsageBodyAclSelectionArms(ownerAsGrantee)).toEqual([
+      "target-as-grantor",
+    ]);
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+    );
+    expect(fake.state.aclRows).toContainEqual(
+      expect.objectContaining({ grantor_name: ownerAsGrantee.grantor_name })
+    );
+    expect(fake.state.executionCount).toBe(0);
+    expect(result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
+  });
+
+  it("per-object owner boundary rejects a global owner assumption across objects", () => {
+    const objectOwners: TestUsageBodyAclObjectOwner[] = [
+      {
+        ...testUsageBodyAclObjectOwners[0],
+        owner_name: "first_fixed_object_owner",
+      },
+      {
+        ...testUsageBodyAclObjectOwners[1],
+        owner_name: "second_fixed_object_owner",
+      },
+    ];
+    const ownerRows = testUsageBodyAclOwnerDefaultCatalogRows(objectOwners);
+    const wrongObjectOwnerApplied = testUsageBodyAclCatalogRow({
+      physical_key: "wrong-owner-applied-to-second-object",
+      owner_name: objectOwners[1].owner_name,
+      grantor_name: objectOwners[0].owner_name,
+      grantee_name: objectOwners[0].owner_name,
+      object_name: objectOwners[1].object_name,
+    });
+
+    expect(ownerRows).toHaveLength(2);
+    expect(ownerRows.every(testLocalIsExactOwnerSelfAcl)).toBe(true);
+    expect(testLocalSelectedUsageBodyAclRows(ownerRows)).toEqual([]);
+    expect(
+      testLocalUsageBodyAclSelectionArms(
+        wrongObjectOwnerApplied,
+        objectOwners[0].owner_name
+      )
+    ).toEqual(["observed-grantor"]);
+  });
+
+  it("owner-self ACL exclusion preserves narrow system, target, observed, and self-grant coverage", () => {
+    const nonOwnerSelfGrant = testUsageBodyAclCatalogRow({
+      physical_key: "non-owner-self-grant",
+      owner_name: testFixtureSessionRole,
+      grantor_name: testUsageBodyAclRoles.denied,
+      grantee_name: testUsageBodyAclRoles.denied,
+    });
+    const ownerTargetGrantor = testUsageBodyAclCatalogRow({
+      physical_key: "owner-target-grantor",
+      owner_name: testUsageBodyAclRoles.denied,
+      grantor_name: testUsageBodyAclRoles.denied,
+      grantee_name: "unknown_fixture_recipient",
+    });
+    const ownerSystemRecipient = testUsageBodyAclCatalogRow({
+      physical_key: "owner-system-recipient",
+      owner_name: "PUBLIC",
+      grantor_name: "fixed_unrelated_grantor",
+      grantee_name: "PUBLIC",
+    });
+    const publicRecipient = testUsageBodyAclCatalogRow({
+      physical_key: "public-recipient",
+      owner_name: testFixtureSessionRole,
+      grantor_name: "fixed_unrelated_grantor",
+      grantee_name: "PUBLIC",
+    });
+    const ownerSelfAcrossMultipleArms = testUsageBodyAclCatalogRow({
+      physical_key: "owner-self-multiple-arms",
+      owner_name: testUsageBodyAclRoles.explicit,
+      grantor_name: testUsageBodyAclRoles.explicit,
+      grantee_name: testUsageBodyAclRoles.explicit,
+    });
+
+    expect(testLocalUsageBodyAclSelectionArms(nonOwnerSelfGrant)).toEqual([
+      "target-as-grantor",
+    ]);
+    expect(testLocalUsageBodyAclSelectionArms(ownerTargetGrantor)).toEqual([
+      "target-as-grantor",
+    ]);
+    expect(testLocalUsageBodyAclSelectionArms(ownerSystemRecipient)).toEqual([
+      "system-wide-recipient",
+    ]);
+    expect(testLocalUsageBodyAclSelectionArms(publicRecipient)).toEqual([
+      "system-wide-recipient",
+    ]);
+    expect(
+      testLocalUsageBodyAclSemanticUnionArms(
+        ownerSelfAcrossMultipleArms,
+        testUsageBodyAclRoles.explicit
+      )
+    ).toEqual(["target-as-grantor", "observed-grantor"]);
+    expect(
+      testLocalUsageBodyAclSelectionArms(
+        ownerSelfAcrossMultipleArms,
+        testUsageBodyAclRoles.explicit
+      )
+    ).toEqual([]);
+  });
+
+  it("owner-self ACL exclusion mutation controls reject broad and phase-specific filters", () => {
+    const exactOwnerSelf = testUsageBodyAclCatalogRow({
+      physical_key: "exact-owner-self",
+      owner_name: testUsageBodyAclRoles.explicit,
+      grantor_name: testUsageBodyAclRoles.explicit,
+      grantee_name: testUsageBodyAclRoles.explicit,
+    });
+    const ownerToNonOwner = testUsageBodyAclCatalogRow({
+      physical_key: "owner-to-non-owner",
+      owner_name: testFixtureSessionRole,
+      grantor_name: testFixtureSessionRole,
+      grantee_name: "unknown_fixture_recipient",
+    });
+    const nonOwnerToOwner = testUsageBodyAclCatalogRow({
+      physical_key: "non-owner-to-owner",
+      owner_name: testFixtureSessionRole,
+      grantor_name: testUsageBodyAclRoles.denied,
+      grantee_name: testFixtureSessionRole,
+    });
+    const nonOwnerSelfGrant = testUsageBodyAclCatalogRow({
+      physical_key: "non-owner-self",
+      owner_name: testFixtureSessionRole,
+      grantor_name: testUsageBodyAclRoles.denied,
+      grantee_name: testUsageBodyAclRoles.denied,
+    });
+    const rows = [
+      exactOwnerSelf,
+      ownerToNonOwner,
+      nonOwnerToOwner,
+      nonOwnerSelfGrant,
+    ];
+    const oracleKeys = testLocalSelectedUsageBodyAclRows(rows).map(
+      (row) => row.physical_key
+    );
+    const excludesEverySelfGrant = rows
+      .filter((row) => row.grantee_name !== row.grantor_name)
+      .flatMap((row) => testLocalUsageBodyAclSemanticUnionArms(row).length ? [row.physical_key] : []);
+    const excludesEitherOwnerSide = rows
+      .filter(
+        (row) =>
+          row.grantee_name !== row.owner_name && row.grantor_name !== row.owner_name
+      )
+      .flatMap((row) => testLocalUsageBodyAclSemanticUnionArms(row).length ? [row.physical_key] : []);
+    const ownerSelfOnlyOnObservedArm = rows
+      .filter(
+        (row) =>
+          !(
+            row.grantee_name === row.owner_name &&
+            row.grantor_name === row.owner_name &&
+            testLocalUsageBodyAclSemanticUnionArms(row).includes("observed-grantor")
+          )
+      )
+      .flatMap((row) => testLocalUsageBodyAclSemanticUnionArms(row).length ? [row.physical_key] : []);
+
+    expect(oracleKeys).toEqual([
+      ownerToNonOwner.physical_key,
+      nonOwnerToOwner.physical_key,
+      nonOwnerSelfGrant.physical_key,
+    ]);
+    expect(excludesEverySelfGrant).not.toEqual(oracleKeys);
+    expect(excludesEitherOwnerSide).not.toEqual(oracleKeys);
+    expect(ownerSelfOnlyOnObservedArm).not.toEqual(oracleKeys);
+    expect(validTestUsageBodyAclRows()).toHaveLength(18);
+  });
+
+  it.each([
+    [
+      "owner to non-owner ACL",
+      testUsageBodyAclCatalogRow({
+        physical_key: "cleanup-owner-to-non-owner",
+        owner_name: testFixtureSessionRole,
+        grantor_name: testFixtureSessionRole,
+        grantee_name: "unknown_fixture_recipient",
+      }),
+    ],
+    [
+      "non-owner to owner ACL",
+      testUsageBodyAclCatalogRow({
+        physical_key: "cleanup-non-owner-to-owner",
+        owner_name: testFixtureSessionRole,
+        grantor_name: testUsageBodyAclRoles.denied,
+        grantee_name: testFixtureSessionRole,
+      }),
+    ],
+    [
+      "non-owner self-grant ACL",
+      testUsageBodyAclCatalogRow({
+        physical_key: "cleanup-non-owner-self-grant",
+        owner_name: testFixtureSessionRole,
+        grantor_name: testUsageBodyAclRoles.denied,
+        grantee_name: testUsageBodyAclRoles.denied,
+      }),
+    ],
+  ])(
+    "rejects cleanup-after owner-self ACL exclusion residue %s",
+    async (_label, rawResidue) => {
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { rawPostRevokeCatalogRows: [rawResidue] },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+      );
+      expect(fake.state.rawAclCatalogRows).toContainEqual(rawResidue);
+      expect(fake.state.aclRows).toContainEqual(
+        expect.objectContaining({
+          grantor_name: rawResidue.grantor_name,
+          grantee_name: rawResidue.grantee_name,
+        })
+      );
+      expect(fake.state.ownerAclMutationCount).toBe(0);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it.each([
+    ["wrong object", { object_name: "outside_fixed_scope" }],
+    ["wrong object kind", { object_kind: "sequence" }],
+  ] as const)(
+    "keeps %s owner-self-like catalog rows outside the fixed-object boundary",
+    (_label, overrides) => {
+      const row = testUsageBodyAclCatalogRow({
+        physical_key: `owner-self-like-${_label}`,
+        owner_name: testUsageBodyAclRoles.explicit,
+        grantor_name: testUsageBodyAclRoles.explicit,
+        grantee_name: testUsageBodyAclRoles.explicit,
+        ...overrides,
+      });
+
+      expect(testLocalIsExactOwnerSelfAcl(row)).toBe(true);
+      expect(testLocalUsageBodyAclSemanticUnionArms(row)).toEqual([]);
+      expect(testLocalUsageBodyAclSelectionArms(row)).toEqual([]);
+    }
+  );
 
   const invalidMutationIdentityRows = [
     ["zero rows", []],
@@ -5009,11 +5559,40 @@ describe("temporary usage body-object ACL boundary", () => {
       "all_explicit_acl.grantor = (SELECT oid FROM observed_grantor)"
     );
     expect(inventoryQuerySource).toContain(
+      "all_explicit_acl.grantee = all_explicit_acl.relowner"
+    );
+    expect(inventoryQuerySource).toContain(
+      "all_explicit_acl.grantor = all_explicit_acl.relowner"
+    );
+    expect(inventoryQuerySource).not.toContain(
       "all_explicit_acl.grantee <> all_explicit_acl.relowner"
     );
+    const ownerSelfFilterIndex = inventoryQuerySource.indexOf(
+      "WHERE NOT (\n      all_explicit_acl.grantee = all_explicit_acl.relowner\n      AND all_explicit_acl.grantor = all_explicit_acl.relowner\n    )"
+    );
+    const systemWideArmIndex = inventoryQuerySource.indexOf(
+      "all_explicit_acl.grantee = 0",
+      ownerSelfFilterIndex
+    );
+    expect(inventoryQuerySource).toContain("relation_entry.relowner");
+    expect(ownerSelfFilterIndex).toBeGreaterThan(-1);
+    expect(systemWideArmIndex).toBeGreaterThan(ownerSelfFilterIndex);
     expect(inventoryQuerySource).toContain("explicit_acl_dependency_sides AS (");
     expect(inventoryQuerySource).toContain("'grantee'::text AS dependency_side");
     expect(inventoryQuerySource).toContain("'grantor'::text AS dependency_side");
+    const dependencySidesStart = inventoryQuerySource.indexOf(
+      "explicit_acl_dependency_sides AS ("
+    );
+    const dependencySidesEnd = inventoryQuerySource.indexOf(
+      "), relevant_dependencies AS (",
+      dependencySidesStart
+    );
+    const dependencySidesSource = inventoryQuerySource.slice(
+      dependencySidesStart,
+      dependencySidesEnd
+    );
+    expect(dependencySidesSource.match(/FROM explicit_acl/g)).toHaveLength(2);
+    expect(dependencySidesSource).not.toContain("FROM all_explicit_acl");
     expect(inventoryQuerySource).toContain(
       "dependency_entry.refobjid = explicit_acl.grantee"
     );
