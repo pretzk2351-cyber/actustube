@@ -2455,13 +2455,132 @@ type TestUsageBodyAclSelectionArm =
   | "target-as-grantor"
   | "observed-grantor";
 
+const testPostgreSql18TableOwnerPrivileges = Object.freeze([
+  "INSERT",
+  "SELECT",
+  "UPDATE",
+  "DELETE",
+  "TRUNCATE",
+  "REFERENCES",
+  "TRIGGER",
+  "MAINTAIN",
+] as const);
+const testUsageBodyAclFixedObjectOwner =
+  testUsageBodyAclRoles.migrationExecutor;
+
 const testUsageBodyAclObjectOwners: TestUsageBodyAclObjectOwner[] =
   testUsageBodyAclManifest.map((entry) => ({
     object_kind: "table",
     schema_name: "public",
     object_name: entry.objectName,
-    owner_name: testFixtureSessionRole,
+    owner_name: testUsageBodyAclFixedObjectOwner,
   }));
+
+function testLocalHasExactPostgreSql18OwnerPrivilegeAllowlist(
+  privileges: readonly unknown[]
+) {
+  if (privileges.length !== 8) return false;
+  if (!privileges.every((privilege) => typeof privilege === "string")) {
+    return false;
+  }
+  const actual = [...privileges].sort();
+  const expected = [...testPostgreSql18TableOwnerPrivileges].sort();
+  return (
+    new Set(privileges).size === 8 &&
+    actual.every((privilege, index) => privilege === expected[index])
+  );
+}
+
+function testLocalUsageBodyAclOwnerRowKey(row: TestUsageBodyAclCatalogRow) {
+  return [
+    row.physical_key,
+    row.owner_name,
+    row.grantor_name,
+    row.grantee_name,
+    row.object_kind,
+    row.schema_name,
+    row.object_name,
+    row.privilege_type,
+    String(row.grant_option),
+  ].join("\u001f");
+}
+
+function testLocalExpectedUsageBodyAclOwnerRowKeys(
+  objectOwners: TestUsageBodyAclObjectOwner[] = testUsageBodyAclObjectOwners
+) {
+  return objectOwners
+    .flatMap((entry, objectIndex) =>
+      testPostgreSql18TableOwnerPrivileges.map((privilegeType) =>
+        [
+          `owner-default-${objectIndex}-${privilegeType}`,
+          entry.owner_name,
+          entry.owner_name,
+          entry.owner_name,
+          entry.object_kind,
+          entry.schema_name,
+          entry.object_name,
+          privilegeType,
+          "false",
+        ].join("\u001f")
+      )
+    )
+    .sort();
+}
+
+function testLocalActualUsageBodyAclOwnerRowKeys(
+  rows: TestUsageBodyAclCatalogRow[]
+) {
+  return rows
+    .filter(testLocalIsExactOwnerSelfAcl)
+    .map(testLocalUsageBodyAclOwnerRowKey)
+    .sort();
+}
+
+function testLocalOwnerAclMultisetMatches(
+  rows: TestUsageBodyAclCatalogRow[],
+  objectOwners: TestUsageBodyAclObjectOwner[] = testUsageBodyAclObjectOwners
+) {
+  const actualKeys = testLocalActualUsageBodyAclOwnerRowKeys(rows);
+  const expectedKeys = testLocalExpectedUsageBodyAclOwnerRowKeys(objectOwners);
+  const physicalKeys = rows
+    .filter(testLocalIsExactOwnerSelfAcl)
+    .map((row) => row.physical_key);
+  return (
+    actualKeys.length === 40 &&
+    new Set(physicalKeys).size === physicalKeys.length &&
+    actualKeys.length === expectedKeys.length &&
+    actualKeys.every((key, index) => key === expectedKeys[index])
+  );
+}
+
+function testLocalNormalBodyObjectOwnerAuthorityIsDistinct(
+  objectOwners: TestUsageBodyAclObjectOwner[]
+) {
+  const forbiddenOwnerIdentities = new Set([
+    testFixtureSessionRole,
+    testUsageBodyAclRoles.explicit,
+    testUsageBodyAclRoles.group,
+    testUsageBodyAclRoles.member,
+    testUsageBodyAclRoles.denied,
+    "PUBLIC",
+    testUsageBodyAclRoles.productionRuntime,
+    testUsageBodyAclRoles.legacyOwner,
+  ]);
+  return (
+    objectOwners.length === 5 &&
+    new Set(objectOwners.map((entry) => entry.object_name)).size === 5 &&
+    objectOwners.every(
+      (entry) =>
+        entry.object_kind === "table" &&
+        entry.schema_name === "public" &&
+        entry.owner_name === testUsageBodyAclFixedObjectOwner &&
+        !forbiddenOwnerIdentities.has(entry.owner_name) &&
+        testUsageBodyAclManifest.some(
+          (manifestEntry) => manifestEntry.objectName === entry.object_name
+        )
+    )
+  );
+}
 
 function testUsageBodyAclCatalogRow(
   overrides: Partial<TestUsageBodyAclCatalogRow> = {}
@@ -2639,17 +2758,19 @@ function testUsageBodyAclOwnerForObject(
 function testUsageBodyAclOwnerDefaultCatalogRows(
   objectOwners: TestUsageBodyAclObjectOwner[] = testUsageBodyAclObjectOwners
 ): TestUsageBodyAclCatalogRow[] {
-  return objectOwners.map((entry, index) =>
-    testUsageBodyAclCatalogRow({
-      physical_key: `owner-default-${index}`,
-      owner_name: entry.owner_name,
-      grantor_name: entry.owner_name,
-      grantee_name: entry.owner_name,
-      object_kind: entry.object_kind,
-      schema_name: entry.schema_name,
-      object_name: entry.object_name,
-      privilege_type: "SELECT",
-    })
+  return objectOwners.flatMap((entry, objectIndex) =>
+    testPostgreSql18TableOwnerPrivileges.map((privilegeType) =>
+      testUsageBodyAclCatalogRow({
+        physical_key: `owner-default-${objectIndex}-${privilegeType}`,
+        owner_name: entry.owner_name,
+        grantor_name: entry.owner_name,
+        grantee_name: entry.owner_name,
+        object_kind: entry.object_kind,
+        schema_name: entry.schema_name,
+        object_name: entry.object_name,
+        privilege_type: privilegeType,
+      })
+    )
   );
 }
 
@@ -2719,6 +2840,7 @@ type UsageBodyAclFakeOptions = {
   postRevokeRows?: TestUsageBodyAclRow[];
   rawGrantedCatalogRows?: TestUsageBodyAclCatalogRow[];
   rawPostRevokeCatalogRows?: TestUsageBodyAclCatalogRow[];
+  rawPostRevokeCatalogSnapshot?: TestUsageBodyAclCatalogRow[];
   rawCatalogDependencies?: TestUsageBodyAclDependencyCatalogRow[];
   objectOwners?: TestUsageBodyAclObjectOwner[];
   schemaUsageRecipients?: string[];
@@ -2746,15 +2868,19 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
   const defaultTemporaryCatalogRows = testUsageBodyAclTemporaryCatalogRows(
     objectOwners
   );
+  const initialOwnerCatalogRows =
+    testUsageBodyAclOwnerDefaultCatalogRows(objectOwners);
   const rawGrantedCatalogRows = (
     options.rawGrantedCatalogRows ?? [
-      ...testUsageBodyAclOwnerDefaultCatalogRows(objectOwners),
+      ...initialOwnerCatalogRows,
       ...defaultTemporaryCatalogRows,
     ]
   ).map((row) => ({ ...row }));
   const rawPostRevokeCatalogRows = (
     options.rawPostRevokeCatalogRows ?? []
   ).map((row) => ({ ...row }));
+  const rawPostRevokeCatalogSnapshot =
+    options.rawPostRevokeCatalogSnapshot?.map((row) => ({ ...row })) ?? null;
   const rawCatalogDependencies = (
     options.rawCatalogDependencies ??
     testUsageBodyAclDefaultCatalogDependencies(defaultTemporaryCatalogRows)
@@ -2782,7 +2908,7 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
   ];
   const state = {
     aclRows: [] as TestUsageBodyAclRow[],
-    rawAclCatalogRows: [] as TestUsageBodyAclCatalogRow[],
+    rawAclCatalogRows: initialOwnerCatalogRows.map((row) => ({ ...row })),
     objectOwners,
     inventorySnapshots: [] as Array<{
       rawCount: number;
@@ -2790,6 +2916,14 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
       filteredCount: number;
     }>,
     ownerAclMutationCount: 0,
+    ownerAclRevokeStatementCount: 0,
+    ownerAclMultisetMismatchCount: 0,
+    ownerAclMultisetSnapshots: [
+      {
+        phase: "before-grant",
+        keys: testLocalActualUsageBodyAclOwnerRowKeys(initialOwnerCatalogRows),
+      },
+    ] as Array<{ phase: string; keys: string[] }>,
     queryLog: [] as Array<{
       statement: string;
       parameters: unknown;
@@ -2922,6 +3056,9 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
         } else if (normalized.startsWith("REVOKE ")) {
           label = "body-acl-revoke";
           state.revokeAttemptCount += 1;
+          if (normalized.includes(`"${testUsageBodyAclFixedObjectOwner}"`)) {
+            state.ownerAclRevokeStatementCount += 1;
+          }
           if (
             typeof statementOrConfiguration === "string" &&
             normalized === normalizeExactRevokeSql(exactUsageBodyAclRevokeContract) &&
@@ -2984,29 +3121,62 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
         if (exactGrantMatched) {
           state.exactGrantCount += 1;
           state.rawAclCatalogRows = rawGrantedCatalogRows.map((row) => ({ ...row }));
+          const ownerKeys = testLocalActualUsageBodyAclOwnerRowKeys(
+            state.rawAclCatalogRows
+          );
+          state.ownerAclMultisetSnapshots.push({
+            phase: "post-grant",
+            keys: ownerKeys,
+          });
+          if (
+            ownerKeys.length !==
+              state.ownerAclMultisetSnapshots[0].keys.length ||
+            ownerKeys.some(
+              (key, index) =>
+                key !== state.ownerAclMultisetSnapshots[0].keys[index]
+            )
+          ) {
+            state.ownerAclMultisetMismatchCount += 1;
+          }
           state.aclRows = hasGrantedRowsOverride
             ? grantedRows.map((row) => ({ ...row }))
             : currentRawCatalogInventoryRows();
         }
         if (exactRevokeMatched) {
           state.exactRevokeCount += 1;
-          const ownerSelfBefore = state.rawAclCatalogRows.filter(
-            testLocalIsExactOwnerSelfAcl
-          );
+          state.ownerAclMutationCount += state.rawAclCatalogRows.filter(
+            (row) =>
+              testLocalIsExactOwnerSelfAcl(row) &&
+              testLocalIsExactTemporaryUsageBodyAcl(row)
+          ).length;
           state.rawAclCatalogRows = state.rawAclCatalogRows.filter(
             (row) => !testLocalIsExactTemporaryUsageBodyAcl(row)
           );
           state.rawAclCatalogRows.push(
             ...rawPostRevokeCatalogRows.map((row) => ({ ...row }))
           );
-          const ownerSelfAfterKeys = new Set(
+          if (rawPostRevokeCatalogSnapshot !== null) {
+            state.rawAclCatalogRows = rawPostRevokeCatalogSnapshot.map((row) => ({
+              ...row,
+            }));
+          }
+          const ownerKeys = testLocalActualUsageBodyAclOwnerRowKeys(
             state.rawAclCatalogRows
-              .filter(testLocalIsExactOwnerSelfAcl)
-              .map((row) => row.physical_key)
           );
-          state.ownerAclMutationCount += ownerSelfBefore.filter(
-            (row) => !ownerSelfAfterKeys.has(row.physical_key)
-          ).length;
+          state.ownerAclMultisetSnapshots.push({
+            phase: "post-revoke",
+            keys: ownerKeys,
+          });
+          if (
+            ownerKeys.length !==
+              state.ownerAclMultisetSnapshots[0].keys.length ||
+            ownerKeys.some(
+              (key, index) =>
+                key !== state.ownerAclMultisetSnapshots[0].keys[index]
+            )
+          ) {
+            state.ownerAclMultisetMismatchCount += 1;
+          }
           state.aclRows = hasGrantedRowsOverride
             ? state.aclRows.filter(
                 (row) =>
@@ -3029,6 +3199,17 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
           state.aclRows.push(...postRevokeRows.map((row) => ({ ...row })));
         }
         if (label === "body-acl-inventory") {
+          if (
+            !testLocalNormalBodyObjectOwnerAuthorityIsDistinct(objectOwners) ||
+            !testLocalOwnerAclMultisetMatches(
+              state.rawAclCatalogRows,
+              objectOwners
+            )
+          ) {
+            return Promise.reject(
+              new Error("fixed-owner-acl-catalog-contract-mismatch")
+            );
+          }
           state.inventorySnapshots.push({
             rawCount: state.rawAclCatalogRows.length,
             ownerSelfCount: state.rawAclCatalogRows.filter(
@@ -3957,7 +4138,7 @@ describe("temporary usage body-object ACL boundary", () => {
     ).toEqual(phaseOrder);
   });
 
-  it("owner-default catalog fixture keeps independent owner metadata for every fixed object", () => {
+  it("owner-default 40-row catalog fixture keeps the owner-default catalog fixture metadata independent for every fixed object", () => {
     const ownerRows = testUsageBodyAclOwnerDefaultCatalogRows();
     const temporaryRows = testUsageBodyAclTemporaryCatalogRows();
 
@@ -3965,28 +4146,37 @@ describe("temporary usage body-object ACL boundary", () => {
     expect(
       new Set(testUsageBodyAclObjectOwners.map((row) => row.object_name)).size
     ).toBe(5);
-    expect(ownerRows).toHaveLength(5);
+    expect(ownerRows).toHaveLength(40);
     expect(ownerRows.every(testLocalIsExactOwnerSelfAcl)).toBe(true);
     expect(temporaryRows).toHaveLength(18);
-    for (const ownerRow of ownerRows) {
-      expect(ownerRow.owner_name).toBe(
-        testUsageBodyAclOwnerForObject(ownerRow.object_name)
+    for (const objectOwner of testUsageBodyAclObjectOwners) {
+      const objectRows = ownerRows.filter(
+        (row) => row.object_name === objectOwner.object_name
       );
-      expect(ownerRow.grantor_name).toBe(ownerRow.owner_name);
-      expect(ownerRow.grantee_name).toBe(ownerRow.owner_name);
+      expect(objectRows).toHaveLength(8);
+      expect(
+        [...new Set(objectRows.map((row) => row.privilege_type))].sort()
+      ).toEqual([...testPostgreSql18TableOwnerPrivileges].sort());
+      for (const ownerRow of objectRows) {
+        expect(ownerRow.owner_name).toBe(
+          testUsageBodyAclOwnerForObject(ownerRow.object_name)
+        );
+        expect(ownerRow.grantor_name).toBe(ownerRow.owner_name);
+        expect(ownerRow.grantee_name).toBe(ownerRow.owner_name);
+      }
     }
   });
 
-  it("owner-self ACL exclusion filters owner defaults from both inventory phases without mutating them", async () => {
+  it("PostgreSQL 18 owner ACL expansion filters raw 58 to 18 and raw 40 to zero residue", async () => {
     const { fake, result } = await runBodyAclProbe();
 
     expect(result.failureMarker).toBeNull();
     expect(result.bodyAclWindowComplete).toBe(true);
     expect(fake.state.inventorySnapshots).toEqual([
-      { rawCount: 23, ownerSelfCount: 5, filteredCount: 18 },
-      { rawCount: 5, ownerSelfCount: 5, filteredCount: 0 },
+      { rawCount: 58, ownerSelfCount: 40, filteredCount: 18 },
+      { rawCount: 40, ownerSelfCount: 40, filteredCount: 0 },
     ]);
-    expect(fake.state.rawAclCatalogRows).toHaveLength(5);
+    expect(fake.state.rawAclCatalogRows).toHaveLength(40);
     expect(fake.state.rawAclCatalogRows.every(testLocalIsExactOwnerSelfAcl)).toBe(
       true
     );
@@ -4001,6 +4191,333 @@ describe("temporary usage body-object ACL boundary", () => {
       ])
     );
     expect(JSON.stringify(result)).not.toContain(testFixtureSessionRole);
+    expect(JSON.stringify(result)).not.toContain(
+      testUsageBodyAclFixedObjectOwner
+    );
+  });
+
+  it("distinct body object owner authority remains separate from the observed grantor and runtime identities", () => {
+    expect(
+      testLocalNormalBodyObjectOwnerAuthorityIsDistinct(
+        testUsageBodyAclObjectOwners
+      )
+    ).toBe(true);
+    expect(testUsageBodyAclFixedObjectOwner).not.toBe(testFixtureSessionRole);
+    expect(testUsageBodyAclFixedObjectOwner).not.toBe(
+      testUsageBodyAclRoles.legacyOwner
+    );
+    expect(testUsageBodyAclFixedObjectOwner).not.toBe(
+      testUsageBodyAclRoles.explicit
+    );
+    expect(
+      testUsageBodyAclObjectOwners.every(
+        (entry) => entry.owner_name === testUsageBodyAclFixedObjectOwner
+      )
+    ).toBe(true);
+  });
+
+  it("owner ACL multiset preservation keeps the exact 40 public-safe fixture rows across grant and revoke", async () => {
+    const { fake, result } = await runBodyAclProbe();
+
+    expect(result.failureMarker).toBeNull();
+    expect(fake.state.ownerAclMultisetSnapshots).toHaveLength(3);
+    expect(fake.state.ownerAclMultisetSnapshots.map((snapshot) => snapshot.phase)).toEqual([
+      "before-grant",
+      "post-grant",
+      "post-revoke",
+    ]);
+    const [beforeGrant, postGrant, postRevoke] =
+      fake.state.ownerAclMultisetSnapshots;
+    expect(beforeGrant.keys).toHaveLength(40);
+    expect(postGrant.keys).toEqual(beforeGrant.keys);
+    expect(postRevoke.keys).toEqual(beforeGrant.keys);
+    expect(fake.state.ownerAclMultisetMismatchCount).toBe(0);
+    expect(fake.state.ownerAclMutationCount).toBe(0);
+    expect(fake.state.ownerAclRevokeStatementCount).toBe(0);
+    expect(exactUsageBodyAclRevokeContract).not.toContain(
+      testUsageBodyAclFixedObjectOwner
+    );
+  });
+
+  it("owner privilege allowlist is the exact independent canonical PostgreSQL 18 set", () => {
+    expect(testPostgreSql18TableOwnerPrivileges).toEqual([
+      "INSERT",
+      "SELECT",
+      "UPDATE",
+      "DELETE",
+      "TRUNCATE",
+      "REFERENCES",
+      "TRIGGER",
+      "MAINTAIN",
+    ]);
+    expect(testLocalHasExactPostgreSql18OwnerPrivilegeAllowlist(
+      testPostgreSql18TableOwnerPrivileges
+    )).toBe(true);
+    expect(testPostgreSql18TableOwnerPrivileges).toHaveLength(8);
+    expect(new Set(testPostgreSql18TableOwnerPrivileges).size).toBe(8);
+  });
+
+  it.each([
+    ["one missing", testPostgreSql18TableOwnerPrivileges.slice(0, -1)],
+    [
+      "one unknown extra",
+      [...testPostgreSql18TableOwnerPrivileges, "EXECUTE"],
+    ],
+    [
+      "one duplicate",
+      [...testPostgreSql18TableOwnerPrivileges, "SELECT"],
+    ],
+    [
+      "case mismatch",
+      testPostgreSql18TableOwnerPrivileges.map((privilege, index) =>
+        index === 0 ? privilege.toLowerCase() : privilege
+      ),
+    ],
+    ["empty value", [...testPostgreSql18TableOwnerPrivileges.slice(1), ""]],
+    ["null value", [...testPostgreSql18TableOwnerPrivileges.slice(1), null]],
+    ["non-string value", [...testPostgreSql18TableOwnerPrivileges.slice(1), 7]],
+  ] as Array<[string, readonly unknown[]]>)(
+    "owner privilege allowlist rejects %s",
+    (_label, privileges) => {
+      expect(testLocalHasExactPostgreSql18OwnerPrivilegeAllowlist(privileges)).toBe(
+        false
+      );
+    }
+  );
+
+  const normalOwnerCatalogRows = testUsageBodyAclOwnerDefaultCatalogRows();
+  const ownerCatalogContractMutations: Array<
+    [string, TestUsageBodyAclCatalogRow[]]
+  > = [
+    ["one of 40 rows missing", normalOwnerCatalogRows.slice(1)],
+    [
+      "one extra owner row",
+      [
+        ...normalOwnerCatalogRows,
+        {
+          ...normalOwnerCatalogRows[0],
+          physical_key: "owner-default-extra",
+        },
+      ],
+    ],
+    [
+      "one object with seven rows",
+      normalOwnerCatalogRows.filter(
+        (row) =>
+          !(
+            row.object_name === testUsageBodyAclObjectOwners[0].object_name &&
+            row.privilege_type === "MAINTAIN"
+          )
+      ),
+    ],
+    [
+      "one object with nine rows",
+      [
+        ...normalOwnerCatalogRows,
+        {
+          ...normalOwnerCatalogRows[0],
+          physical_key: "owner-default-ninth-row",
+          privilege_type: "EXECUTE",
+        },
+      ],
+    ],
+    [
+      "one object with a duplicate privilege",
+      [
+        ...normalOwnerCatalogRows,
+        {
+          ...normalOwnerCatalogRows[0],
+          physical_key: "owner-default-duplicate-privilege",
+        },
+      ],
+    ],
+    [
+      "one object with the wrong owner",
+      normalOwnerCatalogRows.map((row, index) =>
+        index === 0
+          ? {
+              ...row,
+              owner_name: "wrong_body_object_owner",
+              grantor_name: "wrong_body_object_owner",
+              grantee_name: "wrong_body_object_owner",
+            }
+          : row
+      ),
+    ],
+    [
+      "one object owned by the observed grantor",
+      normalOwnerCatalogRows.map((row) =>
+        row.object_name === testUsageBodyAclObjectOwners[0].object_name
+          ? {
+              ...row,
+              owner_name: testFixtureSessionRole,
+              grantor_name: testFixtureSessionRole,
+              grantee_name: testFixtureSessionRole,
+            }
+          : row
+      ),
+    ],
+    [
+      "all objects owned by the observed grantor",
+      normalOwnerCatalogRows.map((row) => ({
+        ...row,
+        owner_name: testFixtureSessionRole,
+        grantor_name: testFixtureSessionRole,
+        grantee_name: testFixtureSessionRole,
+      })),
+    ],
+    [
+      "correct owner grantee with a wrong grantor",
+      normalOwnerCatalogRows.map((row, index) =>
+        index === 0
+          ? { ...row, grantor_name: testUsageBodyAclRoles.denied }
+          : row
+      ),
+    ],
+    [
+      "correct owner grantor with a wrong grantee",
+      normalOwnerCatalogRows.map((row, index) =>
+        index === 0
+          ? { ...row, grantee_name: testUsageBodyAclRoles.denied }
+          : row
+      ),
+    ],
+    [
+      "correct privilege on the wrong object",
+      normalOwnerCatalogRows.map((row, index) =>
+        index === 0 ? { ...row, object_name: "outside_fixed_scope" } : row
+      ),
+    ],
+    [
+      "correct privilege on the wrong object kind",
+      normalOwnerCatalogRows.map((row, index) =>
+        index === 0 ? { ...row, object_kind: "sequence" } : row
+      ),
+    ],
+  ];
+
+  it.each(ownerCatalogContractMutations)(
+    "PostgreSQL 18 owner ACL expansion rejects malformed raw owner catalog: %s",
+    async (_label, ownerRows) => {
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: {
+          rawGrantedCatalogRows: [
+            ...ownerRows,
+            ...testUsageBodyAclTemporaryCatalogRows(),
+          ],
+        },
+      });
+
+      expect(result.bodyAclWindowComplete).toBe(false);
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+      );
+      expect(fake.state.executionCount).toBe(0);
+      expect(fake.state.ownerAclMutationCount).toBe(0);
+      expect(fake.state.ownerAclRevokeStatementCount).toBe(0);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+      const publicResult = JSON.stringify(result);
+      expect(publicResult).not.toContain(testFixtureSessionRole);
+      expect(publicResult).not.toContain(testUsageBodyAclFixedObjectOwner);
+      expect(publicResult).not.toContain("wrong_body_object_owner");
+    }
+  );
+
+  it("distinct body object owner authority rejects an internally consistent observed-grantor owner fixture", async () => {
+    const objectOwners = testUsageBodyAclObjectOwners.map((entry) => ({
+      ...entry,
+      owner_name: testFixtureSessionRole,
+    }));
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { objectOwners },
+    });
+
+    expect(result.failureMarker).toBe(
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+    );
+    expect(fake.state.executionCount).toBe(0);
+    expect(fake.state.ownerAclMutationCount).toBe(0);
+    expect(result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
+  });
+
+  it.each([
+    ["17", validTestUsageBodyAclRows().slice(1)],
+    [
+      "19",
+      [
+        ...validTestUsageBodyAclRows(),
+        testUsageBodyAclResidueRow({
+          recipient_relation: "unexpected",
+          grantee_name: "unknown_fixture_recipient",
+        }),
+      ],
+    ],
+  ])(
+    "PostgreSQL 18 owner ACL expansion rejects filtered temporary count %s",
+    async (_label, grantedRows) => {
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { grantedRows },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY"
+      );
+      expect(fake.state.executionCount).toBe(0);
+      expect(fake.state.ownerAclMutationCount).toBe(0);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it.each([
+    ["39 raw owner rows", normalOwnerCatalogRows.slice(1)],
+    [
+      "41 raw owner rows",
+      [
+        ...normalOwnerCatalogRows,
+        {
+          ...normalOwnerCatalogRows[0],
+          physical_key: "post-revoke-extra-owner-row",
+        },
+      ],
+    ],
+    [
+      "same-count changed owner multiset",
+      normalOwnerCatalogRows.map((row, index) =>
+        index === 0 ? { ...row, privilege_type: "SELECT" } : row
+      ),
+    ],
+  ])(
+    "owner ACL multiset preservation rejects post-REVOKE %s",
+    async (_label, rawPostRevokeCatalogSnapshot) => {
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { rawPostRevokeCatalogSnapshot },
+      });
+
+      expect(result.failureMarker).toBe(
+        "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_ZERO_RESIDUE"
+      );
+      expect(fake.state.zeroResidueInventoryCount).toBe(0);
+      expect(fake.state.ownerAclRevokeStatementCount).toBe(0);
+      expect(fake.state.ownerAclMultisetMismatchCount).toBeGreaterThan(0);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it("owner ACL multiset preservation keeps owner rows outside temporary expected and REVOKE targets", () => {
+    const ownerRows = testUsageBodyAclOwnerDefaultCatalogRows();
+    const temporaryRows = testUsageBodyAclTemporaryCatalogRows();
+
+    expect(ownerRows).toHaveLength(40);
+    expect(temporaryRows).toHaveLength(18);
+    expect(ownerRows.some(testLocalIsExactTemporaryUsageBodyAcl)).toBe(false);
+    expect(temporaryRows.some(testLocalIsExactOwnerSelfAcl)).toBe(false);
+    expect(exactUsageBodyAclRevokeContract).not.toContain(
+      testUsageBodyAclFixedObjectOwner
+    );
   });
 
   it("owner-as-grantor preservation keeps owner to non-owner authority in the inventory", async () => {
@@ -4083,7 +4600,7 @@ describe("temporary usage body-object ACL boundary", () => {
       object_name: objectOwners[1].object_name,
     });
 
-    expect(ownerRows).toHaveLength(2);
+    expect(ownerRows).toHaveLength(16);
     expect(ownerRows.every(testLocalIsExactOwnerSelfAcl)).toBe(true);
     expect(testLocalSelectedUsageBodyAclRows(ownerRows)).toEqual([]);
     expect(
