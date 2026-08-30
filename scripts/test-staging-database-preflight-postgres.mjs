@@ -1658,6 +1658,51 @@ const INTERNAL_PHASE_PROBE_CONTAINER_PHASES = new Set([
 const EXTERNAL_FIXTURE_PHASE_FAILURES = new WeakMap();
 const EXTERNAL_FIXTURE_NOT_CONFIGURED_FAILURES = new WeakSet();
 const EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS = new WeakSet();
+const GRANT_INVENTORY_DIAGNOSTIC_FAILURES = new WeakMap();
+const GRANT_INVENTORY_CLEANUP_RESULTS = new WeakMap();
+const GRANT_INVENTORY_PRIMARY_MARKERS = Object.freeze({
+  CLIENT_FACTORY: "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_FACTORY",
+  CLIENT_CONNECT_REJECTED:
+    "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_CONNECT_REJECTED",
+  CLIENT_CONNECT_TIMEOUT:
+    "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_CONNECT_TIMEOUT",
+  QUERY_REJECTED: "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_QUERY_REJECTED",
+  QUERY_TIMEOUT: "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_QUERY_TIMEOUT",
+  RESULT_SHAPE: "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_RESULT_SHAPE",
+  EXACT_SET_MISMATCH:
+    "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_EXACT_SET_MISMATCH",
+  NORMALIZATION: "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_NORMALIZATION",
+  CLIENT_CLOSE_REJECTED:
+    "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_CLOSE_REJECTED",
+  CLIENT_CLOSE_TIMEOUT:
+    "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_CLOSE_TIMEOUT",
+});
+const GRANT_INVENTORY_DETAIL_MARKERS = Object.freeze([
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_DUPLICATE_ROW",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_MISSING_ROW",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_EXTRA_ROW",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_OBJECT_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_PRIVILEGE_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANT_OPTION_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_RECIPIENT_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANTOR_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_OWNER_SELF_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_SYSTEM_RECIPIENT_COVERAGE",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_TARGET_GRANTOR_COVERAGE",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_OBSERVED_GRANTOR_COVERAGE",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANTEE_DEPENDENCY",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANTOR_DEPENDENCY",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_UNCOVERED_DEPENDENCY",
+]);
+const GRANT_INVENTORY_DIAGNOSTIC_VERSION =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DIAGNOSTIC_V1";
+const GRANT_INVENTORY_CLEANUP_ATTEMPTED =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_ATTEMPTED";
+const GRANT_INVENTORY_CLEANUP_SUCCEEDED =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_SUCCEEDED";
+const GRANT_INVENTORY_CLEANUP_FAILED =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_FAILED";
+const GRANT_INVENTORY_SAFE_COUNT_MAXIMUM = 10_000;
 const INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES = new WeakMap();
 const INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_OPTIONS = new WeakMap();
 const INITIAL_FIXTURE_CLIENT_LIFECYCLE = Symbol("initial-fixture-client-lifecycle");
@@ -1691,13 +1736,164 @@ function fixedExternalFixturePhase(phase) {
     : EXTERNAL_FIXTURE_PHASES.unknown;
 }
 
-function createExternalFixturePhaseFailure(context, phase) {
+function createExternalFixturePhaseFailure(context, phase, sourceFailure = null) {
   const failure = Object.freeze(Object.create(null));
   EXTERNAL_FIXTURE_PHASE_FAILURES.set(
     failure,
     Object.freeze({ context, phase: fixedExternalFixturePhase(phase) })
   );
+  const diagnostic = GRANT_INVENTORY_DIAGNOSTIC_FAILURES.get(sourceFailure);
+  if (diagnostic) GRANT_INVENTORY_DIAGNOSTIC_FAILURES.set(failure, diagnostic);
   return failure;
+}
+
+function createGrantInventoryDiagnosticFailure(primary, details = [], counts = null) {
+  try {
+    if (!Object.prototype.hasOwnProperty.call(GRANT_INVENTORY_PRIMARY_MARKERS, primary)) {
+      return null;
+    }
+    const orderedDetails = GRANT_INVENTORY_DETAIL_MARKERS.filter((marker) =>
+      details.includes(marker)
+    );
+    if (new Set(details).size !== details.length || orderedDetails.length !== details.length) {
+      return null;
+    }
+    let safeCounts = null;
+    if (counts !== null) {
+      const countKeys = [
+        "expectedTotal",
+        "actualTotal",
+        "missingTotal",
+        "extraTotal",
+        "duplicateTotal",
+      ];
+      if (
+        !exactOwnKeys(counts, countKeys) ||
+        !countKeys.every(
+          (key) =>
+            Number.isSafeInteger(counts[key]) &&
+            counts[key] >= 0 &&
+            counts[key] <= GRANT_INVENTORY_SAFE_COUNT_MAXIMUM
+        )
+      ) {
+        return null;
+      }
+      safeCounts = Object.freeze({ ...counts });
+    }
+    const failure = Object.freeze(Object.create(null));
+    GRANT_INVENTORY_DIAGNOSTIC_FAILURES.set(
+      failure,
+      Object.freeze({
+        primary,
+        details: Object.freeze([...orderedDetails]),
+        counts: safeCounts,
+      })
+    );
+    return failure;
+  } catch {
+    return null;
+  }
+}
+
+function throwGrantInventoryDiagnostic(primary, details = [], counts = null) {
+  const failure = createGrantInventoryDiagnosticFailure(primary, details, counts);
+  if (failure === null) {
+    throw new HarnessIssue("EXTERNAL_FIXTURE_USAGE_BODY_ACL_INVENTORY_INVALID");
+  }
+  throw failure;
+}
+
+function isHarnessTimeout(error) {
+  return error instanceof HarnessIssue && error.code === "EXTERNAL_FIXTURE_OPERATION_TIMEOUT";
+}
+
+function recordGrantInventoryCleanupResult(failure, attempted, succeeded) {
+  try {
+    if (
+      !GRANT_INVENTORY_DIAGNOSTIC_FAILURES.has(failure) ||
+      attempted !== true ||
+      typeof succeeded !== "boolean" ||
+      GRANT_INVENTORY_CLEANUP_RESULTS.has(failure)
+    ) {
+      return;
+    }
+    GRANT_INVENTORY_CLEANUP_RESULTS.set(
+      failure,
+      Object.freeze({ attempted: true, succeeded })
+    );
+  } catch {
+    // Diagnostic metadata must never replace the existing primary failure.
+  }
+}
+
+function grantInventoryDiagnosticLines(error) {
+  try {
+    const diagnostic = GRANT_INVENTORY_DIAGNOSTIC_FAILURES.get(error);
+    const cleanup = GRANT_INVENTORY_CLEANUP_RESULTS.get(error);
+    if (
+      !exactOwnKeys(diagnostic, ["primary", "details", "counts"]) ||
+      !exactOwnKeys(cleanup, ["attempted", "succeeded"]) ||
+      cleanup.attempted !== true ||
+      typeof cleanup.succeeded !== "boolean" ||
+      !Array.isArray(diagnostic.details) ||
+      new Set(diagnostic.details).size !== diagnostic.details.length ||
+      diagnostic.details.some(
+        (marker) => !GRANT_INVENTORY_DETAIL_MARKERS.includes(marker)
+      ) ||
+      diagnostic.details.some(
+        (marker, index) =>
+          index > 0 &&
+          GRANT_INVENTORY_DETAIL_MARKERS.indexOf(diagnostic.details[index - 1]) >=
+            GRANT_INVENTORY_DETAIL_MARKERS.indexOf(marker)
+      )
+    ) {
+      return Object.freeze([]);
+    }
+    const primaryMarker = GRANT_INVENTORY_PRIMARY_MARKERS[diagnostic.primary];
+    if (typeof primaryMarker !== "string") return Object.freeze([]);
+    const lines = [GRANT_INVENTORY_DIAGNOSTIC_VERSION, primaryMarker];
+    if (diagnostic.primary === "EXACT_SET_MISMATCH") {
+      const countKeys = [
+        "expectedTotal",
+        "actualTotal",
+        "missingTotal",
+        "extraTotal",
+        "duplicateTotal",
+      ];
+      if (
+        !exactOwnKeys(diagnostic.counts, countKeys) ||
+        !countKeys.every(
+          (key) =>
+            Number.isSafeInteger(diagnostic.counts[key]) &&
+            diagnostic.counts[key] >= 0 &&
+            diagnostic.counts[key] <= GRANT_INVENTORY_SAFE_COUNT_MAXIMUM
+        )
+      ) {
+        return Object.freeze([]);
+      }
+      lines.push(...diagnostic.details);
+      const counts = diagnostic.counts;
+      lines.push(
+        `EXTERNAL_FIXTURE_GRANT_INVENTORY_COUNTS_V1 EXPECTED_TOTAL=${counts.expectedTotal} ACTUAL_TOTAL=${counts.actualTotal} MISSING_TOTAL=${counts.missingTotal} EXTRA_TOTAL=${counts.extraTotal} DUPLICATE_TOTAL=${counts.duplicateTotal}`
+      );
+    } else if (diagnostic.details.length !== 0 || diagnostic.counts !== null) {
+      return Object.freeze([]);
+    }
+    lines.push(
+      GRANT_INVENTORY_CLEANUP_ATTEMPTED,
+      cleanup.succeeded
+        ? GRANT_INVENTORY_CLEANUP_SUCCEEDED
+        : GRANT_INVENTORY_CLEANUP_FAILED
+    );
+    return Object.freeze(lines);
+  } catch {
+    return Object.freeze([]);
+  }
+}
+
+function externalFixtureFailureOutput(error) {
+  const marker = externalFixtureFailureMarker(error);
+  return `${[...grantInventoryDiagnosticLines(error), marker].join("\n")}\n`;
 }
 
 function externalFixtureFailureMarker(error) {
@@ -2126,7 +2322,7 @@ async function runExternalFixturePhase(context, phase, operation) {
   } catch (error) {
     const existingBrand = EXTERNAL_FIXTURE_PHASE_FAILURES.get(error);
     if (existingBrand?.context === context) throw error;
-    throw createExternalFixturePhaseFailure(context, fixedPhase);
+    throw createExternalFixturePhaseFailure(context, fixedPhase, error);
   }
 }
 
@@ -4591,23 +4787,214 @@ function compareUsageBodyAclRows(left, right) {
   return 0;
 }
 
-function assertUsageBodyAclInventoryRows(rows, grantorName, expectedGranted) {
-  requireHarness(
-    Array.isArray(rows) &&
-      rows.every(
-        (row) =>
-          row !== null &&
-          typeof row === "object" &&
-          exactOwnKeys(row, USAGE_BODY_ACL_ROW_KEYS)
+function isUsageBodyAclInventoryRowShape(row) {
+  return (
+    row !== null &&
+    typeof row === "object" &&
+    exactOwnKeys(row, USAGE_BODY_ACL_ROW_KEYS) &&
+    [
+      "authority_kind",
+      "recipient_relation",
+      "grantor_name",
+      "grantee_name",
+      "object_kind",
+      "schema_name",
+      "object_name",
+      "privilege_type",
+    ].every((key) => typeof row[key] === "string") &&
+    typeof row.grant_option === "boolean" &&
+    Number.isSafeInteger(row.grantee_dependency_count) &&
+    row.grantee_dependency_count >= 0 &&
+    Number.isSafeInteger(row.grantor_dependency_count) &&
+    row.grantor_dependency_count >= 0
+  );
+}
+
+function canonicalUsageBodyAclDiagnosticRow(row) {
+  return JSON.stringify(
+    Object.fromEntries(USAGE_BODY_ACL_ROW_KEYS.map((key) => [key, row[key]]))
+  );
+}
+
+function usageBodyAclMultiset(rows) {
+  const counts = new Map();
+  const representatives = new Map();
+  for (const row of rows) {
+    const key = canonicalUsageBodyAclDiagnosticRow(row);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (!representatives.has(key)) representatives.set(key, row);
+  }
+  return { counts, representatives };
+}
+
+function usageBodyAclExactSetDiagnostic(normalized, expected, grantorName) {
+  try {
+    if (
+      normalized.length > GRANT_INVENTORY_SAFE_COUNT_MAXIMUM ||
+      expected.length > GRANT_INVENTORY_SAFE_COUNT_MAXIMUM
+    ) {
+      return null;
+    }
+    const actualMultiset = usageBodyAclMultiset(normalized);
+    const expectedMultiset = usageBodyAclMultiset(expected);
+    const missingRows = [];
+    const extraRows = [];
+    let missingTotal = 0;
+    let extraTotal = 0;
+    for (const [key, expectedCount] of expectedMultiset.counts) {
+      const missingCount = Math.max(0, expectedCount - (actualMultiset.counts.get(key) ?? 0));
+      missingTotal += missingCount;
+      for (let index = 0; index < missingCount; index += 1) {
+        missingRows.push(expectedMultiset.representatives.get(key));
+      }
+    }
+    for (const [key, actualCount] of actualMultiset.counts) {
+      const extraCount = Math.max(0, actualCount - (expectedMultiset.counts.get(key) ?? 0));
+      extraTotal += extraCount;
+      for (let index = 0; index < extraCount; index += 1) {
+        extraRows.push(actualMultiset.representatives.get(key));
+      }
+    }
+    const duplicateTotal = [...actualMultiset.counts.values()].reduce(
+      (total, count) => total + Math.max(0, count - 1),
+      0
+    );
+    const counts = Object.freeze({
+      expectedTotal: expected.length,
+      actualTotal: normalized.length,
+      missingTotal,
+      extraTotal,
+      duplicateTotal,
+    });
+    if (
+      !Object.values(counts).every(
+        (value) =>
+          Number.isSafeInteger(value) &&
+          value >= 0 &&
+          value <= GRANT_INVENTORY_SAFE_COUNT_MAXIMUM
+      )
+    ) {
+      return null;
+    }
+
+    const details = new Set();
+    const addDetail = (name) =>
+      details.add(`EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_${name}`);
+    if (duplicateTotal > 0) addDetail("DUPLICATE_ROW");
+    if (missingTotal > 0) addDetail("MISSING_ROW");
+    if (extraTotal > 0) addDetail("EXTRA_ROW");
+
+    const expectedObjectContracts = new Set(
+      USAGE_BODY_OBJECT_ACL_MANIFEST.map((entry) =>
+        JSON.stringify([entry.objectKind, entry.schemaName, entry.objectName])
+      )
+    );
+    const expectedPrivilegeContracts = new Set(
+      USAGE_BODY_OBJECT_ACL_MANIFEST.flatMap((entry) =>
+        entry.privileges.map((privilege) =>
+          JSON.stringify([
+            entry.objectKind,
+            entry.schemaName,
+            entry.objectName,
+            privilege,
+          ])
+        )
+      )
+    );
+    const expectedRecipientContracts = new Set(
+      USAGE_BODY_ACL_RECIPIENTS.map((granteeName) =>
+        JSON.stringify([
+          granteeName === USAGE_FIXTURE_ROLES.explicitRuntime
+            ? "explicit_direct"
+            : "membership_group_direct",
+          granteeName,
+        ])
+      )
+    );
+    for (const row of extraRows) {
+      const objectContract = JSON.stringify([
+        row.object_kind,
+        row.schema_name,
+        row.object_name,
+      ]);
+      const privilegeContract = JSON.stringify([
+        row.object_kind,
+        row.schema_name,
+        row.object_name,
+        row.privilege_type,
+      ]);
+      const recipientContract = JSON.stringify([
+        row.recipient_relation,
+        row.grantee_name,
+      ]);
+      if (!expectedObjectContracts.has(objectContract)) addDetail("OBJECT_CONTRACT");
+      if (
+        expectedObjectContracts.has(objectContract) &&
+        !expectedPrivilegeContracts.has(privilegeContract)
+      ) {
+        addDetail("PRIVILEGE_CONTRACT");
+      }
+      if (row.grant_option !== false) addDetail("GRANT_OPTION_CONTRACT");
+      if (!expectedRecipientContracts.has(recipientContract)) {
+        addDetail("RECIPIENT_CONTRACT");
+      }
+      if (row.grantor_name !== grantorName) addDetail("GRANTOR_CONTRACT");
+      if (row.grantor_name === row.grantee_name) addDetail("OWNER_SELF_CONTRACT");
+      if (
+        USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE.includes(row.grantee_name) &&
+        !USAGE_BODY_ACL_RECIPIENTS.includes(row.grantee_name)
+      ) {
+        addDetail("SYSTEM_RECIPIENT_COVERAGE");
+      }
+      if (
+        USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE.includes(row.grantor_name) &&
+        row.grantor_name !== grantorName
+      ) {
+        addDetail("TARGET_GRANTOR_COVERAGE");
+      }
+      if (
+        row.grantor_name === grantorName &&
+        !USAGE_BODY_ACL_RECIPIENTS.includes(row.grantee_name)
+      ) {
+        addDetail("OBSERVED_GRANTOR_COVERAGE");
+      }
+      if (row.grantee_dependency_count !== 1) addDetail("GRANTEE_DEPENDENCY");
+      if (row.grantor_dependency_count !== 1) addDetail("GRANTOR_DEPENDENCY");
+      if (
+        row.authority_kind === "uncovered_acl_dependency" ||
+        row.privilege_type === "ACL_DEPENDENCY"
+      ) {
+        addDetail("UNCOVERED_DEPENDENCY");
+      }
+    }
+    return Object.freeze({
+      details: Object.freeze(
+        GRANT_INVENTORY_DETAIL_MARKERS.filter((marker) => details.has(marker))
       ),
-    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_INVENTORY_INVALID"
-  );
-  const normalized = rows.map((row) => Object.freeze({ ...row }));
-  const uniqueKeys = new Set(normalized.map((row) => JSON.stringify(row)));
-  requireHarness(
-    uniqueKeys.size === normalized.length,
-    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_INVENTORY_MISMATCH"
-  );
+      counts,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function assertUsageBodyAclInventoryRows(rows, grantorName, expectedGranted) {
+  let shapeMatches = false;
+  try {
+    shapeMatches =
+      Array.isArray(rows) && rows.every((row) => isUsageBodyAclInventoryRowShape(row));
+  } catch {
+    throwGrantInventoryDiagnostic("NORMALIZATION");
+  }
+  if (!shapeMatches) throwGrantInventoryDiagnostic("RESULT_SHAPE");
+  let normalized;
+  let uniqueKeys;
+  try {
+    normalized = rows.map((row) => Object.freeze({ ...row }));
+    uniqueKeys = new Set(normalized.map((row) => JSON.stringify(row)));
+  } catch {
+    throwGrantInventoryDiagnostic("NORMALIZATION");
+  }
   if (!expectedGranted) {
     requireHarness(
       normalized.length === 0,
@@ -4616,11 +5003,28 @@ function assertUsageBodyAclInventoryRows(rows, grantorName, expectedGranted) {
     return;
   }
   const expected = usageBodyAclExpectedRows(grantorName);
-  requireHarness(
-    JSON.stringify([...normalized].sort(compareUsageBodyAclRows)) ===
-      JSON.stringify(expected),
-    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_INVENTORY_MISMATCH"
-  );
+  let exactMatch = false;
+  try {
+    exactMatch =
+      uniqueKeys.size === normalized.length &&
+      JSON.stringify([...normalized].sort(compareUsageBodyAclRows)) ===
+        JSON.stringify(expected);
+  } catch {
+    throwGrantInventoryDiagnostic("NORMALIZATION");
+  }
+  if (!exactMatch) {
+    const diagnostic = usageBodyAclExactSetDiagnostic(
+      normalized,
+      expected,
+      grantorName
+    );
+    if (diagnostic === null) throwGrantInventoryDiagnostic("RESULT_SHAPE");
+    throwGrantInventoryDiagnostic(
+      "EXACT_SET_MISMATCH",
+      diagnostic.details,
+      diagnostic.counts
+    );
+  }
 }
 
 async function assertUsageBodyAclInventory(
@@ -4628,15 +5032,83 @@ async function assertUsageBodyAclInventory(
   grantorName,
   expectedGranted
 ) {
-  const result = await client.query(USAGE_BODY_ACL_INVENTORY_SQL, [
-    USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,
-    grantorName,
-  ]);
+  let result;
+  try {
+    result = await client.query(USAGE_BODY_ACL_INVENTORY_SQL, [
+      USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,
+      grantorName,
+    ]);
+  } catch (error) {
+    throwGrantInventoryDiagnostic(
+      isHarnessTimeout(error) ? "QUERY_TIMEOUT" : "QUERY_REJECTED"
+    );
+  }
+  let rows;
+  try {
+    rows = result?.rows;
+  } catch {
+    throwGrantInventoryDiagnostic("RESULT_SHAPE");
+  }
   assertUsageBodyAclInventoryRows(
-    result.rows,
+    rows,
     grantorName,
     expectedGranted
   );
+}
+
+async function runUsageBodyAclGrantInventoryClient(
+  context,
+  clientFactory,
+  credentials,
+  grantorName
+) {
+  let factoryReturned = false;
+  let factoryShapeValid = false;
+  let inventoryOperationStarted = false;
+  let inventoryOperationCompleted = false;
+  const trackedFactory = (factoryCredentials) => {
+    let client;
+    try {
+      client = clientFactory(factoryCredentials);
+    } catch {
+      throwGrantInventoryDiagnostic("CLIENT_FACTORY");
+    }
+    factoryReturned = true;
+    factoryShapeValid =
+      client !== null &&
+      typeof client === "object" &&
+      typeof client.then !== "function" &&
+      typeof client.connect === "function" &&
+      typeof client.query === "function" &&
+      typeof client.end === "function";
+    return client;
+  };
+  try {
+    return await withClient(context, trackedFactory, credentials, async (client) => {
+      inventoryOperationStarted = true;
+      await assertUsageBodyAclInventory(client, grantorName, true);
+      inventoryOperationCompleted = true;
+    });
+  } catch (error) {
+    if (GRANT_INVENTORY_DIAGNOSTIC_FAILURES.has(error)) throw error;
+    if (!inventoryOperationStarted) {
+      throwGrantInventoryDiagnostic(
+        !factoryReturned || !factoryShapeValid
+          ? "CLIENT_FACTORY"
+          : isHarnessTimeout(error)
+            ? "CLIENT_CONNECT_TIMEOUT"
+            : "CLIENT_CONNECT_REJECTED"
+      );
+    }
+    if (inventoryOperationCompleted) {
+      throwGrantInventoryDiagnostic(
+        isHarnessTimeout(error) ? "CLIENT_CLOSE_TIMEOUT" : "CLIENT_CLOSE_REJECTED"
+      );
+    }
+    throwGrantInventoryDiagnostic(
+      isHarnessTimeout(error) ? "QUERY_TIMEOUT" : "QUERY_REJECTED"
+    );
+  }
 }
 
 async function assertUsageBodyAclMutationClientIdentity(
@@ -4728,11 +5200,11 @@ async function runTemporaryUsageBodyAclWindow({
       )
     );
     await runMigrationUsageBodyAclGrantInventoryPhase(businessContext, () =>
-      withClient(
+      runUsageBodyAclGrantInventoryClient(
         businessContext,
         clientFactory,
         fixtureCredentials(configuration),
-        (client) => assertUsageBodyAclInventory(client, grantorName, true)
+        grantorName
       )
     );
     verificationResult = await verificationOperation(businessContext);
@@ -4805,6 +5277,13 @@ async function runTemporaryUsageBodyAclWindow({
     releaseReservedDeadlineContext(cleanupContext);
   }
 
+  if (primaryFailed) {
+    recordGrantInventoryCleanupResult(
+      primaryFailure,
+      grantAttempted,
+      grantAttempted && !cleanupFailed
+    );
+  }
   if (primaryFailed) throw primaryFailure;
   if (cleanupFailed) throw cleanupFailure;
   return verificationResult;
@@ -6020,6 +6499,69 @@ export function validateIndependentExtensionInventoryForTests(rows) {
   return Object.freeze({ match: true });
 }
 
+const GRANT_INVENTORY_DIAGNOSTIC_PROBE_SCENARIOS = new Set([
+  "negative-count",
+  "decimal-count",
+  "exponent-count",
+  "overflow-count",
+  "unknown-primary",
+  "unknown-detail",
+  "classification-failure",
+]);
+
+export function runGrantInventoryDiagnosticOutputProbeForTests(scenario) {
+  requireHarness(
+    arguments.length === 1 &&
+      typeof scenario === "string" &&
+      GRANT_INVENTORY_DIAGNOSTIC_PROBE_SCENARIOS.has(scenario),
+    "EXTERNAL_FIXTURE_GRANT_INVENTORY_DIAGNOSTIC_PROBE_INVALID"
+  );
+  const failure = createExternalFixturePhaseFailure(
+    Object.freeze(Object.create(null)),
+    EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclGrantInventory
+  );
+  let diagnostic;
+  if (scenario === "classification-failure") {
+    diagnostic = new Proxy(Object.create(null), {
+      ownKeys() {
+        throw new Error("fixed-classifier-probe-failure");
+      },
+    });
+  } else {
+    const invalidValue =
+      scenario === "negative-count"
+        ? -1
+        : scenario === "decimal-count"
+          ? 1.5
+          : scenario === "exponent-count"
+            ? "1e3"
+            : scenario === "overflow-count"
+              ? Number.MAX_SAFE_INTEGER + 1
+              : 0;
+    diagnostic = Object.freeze({
+      primary: scenario === "unknown-primary" ? "UNKNOWN" : "EXACT_SET_MISMATCH",
+      details: Object.freeze(
+        scenario === "unknown-detail"
+          ? ["EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_UNKNOWN"]
+          : []
+      ),
+      counts: Object.freeze({
+        expectedTotal: 18,
+        actualTotal: invalidValue,
+        missingTotal: 0,
+        extraTotal: 0,
+        duplicateTotal: 0,
+      }),
+    });
+  }
+  GRANT_INVENTORY_DIAGNOSTIC_FAILURES.set(failure, diagnostic);
+  GRANT_INVENTORY_CLEANUP_RESULTS.set(
+    failure,
+    Object.freeze({ attempted: true, succeeded: true })
+  );
+  return Object.freeze({ output: externalFixtureFailureOutput(failure) });
+}
+
 /**
  * @param {{
  *   initialIdentityClient: object,
@@ -6067,6 +6609,7 @@ export async function runUsageBodyAclBoundaryProbeForTests({
   EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.add(context);
   let unrelatedOwnedClient = null;
   let failureMarker = null;
+  let diagnosticOutput = "";
   let bodyAclWindowComplete = false;
   let observedIdentityReference = null;
   let deadlineState = null;
@@ -6133,6 +6676,7 @@ export async function runUsageBodyAclBoundaryProbeForTests({
     bodyAclWindowComplete = true;
   } catch (error) {
     failureMarker = externalFixtureFailureMarker(error);
+    diagnosticOutput = externalFixtureFailureOutput(error);
   } finally {
     EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.delete(context);
     INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES.delete(context);
@@ -6142,6 +6686,7 @@ export async function runUsageBodyAclBoundaryProbeForTests({
   }
   return Object.freeze({
     failureMarker,
+    diagnosticOutput,
     bodyAclWindowComplete,
     timedOut: context.timedOut,
     activeClientCount: context.activeClients.size,
@@ -7518,8 +8063,7 @@ if (invokedDirectly) {
     const result = await runConnectionOnlyHarness();
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
-    const marker = externalFixtureFailureMarker(error);
-    process.stderr.write(`${marker}\n`);
+    process.stderr.write(externalFixtureFailureOutput(error));
     process.exitCode = 1;
   }
 }

@@ -29,6 +29,7 @@ import {
   harnessAuthorityBoundaryForTests,
   runConnectionOnlyHarness,
   runExternalFixturePhaseProbeForTests,
+  runGrantInventoryDiagnosticOutputProbeForTests,
   runHarnessDeadlineProbeForTests,
   runHarnessTransactionBoundaryProbeForTests,
   runMigrationOwnerBoundaryProbeForTests,
@@ -2309,6 +2310,51 @@ const exactUsageBodyAclRevokeContract = testUsageBodyAclManifest
 const exactUsageBodyAclIdentityContract = `SELECT
 session_user AS session_role,
 current_user AS effective_role`;
+const testGrantInventoryDiagnosticVersion =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DIAGNOSTIC_V1";
+const testGrantInventoryPrimaryMarkers = [
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_FACTORY",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_CONNECT_REJECTED",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_CONNECT_TIMEOUT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_QUERY_REJECTED",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_QUERY_TIMEOUT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_RESULT_SHAPE",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_EXACT_SET_MISMATCH",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_NORMALIZATION",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_CLOSE_REJECTED",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_CLOSE_TIMEOUT",
+] as const;
+const testGrantInventoryDetailMarkers = [
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_DUPLICATE_ROW",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_MISSING_ROW",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_EXTRA_ROW",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_OBJECT_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_PRIVILEGE_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANT_OPTION_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_RECIPIENT_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANTOR_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_OWNER_SELF_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_SYSTEM_RECIPIENT_COVERAGE",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_TARGET_GRANTOR_COVERAGE",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_OBSERVED_GRANTOR_COVERAGE",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANTEE_DEPENDENCY",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANTOR_DEPENDENCY",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_UNCOVERED_DEPENDENCY",
+] as const;
+const testGrantInventoryCleanupAttempted =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_ATTEMPTED";
+const testGrantInventoryCleanupSucceeded =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_SUCCEEDED";
+const testGrantInventoryCleanupFailed =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_FAILED";
+const testGrantInventoryGenericMarker =
+  "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY";
+
+function testGrantInventoryOutputLines(diagnosticOutput: string) {
+  return diagnosticOutput.endsWith("\n")
+    ? diagnosticOutput.slice(0, -1).split("\n")
+    : diagnosticOutput.split("\n");
+}
 
 const exactMissingUserUsageExecutionContract = `SELECT allowed FROM public.reserve_usage_limits_v2(
   $1::uuid, 1, 'channel_analysis'::public.usage_metric,
@@ -2852,6 +2898,15 @@ type UsageBodyAclFakeOptions = {
   grantIdentityRows?: Array<Record<string, unknown>>;
   revokeIdentityRows?: Array<Record<string, unknown>>;
   unrelatedAuthorityRows?: Array<Record<string, unknown>>;
+  grantInventoryResultRows?: unknown;
+  grantInventoryNormalizerFailure?: boolean;
+  inventoryClientScenario?:
+    | "factory-throws"
+    | "factory-invalid"
+    | "connect-rejects"
+    | "connect-hangs"
+    | "close-rejects"
+    | "close-hangs";
 };
 
 function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
@@ -2906,6 +2961,13 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
   const unrelatedAuthorityRows = options.unrelatedAuthorityRows ?? [
     { fixed_unrelated_authority: true },
   ];
+  const hasGrantInventoryResultRows = Object.prototype.hasOwnProperty.call(
+    options,
+    "grantInventoryResultRows"
+  );
+  const grantInventoryNormalizerFailure =
+    options.grantInventoryNormalizerFailure === true;
+  const inventoryClientScenario = options.inventoryClientScenario ?? null;
   const state = {
     aclRows: [] as TestUsageBodyAclRow[],
     rawAclCatalogRows: initialOwnerCatalogRows.map((row) => ({ ...row })),
@@ -2939,6 +3001,7 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
     inventoryCount: 0,
     executionCount: 0,
     connectCount: 0,
+    factoryCount: 0,
     endCount: 0,
     destroyCount: 0,
     grantIdentityQueryCount: 0,
@@ -2983,6 +3046,7 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
   }
 
   function createClient() {
+    const clientOrdinal = state.clients.length + 1;
     let activeRole = testFixtureSessionRole;
     let destroyed = false;
     const clientState = {
@@ -3005,6 +3069,12 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
       connect() {
         state.connectCount += 1;
         clientState.connect += 1;
+        if (clientOrdinal === 2 && inventoryClientScenario === "connect-rejects") {
+          return Promise.reject(new Error("fixed-sensitive-connect-rejection"));
+        }
+        if (clientOrdinal === 2 && inventoryClientScenario === "connect-hangs") {
+          return new Promise(() => undefined);
+        }
         return Promise.resolve();
       },
       query(
@@ -3220,6 +3290,21 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
           if (state.revokeIdentityQueryCount > 0) {
             state.zeroResidueInventoryCount += 1;
           }
+          if (state.revokeIdentityQueryCount === 0 && grantInventoryNormalizerFailure) {
+            const normalizationFailureRow = {
+              ...validTestUsageBodyAclRows()[0],
+            };
+            Object.defineProperty(normalizationFailureRow, "object_name", {
+              enumerable: true,
+              get() {
+                throw new Error("fixed-sensitive-normalization-failure");
+              },
+            });
+            return Promise.resolve({ rows: [normalizationFailureRow] });
+          }
+          if (state.revokeIdentityQueryCount === 0 && hasGrantInventoryResultRows) {
+            return Promise.resolve({ rows: options.grantInventoryResultRows });
+          }
           return Promise.resolve({ rows: state.aclRows.map((row) => ({ ...row })) });
         }
         if (label === "body-acl-grant-identity") {
@@ -3268,6 +3353,12 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
       end() {
         state.endCount += 1;
         clientState.end += 1;
+        if (clientOrdinal === 2 && inventoryClientScenario === "close-rejects") {
+          return Promise.reject(new Error("fixed-sensitive-close-rejection"));
+        }
+        if (clientOrdinal === 2 && inventoryClientScenario === "close-hangs") {
+          return new Promise(() => undefined);
+        }
         return Promise.resolve();
       },
     };
@@ -3275,7 +3366,16 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
 
   return {
     state,
-    clientFactory: () => createClient(),
+    clientFactory: () => {
+      state.factoryCount += 1;
+      if (state.factoryCount === 2 && inventoryClientScenario === "factory-throws") {
+        throw new Error("fixed-sensitive-factory-rejection");
+      }
+      if (state.factoryCount === 2 && inventoryClientScenario === "factory-invalid") {
+        return Object.freeze({ invalid: true });
+      }
+      return createClient();
+    },
   };
 }
 
@@ -4059,6 +4159,304 @@ describe("temporary usage body-object ACL boundary", () => {
     });
     return { initial, fake, result };
   }
+
+  it("grant inventory observability keeps success silent and preserves the generic failure identity", async () => {
+    const success = await runBodyAclProbe();
+    expect(success.result.failureMarker).toBeNull();
+    expect(success.result.diagnosticOutput).toBe("");
+
+    const failure = await runBodyAclProbe({
+      fakeOptions: { grantedRows: validTestUsageBodyAclRows().slice(1) },
+    });
+    const lines = testGrantInventoryOutputLines(failure.result.diagnosticOutput);
+    expect(failure.result.failureMarker).toBe(testGrantInventoryGenericMarker);
+    expect(lines[0]).toBe(testGrantInventoryDiagnosticVersion);
+    expect(lines.at(-1)).toBe(testGrantInventoryGenericMarker);
+    expect(lines.filter((line) => testGrantInventoryPrimaryMarkers.includes(line as never))).toHaveLength(1);
+    expect(lines.filter((line) => line === testGrantInventoryCleanupAttempted)).toHaveLength(1);
+    expect(
+      lines.filter(
+        (line) =>
+          line === testGrantInventoryCleanupSucceeded ||
+          line === testGrantInventoryCleanupFailed
+      )
+    ).toHaveLength(1);
+    expect(failure.fake.state).toMatchObject({
+      exactGrantCount: 1,
+      exactRevokeCount: 1,
+      inventoryCount: 2,
+      connectCount: 3,
+      endCount: 3,
+    });
+    expect(failure.result.operationStarts).toMatchObject({
+      connect: 4,
+      query: 7,
+      close: 4,
+    });
+    expect(failure.result.cleanupReserveMilliseconds).toBe(
+      HARNESS_DEADLINE_LIMITS_FOR_TESTS.connectMilliseconds +
+        3 * HARNESS_DEADLINE_LIMITS_FOR_TESTS.queryMilliseconds +
+        HARNESS_DEADLINE_LIMITS_FOR_TESTS.closeMilliseconds
+    );
+    expect(failure.result.bodyAclWindowComplete).toBe(false);
+    expect(failure.result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(failure.result.postflightStartCount).toBe(0);
+  });
+
+  it.each([
+    ["factory throws", { inventoryClientScenario: "factory-throws" }, "CLIENT_FACTORY", null],
+    ["factory shape", { inventoryClientScenario: "factory-invalid" }, "CLIENT_FACTORY", null],
+    [
+      "connect rejection",
+      { inventoryClientScenario: "connect-rejects" },
+      "CLIENT_CONNECT_REJECTED",
+      null,
+    ],
+    [
+      "connect timeout",
+      { inventoryClientScenario: "connect-hangs" },
+      "CLIENT_CONNECT_TIMEOUT",
+      { totalMilliseconds: 100, connectMilliseconds: 5, queryMilliseconds: 5, closeMilliseconds: 5 },
+    ],
+    ["query rejection", { rejectOnLabel: "body-acl-inventory" }, "QUERY_REJECTED", null],
+    [
+      "query timeout",
+      { hangOnLabel: "body-acl-inventory" },
+      "QUERY_TIMEOUT",
+      { totalMilliseconds: 100, connectMilliseconds: 5, queryMilliseconds: 5, closeMilliseconds: 5 },
+    ],
+    ["rows non-array", { grantInventoryResultRows: {} }, "RESULT_SHAPE", null],
+    ["null row", { grantInventoryResultRows: [null] }, "RESULT_SHAPE", null],
+    ["missing key", { grantInventoryResultRows: [{ authority_kind: "explicit_acl" }] }, "RESULT_SHAPE", null],
+    [
+      "extra key",
+      { grantInventoryResultRows: [{ ...validTestUsageBodyAclRows()[0], extra: true }] },
+      "RESULT_SHAPE",
+      null,
+    ],
+    [
+      "wrong field type",
+      { grantInventoryResultRows: [{ ...validTestUsageBodyAclRows()[0], object_kind: 7 }] },
+      "RESULT_SHAPE",
+      null,
+    ],
+    ["normalizer failure", { grantInventoryNormalizerFailure: true }, "NORMALIZATION", null],
+    [
+      "close rejection",
+      { inventoryClientScenario: "close-rejects" },
+      "CLIENT_CLOSE_REJECTED",
+      null,
+    ],
+    [
+      "close timeout",
+      { inventoryClientScenario: "close-hangs" },
+      "CLIENT_CLOSE_TIMEOUT",
+      { totalMilliseconds: 100, connectMilliseconds: 5, queryMilliseconds: 5, closeMilliseconds: 5 },
+    ],
+  ] as const)(
+    "grant inventory primary classifier identifies %s without changing cleanup precedence",
+    async (_label, fakeOptions, primarySuffix, deadlineLimits) => {
+      const { result } = await runBodyAclProbe({
+        fakeOptions: fakeOptions as UsageBodyAclFakeOptions,
+        deadlineLimits: deadlineLimits ?? undefined,
+      });
+      const lines = testGrantInventoryOutputLines(result.diagnosticOutput);
+      const expectedPrimary = `EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_${primarySuffix}`;
+      expect(testGrantInventoryPrimaryMarkers).toContain(expectedPrimary);
+      expect(lines).toContain(expectedPrimary);
+      expect(lines.filter((line) => testGrantInventoryPrimaryMarkers.includes(line as never))).toHaveLength(1);
+      expect(lines[0]).toBe(testGrantInventoryDiagnosticVersion);
+      expect(lines.at(-1)).toBe(testGrantInventoryGenericMarker);
+      expect(result.failureMarker).toBe(testGrantInventoryGenericMarker);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+    }
+  );
+
+  it.each([
+    [
+      "duplicate exact row",
+      [...validTestUsageBodyAclRows(), { ...validTestUsageBodyAclRows()[0] }],
+      [18, 19, 0, 1, 1],
+      ["DUPLICATE_ROW", "EXTRA_ROW"],
+    ],
+    [
+      "over-broad owner-self exclusion represented by one missing expected row",
+      validTestUsageBodyAclRows().slice(1),
+      [18, 17, 1, 0, 0],
+      ["MISSING_ROW"],
+    ],
+    [
+      "one extra row",
+      [
+        ...validTestUsageBodyAclRows(),
+        { ...validTestUsageBodyAclRows()[0], grantee_name: "unknown_fixture_recipient" },
+      ],
+      [18, 19, 0, 1, 0],
+      ["EXTRA_ROW", "RECIPIENT_CONTRACT", "OBSERVED_GRANTOR_COVERAGE"],
+    ],
+    [
+      "same-count replacement",
+      validTestUsageBodyAclRows().map((row, index) =>
+        index === 0 ? { ...row, object_name: "unknown_fixture_object" } : row
+      ),
+      [18, 18, 1, 1, 0],
+      ["MISSING_ROW", "EXTRA_ROW", "OBJECT_CONTRACT"],
+    ],
+    [
+      "missing and extra together",
+      [
+        ...validTestUsageBodyAclRows().slice(1),
+        { ...validTestUsageBodyAclRows()[0], privilege_type: "DELETE" },
+      ],
+      [18, 18, 1, 1, 0],
+      ["MISSING_ROW", "EXTRA_ROW", "PRIVILEGE_CONTRACT"],
+    ],
+  ] as const)(
+    "grant inventory exact-set counters report %s with fixed field order",
+    async (_label, grantedRows, expectedCounts, expectedDetails) => {
+      const { result } = await runBodyAclProbe({
+        fakeOptions: { grantedRows: [...grantedRows] as TestUsageBodyAclRow[] },
+      });
+      const lines = testGrantInventoryOutputLines(result.diagnosticOutput);
+      const countLine = lines.find((line) =>
+        line.startsWith("EXTERNAL_FIXTURE_GRANT_INVENTORY_COUNTS_V1 ")
+      );
+      expect(countLine).toBe(
+        `EXTERNAL_FIXTURE_GRANT_INVENTORY_COUNTS_V1 EXPECTED_TOTAL=${expectedCounts[0]} ACTUAL_TOTAL=${expectedCounts[1]} MISSING_TOTAL=${expectedCounts[2]} EXTRA_TOTAL=${expectedCounts[3]} DUPLICATE_TOTAL=${expectedCounts[4]}`
+      );
+      expect(
+        lines.filter((line) => line.startsWith("EXTERNAL_FIXTURE_GRANT_INVENTORY_COUNTS_V1 "))
+      ).toHaveLength(1);
+      for (const detail of expectedDetails) {
+        expect(lines).toContain(`EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_${detail}`);
+      }
+    }
+  );
+
+  it.each([
+    ["object contract", { object_name: "unknown_fixture_object" }, "OBJECT_CONTRACT"],
+    ["privilege contract", { privilege_type: "DELETE" }, "PRIVILEGE_CONTRACT"],
+    ["grant option contract", { grant_option: true }, "GRANT_OPTION_CONTRACT"],
+    [
+      "recipient contract",
+      { recipient_relation: "unexpected", grantee_name: "unknown_fixture_recipient" },
+      "RECIPIENT_CONTRACT",
+    ],
+    ["grantor contract", { grantor_name: "wrong_fixture_grantor" }, "GRANTOR_CONTRACT"],
+    [
+      "owner-self inclusion",
+      { grantor_name: testUsageBodyAclRoles.explicit },
+      "OWNER_SELF_CONTRACT",
+    ],
+    [
+      "system-wide recipient coverage",
+      { recipient_relation: "unexpected", grantee_name: testUsageBodyAclRoles.denied },
+      "SYSTEM_RECIPIENT_COVERAGE",
+    ],
+    [
+      "target-as-grantor coverage",
+      { grantor_name: testUsageBodyAclRoles.denied },
+      "TARGET_GRANTOR_COVERAGE",
+    ],
+    [
+      "observed-grantor unknown recipient coverage",
+      { recipient_relation: "unexpected", grantee_name: "unknown_fixture_recipient" },
+      "OBSERVED_GRANTOR_COVERAGE",
+    ],
+    ["grantee dependency", { grantee_dependency_count: 0 }, "GRANTEE_DEPENDENCY"],
+    ["grantor dependency", { grantor_dependency_count: 0 }, "GRANTOR_DEPENDENCY"],
+    [
+      "uncovered dependency",
+      {
+        authority_kind: "uncovered_acl_dependency",
+        recipient_relation: "unexpected",
+        grantor_name: "UNRESOLVED",
+        privilege_type: "ACL_DEPENDENCY",
+        grantee_dependency_count: 0,
+        grantor_dependency_count: 0,
+      },
+      "UNCOVERED_DEPENDENCY",
+    ],
+  ] as const)(
+    "grant inventory exact-set counters classify %s from the complete in-memory row set",
+    async (_label, replacement, expectedDetail) => {
+      const grantedRows = validTestUsageBodyAclRows().map((row, index) =>
+        index === 0 ? { ...row, ...replacement } : row
+      );
+      const { result } = await runBodyAclProbe({ fakeOptions: { grantedRows } });
+      const lines = testGrantInventoryOutputLines(result.diagnosticOutput);
+      expect(lines).toContain(
+        `EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_${expectedDetail}`
+      );
+      const emittedDetails = lines.filter((line) =>
+        testGrantInventoryDetailMarkers.includes(line as never)
+      );
+      expect(emittedDetails).toEqual(
+        testGrantInventoryDetailMarkers.filter((marker) => emittedDetails.includes(marker))
+      );
+    }
+  );
+
+  it("grant inventory cleanup markers preserve a successful cleanup and a failed cleanup without replacing the primary", async () => {
+    const grantedRows = validTestUsageBodyAclRows().slice(1);
+    const cleanupSucceeded = await runBodyAclProbe({ fakeOptions: { grantedRows } });
+    const cleanupFailed = await runBodyAclProbe({
+      fakeOptions: { grantedRows, rejectOnLabel: "body-acl-revoke-exact" },
+    });
+    for (const [scenario, expectedResult] of [
+      [cleanupSucceeded, testGrantInventoryCleanupSucceeded],
+      [cleanupFailed, testGrantInventoryCleanupFailed],
+    ] as const) {
+      const lines = testGrantInventoryOutputLines(scenario.result.diagnosticOutput);
+      expect(lines.filter((line) => line === testGrantInventoryCleanupAttempted)).toHaveLength(1);
+      expect(lines.filter((line) => line === expectedResult)).toHaveLength(1);
+      expect(
+        lines.filter(
+          (line) =>
+            line === testGrantInventoryCleanupSucceeded ||
+            line === testGrantInventoryCleanupFailed
+        )
+      ).toHaveLength(1);
+      expect(lines.at(-1)).toBe(testGrantInventoryGenericMarker);
+      expect(scenario.result.failureMarker).toBe(testGrantInventoryGenericMarker);
+    }
+    expect(cleanupSucceeded.fake.state.exactRevokeCount).toBe(1);
+    expect(cleanupFailed.fake.state.revokeAttemptCount).toBe(1);
+    expect(cleanupFailed.fake.state.exactRevokeCount).toBe(0);
+  });
+
+  it("grant inventory observability redaction fails closed for invalid counts, unknown codes, and classifier failure", async () => {
+    const rejected = await runBodyAclProbe({
+      fakeOptions: { rejectOnLabel: "body-acl-inventory" },
+    });
+    const output = rejected.result.diagnosticOutput;
+    expect(output).toContain(
+      "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_QUERY_REJECTED"
+    );
+    expect(output).not.toContain(exactUsageBodyAclGrantContract);
+    expect(output).not.toContain(exactUsageBodyAclRevokeContract);
+    expect(output).not.toContain(testFixtureSessionRole);
+    expect(output).not.toMatch(
+      /sensitive|fixed-body-acl-failure|oid|catalog|postgresql:\/\/|127\.0\.0\.1|5432/i
+    );
+    expect(output.split("\n").filter(Boolean).every((line) => /^[A-Z0-9_= ]+$/.test(line))).toBe(true);
+
+    for (const scenario of [
+      "negative-count",
+      "decimal-count",
+      "exponent-count",
+      "overflow-count",
+      "unknown-primary",
+      "unknown-detail",
+      "classification-failure",
+    ]) {
+      const invalid = runGrantInventoryDiagnosticOutputProbeForTests(scenario);
+      expect(invalid.output).toBe(`${testGrantInventoryGenericMarker}\n`);
+      expect(invalid.output).not.toContain(testGrantInventoryDiagnosticVersion);
+      expect(invalid.output).not.toMatch(/PRIMARY_|DETAIL_|COUNTS_V1|CLEANUP_/);
+    }
+  });
 
   it("uses exact body-object ACL grants for explicit runtime and membership runtime inheritance, then proves zero residue", async () => {
     const { fake, result } = await runBodyAclProbe();
@@ -6121,7 +6519,7 @@ describe("temporary usage body-object ACL boundary", () => {
     expect(inventoryQuerySource).not.toContain("shared_dependency_covered");
     expect(inventoryQuerySource).not.toContain("dependency_entry.refobjid IN (");
     expect(source).toContain(
-      "USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,\n    grantorName"
+      "USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,\n      grantorName"
     );
     expect(source).toContain("assertMissingUserUsageExecutionResult(result)");
     expect(source).toContain("GRANTED BY ${grantor}");
@@ -6221,6 +6619,7 @@ describe("connection-only external fixture boundary", () => {
         "harnessAuthorityBoundaryForTests",
         "runConnectionOnlyHarness",
         "runExternalFixturePhaseProbeForTests",
+        "runGrantInventoryDiagnosticOutputProbeForTests",
         "runHarnessDeadlineProbeForTests",
         "runHarnessTransactionBoundaryProbeForTests",
         "runMigrationOwnerBoundaryProbeForTests",
@@ -10259,12 +10658,12 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
       source.indexOf("const invokedDirectly =")
     );
     expect(directInvocationSection).toMatch(
-      /if \(invokedDirectly\) \{\s*try \{[\s\S]*?const result = await runConnectionOnlyHarness\(\);[\s\S]*?process\.stdout\.write\(`\$\{JSON\.stringify\(result\)\}\\n`\);\s*\} catch \(error\) \{\s*const marker = externalFixtureFailureMarker\(error\);\s*process\.stderr\.write\(`\$\{marker\}\\n`\);\s*process\.exitCode = 1;\s*\}\s*\}/
+      /if \(invokedDirectly\) \{\s*try \{[\s\S]*?const result = await runConnectionOnlyHarness\(\);[\s\S]*?process\.stdout\.write\(`\$\{JSON\.stringify\(result\)\}\\n`\);\s*\} catch \(error\) \{\s*process\.stderr\.write\(externalFixtureFailureOutput\(error\)\);\s*process\.exitCode = 1;\s*\}\s*\}/
     );
     expect(
       literalOccurrenceCount(
         directInvocationSection,
-        "externalFixtureFailureMarker(error)"
+        "externalFixtureFailureOutput(error)"
       )
     ).toBe(1);
     expect(
