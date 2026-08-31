@@ -2333,7 +2333,7 @@ const testGrantInventoryDetailMarkers = [
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANT_OPTION_CONTRACT",
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_RECIPIENT_CONTRACT",
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_GRANTOR_CONTRACT",
-  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_OWNER_SELF_CONTRACT",
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_SELF_GRANT_CONTRACT",
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_SYSTEM_RECIPIENT_COVERAGE",
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_TARGET_GRANTOR_COVERAGE",
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_OBSERVED_GRANTOR_COVERAGE",
@@ -2349,6 +2349,12 @@ const testGrantInventoryCleanupFailed =
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_FAILED";
 const testGrantInventoryGenericMarker =
   "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY";
+const testSelfGrantDetailMarker = testGrantInventoryDetailMarkers[8];
+const retiredOwnerSelfDetailMarker = [
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_",
+  "OWNER",
+  "_SELF_CONTRACT",
+].join("");
 
 function testGrantInventoryOutputLines(diagnosticOutput: string) {
   return diagnosticOutput.endsWith("\n")
@@ -4345,9 +4351,9 @@ describe("temporary usage body-object ACL boundary", () => {
     ],
     ["grantor contract", { grantor_name: "wrong_fixture_grantor" }, "GRANTOR_CONTRACT"],
     [
-      "owner-self inclusion",
+      "self-grant equality",
       { grantor_name: testUsageBodyAclRoles.explicit },
-      "OWNER_SELF_CONTRACT",
+      "SELF_GRANT_CONTRACT",
     ],
     [
       "system-wide recipient coverage",
@@ -4397,6 +4403,223 @@ describe("temporary usage body-object ACL boundary", () => {
       );
     }
   );
+
+  it("grant inventory self-grant classifier emits the equality detail only for an unmatched extra row", async () => {
+    const expectedRows = validTestUsageBodyAclRows();
+    const extraSelfGrant = {
+      ...expectedRows[0],
+      grantor_name: expectedRows[0].grantee_name,
+    };
+    const extraNonSelfGrant = {
+      ...expectedRows[0],
+      grantor_name: testUsageBodyAclRoles.group,
+    };
+    const selfGrant = await runBodyAclProbe({
+      fakeOptions: { grantedRows: [...expectedRows, extraSelfGrant] },
+    });
+    const nonSelfGrant = await runBodyAclProbe({
+      fakeOptions: { grantedRows: [...expectedRows, extraNonSelfGrant] },
+    });
+    const missingOnly = await runBodyAclProbe({
+      fakeOptions: { grantedRows: expectedRows.slice(1) },
+    });
+    const invalidShape = await runBodyAclProbe({
+      fakeOptions: {
+        grantInventoryResultRows: [
+          { ...extraSelfGrant, grantor_name: 7, grantee_name: 7 },
+        ],
+      },
+    });
+
+    expect(testGrantInventoryDetailMarkers).toHaveLength(15);
+    expect(testGrantInventoryDetailMarkers).toContain(testSelfGrantDetailMarker);
+    expect(testGrantInventoryDetailMarkers).not.toContain(
+      retiredOwnerSelfDetailMarker
+    );
+    expect(testSelfGrantDetailMarker).not.toMatch(/OWNER|NON_OWNER/);
+    expect(Object.keys(extraSelfGrant).sort()).toEqual(
+      [...testUsageBodyAclRowKeys].sort()
+    );
+    expect(extraSelfGrant.grantor_name).toBe(extraSelfGrant.grantee_name);
+    expect(extraSelfGrant.grantor_name).not.toBe(testUsageBodyAclFixedObjectOwner);
+    expect(extraNonSelfGrant.grantor_name).not.toBe(
+      extraNonSelfGrant.grantee_name
+    );
+
+    const selfGrantLines = testGrantInventoryOutputLines(
+      selfGrant.result.diagnosticOutput
+    );
+    expect(
+      selfGrantLines.filter(
+        (line) =>
+          line ===
+          "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_EXACT_SET_MISMATCH"
+      )
+    ).toHaveLength(1);
+    expect(
+      selfGrantLines.filter((line) => line === testSelfGrantDetailMarker)
+    ).toHaveLength(1);
+    expect(selfGrantLines).toContain(
+      "EXTERNAL_FIXTURE_GRANT_INVENTORY_COUNTS_V1 EXPECTED_TOTAL=18 ACTUAL_TOTAL=19 MISSING_TOTAL=0 EXTRA_TOTAL=1 DUPLICATE_TOTAL=0"
+    );
+    expect(
+      selfGrantLines.filter((line) => line === retiredOwnerSelfDetailMarker)
+    ).toHaveLength(0);
+    expect(selfGrantLines.at(-1)).toBe(testGrantInventoryGenericMarker);
+    expect(selfGrant.result.failureMarker).toBe(testGrantInventoryGenericMarker);
+
+    for (const scenario of [nonSelfGrant, missingOnly, invalidShape]) {
+      const lines = testGrantInventoryOutputLines(
+        scenario.result.diagnosticOutput
+      );
+      expect(lines.filter((line) => line === testSelfGrantDetailMarker)).toHaveLength(
+        0
+      );
+      expect(lines.filter((line) => line === retiredOwnerSelfDetailMarker)).toHaveLength(
+        0
+      );
+      expect(lines.at(-1)).toBe(testGrantInventoryGenericMarker);
+    }
+    expect(invalidShape.result.diagnosticOutput).toContain(
+      "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_RESULT_SHAPE"
+    );
+  });
+
+  it("grant inventory self-grant classifier is deterministic for multiple, reordered, and duplicate extra rows", async () => {
+    const expectedRows = validTestUsageBodyAclRows();
+    const firstSelfGrant = {
+      ...expectedRows[0],
+      grantor_name: expectedRows[0].grantee_name,
+    };
+    const secondSelfGrant = {
+      ...expectedRows[1],
+      grantor_name: expectedRows[1].grantee_name,
+    };
+    const grantedRows = [
+      ...expectedRows,
+      firstSelfGrant,
+      secondSelfGrant,
+      { ...firstSelfGrant },
+    ];
+    const ordered = await runBodyAclProbe({ fakeOptions: { grantedRows } });
+    const reordered = await runBodyAclProbe({
+      fakeOptions: { grantedRows: [...grantedRows].reverse() },
+    });
+
+    for (const scenario of [ordered, reordered]) {
+      const lines = testGrantInventoryOutputLines(
+        scenario.result.diagnosticOutput
+      );
+      expect(lines.filter((line) => line === testSelfGrantDetailMarker)).toHaveLength(
+        1
+      );
+      expect(lines).toContain(
+        "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_DUPLICATE_ROW"
+      );
+      expect(lines).toContain(
+        "EXTERNAL_FIXTURE_GRANT_INVENTORY_COUNTS_V1 EXPECTED_TOTAL=18 ACTUAL_TOTAL=21 MISSING_TOTAL=0 EXTRA_TOTAL=3 DUPLICATE_TOTAL=1"
+      );
+      expect(lines.at(-1)).toBe(testGrantInventoryGenericMarker);
+      expect(scenario.result.failureMarker).toBe(testGrantInventoryGenericMarker);
+      expect(scenario.fake.state).toMatchObject({
+        exactGrantCount: 1,
+        exactRevokeCount: 1,
+        inventoryCount: 2,
+        connectCount: 3,
+        endCount: 3,
+      });
+    }
+    expect(reordered.result.diagnosticOutput).toBe(
+      ordered.result.diagnosticOutput
+    );
+    expect(reordered.result.operationStarts).toEqual(
+      ordered.result.operationStarts
+    );
+    expect(reordered.fake.state.clients).toEqual(ordered.fake.state.clients);
+  });
+
+  it("grant inventory self-grant classifier mutation changes only the equality detail and preserves the failure boundary", async () => {
+    const expectedRows = validTestUsageBodyAclRows();
+    const nonSelfExtra = {
+      ...expectedRows[0],
+      grantor_name: testUsageBodyAclRoles.group,
+    };
+    const selfExtra = {
+      ...nonSelfExtra,
+      grantor_name: nonSelfExtra.grantee_name,
+    };
+    const before = await runBodyAclProbe({
+      fakeOptions: { grantedRows: [...expectedRows, nonSelfExtra] },
+    });
+    const after = await runBodyAclProbe({
+      fakeOptions: { grantedRows: [...expectedRows, selfExtra] },
+    });
+    const beforeLines = testGrantInventoryOutputLines(
+      before.result.diagnosticOutput
+    );
+    const afterLines = testGrantInventoryOutputLines(after.result.diagnosticOutput);
+
+    expect(nonSelfExtra).not.toEqual(selfExtra);
+    expect(nonSelfExtra.grantor_name).not.toBe(nonSelfExtra.grantee_name);
+    expect(selfExtra.grantor_name).toBe(selfExtra.grantee_name);
+    expect(beforeLines.filter((line) => line === testSelfGrantDetailMarker)).toHaveLength(
+      0
+    );
+    expect(afterLines.filter((line) => line === testSelfGrantDetailMarker)).toHaveLength(
+      1
+    );
+    expect(
+      beforeLines.filter((line) => line !== testSelfGrantDetailMarker)
+    ).toEqual(afterLines.filter((line) => line !== testSelfGrantDetailMarker));
+    expect(before.result.operationStarts).toEqual(after.result.operationStarts);
+    expect(before.fake.state.clients).toEqual(after.fake.state.clients);
+    expect(before.result.failureMarker).toBe(after.result.failureMarker);
+    expect(before.result.bodyAclWindowComplete).toBe(false);
+    expect(after.result.bodyAclWindowComplete).toBe(false);
+    expect(before.result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(after.result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(before.result.postflightStartCount).toBe(0);
+    expect(after.result.postflightStartCount).toBe(0);
+    expect(before.fake.state.exactRevokeCount).toBe(1);
+    expect(after.fake.state.exactRevokeCount).toBe(1);
+  });
+
+  it("grant inventory self-grant classifier redacts row data and remains silent on success", async () => {
+    const expectedRows = validTestUsageBodyAclRows();
+    const sensitiveSentinel =
+      "sensitive_role_oid_object_sql_parameter_catalog_error_sentinel";
+    const extraSelfGrant = {
+      ...expectedRows[0],
+      grantor_name: sensitiveSentinel,
+      grantee_name: sensitiveSentinel,
+      object_name: sensitiveSentinel,
+    };
+    const failure = await runBodyAclProbe({
+      fakeOptions: { grantedRows: [...expectedRows, extraSelfGrant] },
+    });
+    const success = await runBodyAclProbe();
+
+    expect(failure.result.diagnosticOutput).toContain(testSelfGrantDetailMarker);
+    expect(failure.result.diagnosticOutput).not.toContain(sensitiveSentinel);
+    expect(failure.result.diagnosticOutput).not.toContain(
+      retiredOwnerSelfDetailMarker
+    );
+    expect(failure.result.diagnosticOutput).not.toContain(
+      exactUsageBodyAclGrantContract
+    );
+    expect(failure.result.diagnosticOutput).not.toContain(
+      exactUsageBodyAclRevokeContract
+    );
+    expect(failure.result.diagnosticOutput).not.toContain(testFixtureSessionRole);
+    expect(
+      failure.result.diagnosticOutput
+        .split("\n")
+        .filter(Boolean)
+        .every((line) => /^[A-Z0-9_= ]+$/.test(line))
+    ).toBe(true);
+    expect(success.result.failureMarker).toBeNull();
+    expect(success.result.diagnosticOutput).toBe("");
+  });
 
   it("grant inventory cleanup markers preserve a successful cleanup and a failed cleanup without replacing the primary", async () => {
     const grantedRows = validTestUsageBodyAclRows().slice(1);
