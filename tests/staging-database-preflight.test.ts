@@ -26,10 +26,12 @@ import {
   TEMPORARY_AUTHORITY_INVENTORY_SQL_FOR_TESTS,
   createIndependentDeadlineContextsForTests,
   externalFixtureSuccessResultForTests,
+  grantInventoryGrantorDeltaFieldPartitionForTests,
   harnessAuthorityBoundaryForTests,
   runConnectionOnlyHarness,
   runExternalFixturePhaseProbeForTests,
   runGrantInventoryDiagnosticOutputProbeForTests,
+  runGrantInventoryGrantorDeltaOutputProbeForTests,
   runHarnessDeadlineProbeForTests,
   runHarnessTransactionBoundaryProbeForTests,
   runMigrationOwnerBoundaryProbeForTests,
@@ -2349,6 +2351,22 @@ const testGrantInventoryCleanupFailed =
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_FAILED";
 const testGrantInventoryGenericMarker =
   "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY";
+const testGrantInventoryGrantorDeltaVersion =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_GRANTOR_DELTA_V1";
+const testGrantInventoryWithoutGrantorIdentity =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_WITHOUT_GRANTOR_IDENTITY_V1";
+const testGrantInventoryWithoutGrantorDependency =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_WITHOUT_GRANTOR_DEPENDENCY_V1";
+const testGrantInventoryWithoutGrantorDomain =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_WITHOUT_GRANTOR_DOMAIN_V1";
+const testGrantInventoryTargetGrantorCounts =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_TARGET_GRANTOR_COUNTS_V1";
+const testGrantInventoryTargetGrantorUnavailable =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_TARGET_GRANTOR_REFERENCE_UNAVAILABLE";
+const testGrantInventoryObservedGrantorCounts =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_OBSERVED_GRANTOR_COUNTS_V1";
+const testGrantInventoryObservedGrantorUnavailable =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_OBSERVED_GRANTOR_REFERENCE_UNAVAILABLE";
 const testSelfGrantDetailMarker = testGrantInventoryDetailMarkers[8];
 const retiredOwnerSelfDetailMarker = [
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_DETAIL_",
@@ -2360,6 +2378,36 @@ function testGrantInventoryOutputLines(diagnosticOutput: string) {
   return diagnosticOutput.endsWith("\n")
     ? diagnosticOutput.slice(0, -1).split("\n")
     : diagnosticOutput.split("\n");
+}
+
+const testGrantorDeltaNonGrantorFields = [
+  "authority_kind",
+  "recipient_relation",
+  "grantee_name",
+  "object_kind",
+  "schema_name",
+  "object_name",
+  "privilege_type",
+  "grant_option",
+  "grantee_dependency_count",
+] as const;
+const testGrantorDeltaIdentityFields = ["grantor_name"] as const;
+const testGrantorDeltaDependencyFields = [
+  "grantor_dependency_count",
+] as const;
+
+function testGrantorDeltaProjectionLine(
+  marker: string,
+  counts: readonly [number, number, number, number, number, number]
+) {
+  return `${marker} EXPECTED_TOTAL=${counts[0]} ACTUAL_TOTAL=${counts[1]} MISSING_TOTAL=${counts[2]} EXTRA_TOTAL=${counts[3]} EXPECTED_UNIQUE_TOTAL=${counts[4]} ACTUAL_UNIQUE_TOTAL=${counts[5]}`;
+}
+
+function testGrantorDeltaDirectionalLine(
+  marker: string,
+  counts: readonly [number, number]
+) {
+  return `${marker} EXPECTED_TOTAL=${counts[0]} ACTUAL_TOTAL=${counts[1]}`;
 }
 
 const exactMissingUserUsageExecutionContract = `SELECT allowed FROM public.reserve_usage_limits_v2(
@@ -2460,6 +2508,59 @@ function testUsageBodyAclResidueRow(
     grantor_dependency_count: 1,
     ...overrides,
   };
+}
+
+type TestGrantorDeltaScenario =
+  | "identity-all"
+  | "dependency-all"
+  | "identity-and-dependency-all"
+  | "non-grantor-all"
+  | "mixed-halves"
+  | "identity-one"
+  | "multiple-subsets"
+  | "duplicate-occurrence";
+
+function testGrantorDeltaRows(
+  scenario: TestGrantorDeltaScenario
+): TestUsageBodyAclRow[] {
+  return validTestUsageBodyAclRows().map((row, index, rows) => {
+    if (scenario === "identity-all") {
+      return { ...row, grantor_name: testUsageBodyAclRoles.denied };
+    }
+    if (scenario === "dependency-all") {
+      return { ...row, grantor_dependency_count: 0 };
+    }
+    if (scenario === "identity-and-dependency-all") {
+      return {
+        ...row,
+        grantor_name: testUsageBodyAclRoles.denied,
+        grantor_dependency_count: 0,
+      };
+    }
+    if (scenario === "non-grantor-all") {
+      return { ...row, object_kind: "sequence" };
+    }
+    if (scenario === "mixed-halves") {
+      return index < 9
+        ? { ...row, grantor_name: testUsageBodyAclRoles.denied }
+        : { ...row, object_kind: "sequence" };
+    }
+    if (scenario === "identity-one") {
+      return index === 0
+        ? { ...row, grantor_name: testUsageBodyAclRoles.denied }
+        : { ...row };
+    }
+    if (scenario === "multiple-subsets") {
+      if (index < 6) {
+        return { ...row, grantor_name: testUsageBodyAclRoles.denied };
+      }
+      if (index < 12) {
+        return { ...row, grantor_dependency_count: 0 };
+      }
+      return { ...row, object_kind: "sequence" };
+    }
+    return index === 1 ? { ...rows[0] } : { ...row };
+  });
 }
 
 const testSystemWideAclRecipients = ["PUBLIC"] as const;
@@ -4619,6 +4720,410 @@ describe("temporary usage body-object ACL boundary", () => {
     ).toBe(true);
     expect(success.result.failureMarker).toBeNull();
     expect(success.result.diagnosticOutput).toBe("");
+  });
+
+  it("grant inventory grantor delta observability fixes an exhaustive disjoint 11-key field partition", () => {
+    const productionPartition =
+      grantInventoryGrantorDeltaFieldPartitionForTests();
+    const testLocalPartition = {
+      NON_GRANTOR_FIELDS: [...testGrantorDeltaNonGrantorFields],
+      GRANTOR_IDENTITY_FIELDS: [...testGrantorDeltaIdentityFields],
+      GRANTOR_DEPENDENCY_FIELDS: [...testGrantorDeltaDependencyFields],
+    };
+    const groups = Object.values(testLocalPartition);
+    const union = groups.flat();
+
+    expect(productionPartition).toEqual(testLocalPartition);
+    expect(testUsageBodyAclRowKeys).toHaveLength(11);
+    expect(union).toHaveLength(11);
+    expect(new Set(union).size).toBe(11);
+    expect([...union].sort()).toEqual([...testUsageBodyAclRowKeys].sort());
+    expect(
+      groups.flatMap((group, index) =>
+        groups
+          .slice(index + 1)
+          .flatMap((other) => {
+            const otherFields = new Set<string>(other);
+            return group.filter((field) => otherFields.has(field));
+          })
+      )
+    ).toEqual([]);
+    expect(
+      testUsageBodyAclRowKeys.filter((field) => !union.includes(field))
+    ).toEqual([]);
+    expect(testGrantorDeltaNonGrantorFields).toContain(
+      "grantee_dependency_count"
+    );
+    expect(testGrantorDeltaDependencyFields).toEqual([
+      "grantor_dependency_count",
+    ]);
+    expect(testGrantorDeltaIdentityFields).toEqual(["grantor_name"]);
+    expect(testGrantorDeltaNonGrantorFields).toContain("authority_kind");
+    expect(testGrantorDeltaNonGrantorFields).toContain("privilege_type");
+  });
+
+  it.each([
+    [
+      "grantor identity only across all 18 rows",
+      "identity-all",
+      [18, 18],
+      [18, 18, 0, 0, 18, 18],
+      [18, 18, 18, 18, 18, 18],
+      [18, 18, 0, 0, 18, 18],
+      [0, 18],
+      [18, 0],
+      testGrantInventoryCleanupFailed,
+    ],
+    [
+      "grantor dependency only across all 18 rows",
+      "dependency-all",
+      [18, 18],
+      [18, 18, 18, 18, 18, 18],
+      [18, 18, 0, 0, 18, 18],
+      [18, 18, 0, 0, 18, 18],
+      [0, 0],
+      [18, 18],
+      testGrantInventoryCleanupSucceeded,
+    ],
+    [
+      "grantor identity and dependency across all 18 rows",
+      "identity-and-dependency-all",
+      [18, 18],
+      [18, 18, 18, 18, 18, 18],
+      [18, 18, 18, 18, 18, 18],
+      [18, 18, 0, 0, 18, 18],
+      [0, 18],
+      [18, 0],
+      testGrantInventoryCleanupFailed,
+    ],
+    [
+      "non-grantor field across all 18 rows",
+      "non-grantor-all",
+      [18, 18],
+      [18, 18, 18, 18, 18, 18],
+      [18, 18, 18, 18, 18, 18],
+      [18, 18, 18, 18, 18, 18],
+      [0, 0],
+      [18, 18],
+      testGrantInventoryCleanupSucceeded,
+    ],
+    [
+      "grantor and non-grantor mixed replacement",
+      "mixed-halves",
+      [18, 18],
+      [18, 18, 9, 9, 18, 18],
+      [18, 18, 18, 18, 18, 18],
+      [18, 18, 9, 9, 18, 18],
+      [0, 9],
+      [18, 9],
+      testGrantInventoryCleanupFailed,
+    ],
+    [
+      "one-row grantor identity replacement",
+      "identity-one",
+      [1, 1],
+      [18, 18, 0, 0, 18, 18],
+      [18, 18, 1, 1, 18, 18],
+      [18, 18, 0, 0, 18, 18],
+      [0, 1],
+      [18, 17],
+      testGrantInventoryCleanupFailed,
+    ],
+    [
+      "multiple disjoint field subsets",
+      "multiple-subsets",
+      [18, 18],
+      [18, 18, 12, 12, 18, 18],
+      [18, 18, 12, 12, 18, 18],
+      [18, 18, 6, 6, 18, 18],
+      [0, 6],
+      [18, 12],
+      testGrantInventoryCleanupFailed,
+    ],
+  ] as const)(
+    "grant inventory grantor delta observability classifies %s with literal multiset counts",
+    async (
+      _label,
+      scenario,
+      fullDelta,
+      withoutIdentity,
+      withoutDependency,
+      withoutDomain,
+      targetCounts,
+      observedCounts,
+      cleanupTerminal
+    ) => {
+      const grantedRows = testGrantorDeltaRows(
+        scenario as TestGrantorDeltaScenario
+      );
+      const { fake, result } = await runBodyAclProbe({
+        fakeOptions: { grantedRows },
+      });
+      const lines = testGrantInventoryOutputLines(result.diagnosticOutput);
+      const deltaIndex = lines.indexOf(testGrantInventoryGrantorDeltaVersion);
+
+      expect(lines).toContain(
+        `EXTERNAL_FIXTURE_GRANT_INVENTORY_COUNTS_V1 EXPECTED_TOTAL=18 ACTUAL_TOTAL=18 MISSING_TOTAL=${fullDelta[0]} EXTRA_TOTAL=${fullDelta[1]} DUPLICATE_TOTAL=0`
+      );
+      expect(deltaIndex).toBeGreaterThan(0);
+      expect(lines.slice(deltaIndex, deltaIndex + 6)).toEqual([
+        testGrantInventoryGrantorDeltaVersion,
+        testGrantorDeltaProjectionLine(
+          testGrantInventoryWithoutGrantorIdentity,
+          withoutIdentity
+        ),
+        testGrantorDeltaProjectionLine(
+          testGrantInventoryWithoutGrantorDependency,
+          withoutDependency
+        ),
+        testGrantorDeltaProjectionLine(
+          testGrantInventoryWithoutGrantorDomain,
+          withoutDomain
+        ),
+        testGrantorDeltaDirectionalLine(
+          testGrantInventoryTargetGrantorCounts,
+          targetCounts
+        ),
+        testGrantorDeltaDirectionalLine(
+          testGrantInventoryObservedGrantorCounts,
+          observedCounts
+        ),
+      ]);
+      expect(
+        lines.filter((line) => line === testGrantInventoryGrantorDeltaVersion)
+      ).toHaveLength(1);
+      expect(lines.at(-3)).toBe(testGrantInventoryCleanupAttempted);
+      expect(lines.at(-2)).toBe(cleanupTerminal);
+      expect(lines.at(-1)).toBe(testGrantInventoryGenericMarker);
+      expect(result.failureMarker).toBe(testGrantInventoryGenericMarker);
+      expect(result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(result.postflightStartCount).toBe(0);
+      expect(fake.state).toMatchObject({
+        exactGrantCount: 1,
+        exactRevokeCount: 1,
+        inventoryCount: 2,
+        connectCount: 3,
+        endCount: 3,
+      });
+    }
+  );
+
+  it("grant inventory grantor delta observability preserves row-order invariance, collisions, duplicates, and multiplicity", async () => {
+    const duplicateRows = testGrantorDeltaRows("duplicate-occurrence");
+    const ordered = await runBodyAclProbe({
+      fakeOptions: { grantedRows: duplicateRows },
+    });
+    const reordered = await runBodyAclProbe({
+      fakeOptions: { grantedRows: [...duplicateRows].reverse() },
+    });
+    const expectedSide = runGrantInventoryGrantorDeltaOutputProbeForTests(
+      "expected-side-collision"
+    );
+    const actualSide = runGrantInventoryGrantorDeltaOutputProbeForTests(
+      "actual-side-collision"
+    );
+    const duplicateProbe = runGrantInventoryGrantorDeltaOutputProbeForTests(
+      "duplicate-occurrence"
+    );
+
+    expect(reordered.result.diagnosticOutput).toBe(
+      ordered.result.diagnosticOutput
+    );
+    expect(reordered.result.operationStarts).toEqual(
+      ordered.result.operationStarts
+    );
+    expect(ordered.result.diagnosticOutput).toContain(
+      testGrantorDeltaProjectionLine(
+        testGrantInventoryWithoutGrantorIdentity,
+        [18, 18, 1, 1, 18, 17]
+      )
+    );
+    expect(expectedSide.output).toContain(
+      testGrantorDeltaProjectionLine(
+        testGrantInventoryWithoutGrantorIdentity,
+        [18, 18, 0, 0, 17, 17]
+      )
+    );
+    expect(actualSide.output).toContain(
+      testGrantorDeltaProjectionLine(
+        testGrantInventoryWithoutGrantorIdentity,
+        [18, 18, 1, 1, 18, 17]
+      )
+    );
+    expect(duplicateProbe.output).toContain(
+      testGrantorDeltaProjectionLine(
+        testGrantInventoryWithoutGrantorDomain,
+        [18, 18, 1, 1, 18, 17]
+      )
+    );
+    for (const output of [
+      ordered.result.diagnosticOutput,
+      expectedSide.output,
+      actualSide.output,
+      duplicateProbe.output,
+    ]) {
+      expect(output).toContain(testGrantInventoryGrantorDeltaVersion);
+      expect(output).toContain(testGrantInventoryCleanupSucceeded);
+      expect(output.endsWith(`${testGrantInventoryGenericMarker}\n`)).toBe(
+        true
+      );
+    }
+  });
+
+  it("grant inventory grantor delta observability reports target and observed relations or exact unavailable markers", () => {
+    const targetExpected = testGrantInventoryOutputLines(
+      runGrantInventoryGrantorDeltaOutputProbeForTests(
+        "target-expected-all-actual-none"
+      ).output
+    );
+    const targetUnavailable = testGrantInventoryOutputLines(
+      runGrantInventoryGrantorDeltaOutputProbeForTests(
+        "target-reference-unavailable"
+      ).output
+    );
+    const invalidTarget = testGrantInventoryOutputLines(
+      runGrantInventoryGrantorDeltaOutputProbeForTests(
+        "invalid-reference-shape"
+      ).output
+    );
+    const observedUnavailable = testGrantInventoryOutputLines(
+      runGrantInventoryGrantorDeltaOutputProbeForTests(
+        "observed-reference-unavailable"
+      ).output
+    );
+    const perObjectObserved = testGrantInventoryOutputLines(
+      runGrantInventoryGrantorDeltaOutputProbeForTests(
+        "observed-per-object-reference-unavailable"
+      ).output
+    );
+
+    expect(targetExpected).toContain(
+      testGrantorDeltaDirectionalLine(
+        testGrantInventoryTargetGrantorCounts,
+        [18, 0]
+      )
+    );
+    expect(targetExpected).toContain(
+      testGrantorDeltaDirectionalLine(
+        testGrantInventoryObservedGrantorCounts,
+        [18, 0]
+      )
+    );
+    for (const lines of [targetUnavailable, invalidTarget]) {
+      expect(lines.filter((line) => line === testGrantInventoryTargetGrantorUnavailable)).toHaveLength(1);
+      expect(
+        lines.filter((line) =>
+          line.startsWith(`${testGrantInventoryTargetGrantorCounts} `)
+        )
+      ).toHaveLength(0);
+    }
+    for (const lines of [observedUnavailable, perObjectObserved]) {
+      expect(lines.filter((line) => line === testGrantInventoryObservedGrantorUnavailable)).toHaveLength(1);
+      expect(
+        lines.filter((line) =>
+          line.startsWith(`${testGrantInventoryObservedGrantorCounts} `)
+        )
+      ).toHaveLength(0);
+    }
+    expect(perObjectObserved).toContain(
+      testGrantInventoryObservedGrantorUnavailable
+    );
+  });
+
+  it.each([
+    "invalid-partition",
+    "invalid-count",
+    "classifier-exception",
+  ] as const)(
+    "grant inventory grantor delta observability fails closed with generic-only output for %s",
+    (scenario) => {
+      const result =
+        runGrantInventoryGrantorDeltaOutputProbeForTests(scenario);
+      expect(result.output).toBe(`${testGrantInventoryGenericMarker}\n`);
+      expect(result.output).not.toMatch(
+        /GRANTOR_DELTA|WITHOUT_GRANTOR|TARGET_GRANTOR_|OBSERVED_GRANTOR_/
+      );
+      expect(result.output).not.toMatch(/PRIMARY_|DETAIL_|COUNTS_V1|CLEANUP_/);
+    }
+  );
+
+  it("grant inventory grantor delta observability emits no aggregate on success or another primary and preserves cleanup precedence", async () => {
+    const success = await runBodyAclProbe();
+    const otherPrimary = await runBodyAclProbe({
+      fakeOptions: { rejectOnLabel: "body-acl-inventory" },
+    });
+    const mismatchRows = testGrantorDeltaRows("dependency-all");
+    const cleanupSucceeded = await runBodyAclProbe({
+      fakeOptions: { grantedRows: mismatchRows },
+    });
+    const cleanupFailed = await runBodyAclProbe({
+      fakeOptions: {
+        grantedRows: mismatchRows,
+        rejectOnLabel: "body-acl-revoke-exact",
+      },
+    });
+
+    expect(success.result.diagnosticOutput).toBe("");
+    expect(otherPrimary.result.diagnosticOutput).not.toMatch(
+      /GRANTOR_DELTA|WITHOUT_GRANTOR|TARGET_GRANTOR_|OBSERVED_GRANTOR_/
+    );
+    for (const [scenario, terminal] of [
+      [cleanupSucceeded, testGrantInventoryCleanupSucceeded],
+      [cleanupFailed, testGrantInventoryCleanupFailed],
+    ] as const) {
+      const lines = testGrantInventoryOutputLines(
+        scenario.result.diagnosticOutput
+      );
+      expect(lines).toContain(testGrantInventoryGrantorDeltaVersion);
+      expect(lines.filter((line) => line === testGrantInventoryCleanupAttempted)).toHaveLength(1);
+      expect(lines.filter((line) => line === terminal)).toHaveLength(1);
+      expect(lines.at(-1)).toBe(testGrantInventoryGenericMarker);
+      expect(scenario.result.failureMarker).toBe(testGrantInventoryGenericMarker);
+      expect(scenario.result.runtimeAclConfigurationStartCount).toBe(0);
+      expect(scenario.result.postflightStartCount).toBe(0);
+    }
+    expect(cleanupSucceeded.fake.state.exactRevokeCount).toBe(1);
+    expect(cleanupFailed.fake.state.exactRevokeCount).toBe(0);
+  });
+
+  it("grant inventory grantor delta observability redacts values and preserves query, Client, GRANT, REVOKE, and acceptance behavior", async () => {
+    const sensitiveSentinel =
+      "sensitive_grantor_delta_identity_oid_object_sql_error_sentinel";
+    const grantedRows = validTestUsageBodyAclRows().map((row) => ({
+      ...row,
+      grantor_name: sensitiveSentinel,
+    }));
+    const { fake, result } = await runBodyAclProbe({
+      fakeOptions: { grantedRows },
+    });
+
+    expect(validTestUsageBodyAclRows()).toHaveLength(18);
+    expect(result.diagnosticOutput).toContain(
+      testGrantInventoryGrantorDeltaVersion
+    );
+    expect(result.diagnosticOutput).not.toContain(sensitiveSentinel);
+    expect(result.diagnosticOutput).not.toContain(retiredOwnerSelfDetailMarker);
+    expect(result.diagnosticOutput).not.toContain(exactUsageBodyAclGrantContract);
+    expect(result.diagnosticOutput).not.toContain(exactUsageBodyAclRevokeContract);
+    expect(result.diagnosticOutput).not.toContain(testFixtureSessionRole);
+    expect(
+      result.diagnosticOutput
+        .split("\n")
+        .filter(Boolean)
+        .every((line) => /^[A-Z0-9_= ]+$/.test(line))
+    ).toBe(true);
+    expect(result.failureMarker).toBe(testGrantInventoryGenericMarker);
+    expect(result.bodyAclWindowComplete).toBe(false);
+    expect(result.runtimeAclConfigurationStartCount).toBe(0);
+    expect(result.postflightStartCount).toBe(0);
+    expect(fake.state).toMatchObject({
+      exactGrantCount: 1,
+      exactRevokeCount: 1,
+      inventoryCount: 2,
+      connectCount: 3,
+      endCount: 3,
+      destroyCount: 0,
+    });
   });
 
   it("grant inventory cleanup markers preserve a successful cleanup and a failed cleanup without replacing the primary", async () => {
@@ -6839,10 +7344,12 @@ describe("connection-only external fixture boundary", () => {
         "TEMPORARY_AUTHORITY_INVENTORY_SQL_FOR_TESTS",
         "createIndependentDeadlineContextsForTests",
         "externalFixtureSuccessResultForTests",
+        "grantInventoryGrantorDeltaFieldPartitionForTests",
         "harnessAuthorityBoundaryForTests",
         "runConnectionOnlyHarness",
         "runExternalFixturePhaseProbeForTests",
         "runGrantInventoryDiagnosticOutputProbeForTests",
+        "runGrantInventoryGrantorDeltaOutputProbeForTests",
         "runHarnessDeadlineProbeForTests",
         "runHarnessTransactionBoundaryProbeForTests",
         "runMigrationOwnerBoundaryProbeForTests",

@@ -1,12 +1,12 @@
 # ActusTube Staging Database Preflight / Postflight Runbook
 
-最終更新日：2026-08-30
+最終更新日：2026-08-31
 
 ## 目的と適用範囲
 
 このRunbookは、別工程で作成・本人確認したActusTube専用staging databaseについて、Migration前の空状態をpreflightで確認し、Migration適用後の状態をpostflightで確認する手順です。Production、rehearsal、backup、default branch、接続先を分類できないdatabaseには使用しません。
 
-文書上はstaging専用provider resourceが別の承認済み工程で作成済みですが、今回のlocal product recoveryではprovider状態を再確認していません。staging DBへのpreflight、Migration、postflightは未実行のままです。GitHub Actions run `32695896204`はhistorical PostgreSQL 18.6 external fixtureで`RUN / FAILED`、observed markerはexplicit runtime executionであり、静的root causeは`SECURITY INVOKER` function bodyのobject privilege不足です。body ACL / cleanup / inventory / owner oracle chainをpushしたcurrent HEAD `0199154710dfdc157953360323d8f27ba9ff7e24`に対するrun `33291908052`も`RUN / FAILED`で、failed stepは`Run external disposable PostgreSQL verifier`、observed markerはgrant-inventory generic markerでした。read-only診断は`PROVEN 0 / UNRESOLVED 25`で、actual PostgreSQL root causeは未特定です。今回のcandidateは次のautomatic CIで固定categoryと安全なaggregate count、既存cleanup結果を得るpublic-safe observabilityだけを追加し、production acceptance semantics、SQL / parameter、query / Client operation count、deadline、cleanup、Migration、workflowを変更しません。このRunbookの更新は、DB接続、Migration適用、Vercel deployment、Neon設定変更、Google Cloud / OAuth操作を新たに許可または実施するものではありません。
+文書上はstaging専用provider resourceが別の承認済み工程で作成済みですが、今回のlocal product recoveryではprovider状態を再確認していません。staging DBへのpreflight、Migration、postflightは未実行のままです。GitHub Actions run `32695896204`はhistorical PostgreSQL 18.6 external fixtureで`RUN / FAILED`、observed markerはexplicit runtime executionであり、静的root causeは`SECURITY INVOKER` function bodyのobject privilege不足です。run `33291908052`はgrant-inventory generic markerで`RUN / FAILED`でした。current pushed HEAD `82f4b3da86e33ad9d2e01118be477223cc186e95`に対するautomatic push run `33347045917`も`RUN / FAILED`で、failed stepは`Run external disposable PostgreSQL verifier`、primaryはexact-set mismatch、safe countsはexpected / actual / missing / extra / duplicateが`18 / 18 / 18 / 18 / 0`でした。grantor関連detailsはexistential evidenceで、cleanupは`SUCCEEDED`、旧OWNER_SELF marker 0、SELF_GRANT marker 0、unknown marker 0、sensitive candidate 0です。PostgreSQL 18.6 fixture PASSとcurrent root causeは`NOT VERIFIED`で、expected oracle側、GRANT execution context側、inventory attribution側のどれが正しいかは`UNRESOLVED`です。今回のcandidateは次のautomatic CIでnon-grantor、grantor identity、grantor-side dependencyのfield-domain aggregateを得るobservabilityだけを追加し、production acceptance semantics、SQL / projection / QueryConfig / parameter、query / Client / GRANT / REVOKE operation count、expected 18、deadline、cleanup、Migration、workflowを変更しません。fake Clientはactual PostgreSQL evidenceではありません。このRunbookの更新は、DB接続、Migration適用、Vercel deployment、Neon設定変更、Google Cloud / OAuth操作を新たに許可または実施するものではありません。
 
 ## 正式commandと実装path
 
@@ -303,14 +303,14 @@ connection-only verifierはharness開始時にmonotonic clockから作成した�
 
 P3 unit gateだけはconnection-only verifierから分離した`test-staging-database-fault-lifecycle.mjs`で固定sourceのbenign Node childを使います。connection-only verifierはこのmoduleをimportせず、`node:child_process`へ到達しません。P3 parentが固定modeをprivate IPCで1回渡し、childのexact schema / occurrence / capability / sequence / phaseを検証した上で、parentが`exit`と`close`のevent count、code、signal、monotonic timestampを別々に記録し、error eventとauthenticated phase sequenceも保持します。exact nonzero code、exact signal、deadline時aliveだけをacceptedとし、wrong / zero exit、wrong signal、deadline前正常終了、phase前failure、phase後正常終了、terminal reason偽装、duplicate / malformed / replayed phaseをrejectします。result keyはexact allowlistであり、private bindingとPID情報を含めません。これはdatabase processのownership、termination、cleanupをテストするものではありません。
 
-- external fixture separate-role connection、PostgreSQL 18.6 actual結果、移植したusage Migration意味検証：run `32695896204`はhistorical `RUN / FAILED`、fixed markerはexplicit runtime executionで、静的root causeは`SECURITY INVOKER` body-object privilege不足。current run `33291908052`はgrant-inventory generic markerで`RUN / FAILED`、read-only診断は`PROVEN 0 / UNRESOLVED 25`、actual root causeは`NOT VERIFIED`
+- external fixture separate-role connection、PostgreSQL 18.6 actual結果、移植したusage Migration意味検証：run `32695896204`はhistorical `RUN / FAILED`、fixed markerはexplicit runtime executionで、静的root causeは`SECURITY INVOKER` body-object privilege不足。run `33291908052`はgrant-inventory generic marker、run `33347045917`はgrant-inventory exact-set mismatchで`RUN / FAILED`です。run `33347045917`のsafe countsは`18 / 18 / 18 / 18 / 0`、grantor detailsはexistential evidence、cleanupは`SUCCEEDED`で、actual root causeは`NOT VERIFIED`
 - staging専用provider resource：文書上は別工程で作成済み。今回のlocal product recoveryではprovider状態をNOT VERIFIED
 - 実staging DB：未接続・未検証。preflight / Migration / postflightは実行0回
 - real transaction pooler behavior：実provider endpoint未接続のためNOT TESTED
 - 実staging owner / ACL：実staging DB未接続のためNOT TESTED
 - Production：未接続・不変
 
-local fake Client / unit testのPASSはrole・owner・deadline・oracle境界の静的な実装確認であり、actual PostgreSQLのMigration実行結果ではありません。local unit PASSまたは将来のGitHub Actions disposable fixture PASSを、実provider poolerや実staging DBのPASSとして扱いません。run `32695896204`はhistorical `RUN / FAILED`、current run `33291908052`もgrant-inventory generic markerで`RUN / FAILED`です。次の外部qualification stepは、public-safe observability candidateのlocal validationと独立review 2系統でP0 / P1 / P2とblocking NOT VERIFIEDが0の場合だけ行うnormal feature-branch pushにより自動起動されるworkflowの監視です。そのCIがfailure categoryを示してもroot cause修正、追加commit、追加pushへ進みません。manual dispatch、same-SHA rerun、Draft PR、staging / Production / provider操作へ進みません。
+local fake Client / unit testのPASSはrole・owner・deadline・oracle境界の静的な実装確認であり、actual PostgreSQLのMigration実行結果ではありません。local unit PASSまたは将来のGitHub Actions disposable fixture PASSを、実provider poolerや実staging DBのPASSとして扱いません。run `32695896204`、run `33291908052`、run `33347045917`はいずれもhistorical `RUN / FAILED`です。次の外部qualification stepは、grantor-delta aggregate observability candidateのlocal validationと独立review 2系統でP0 / P1 / P2とblocking NOT VERIFIEDが0の場合だけ行うnormal feature-branch pushにより自動起動されるworkflowの監視です。そのCIでfield-domain aggregateを取得してもroot-cause修正、追加commit、追加pushへ進みません。manual dispatch、same-SHA rerun、Draft PR、staging / Production / provider操作へ進みません。
 
 ## 成功・停止・cleanup
 

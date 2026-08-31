@@ -93,6 +93,26 @@ const USAGE_BODY_ACL_ROW_KEYS = Object.freeze([
   "grantee_dependency_count",
   "grantor_dependency_count",
 ]);
+const NON_GRANTOR_FIELDS = Object.freeze([
+  "authority_kind",
+  "recipient_relation",
+  "grantee_name",
+  "object_kind",
+  "schema_name",
+  "object_name",
+  "privilege_type",
+  "grant_option",
+  "grantee_dependency_count",
+]);
+const GRANTOR_IDENTITY_FIELDS = Object.freeze(["grantor_name"]);
+const GRANTOR_DEPENDENCY_FIELDS = Object.freeze([
+  "grantor_dependency_count",
+]);
+const USAGE_BODY_ACL_GRANTOR_FIELD_PARTITION = Object.freeze({
+  NON_GRANTOR_FIELDS,
+  GRANTOR_IDENTITY_FIELDS,
+  GRANTOR_DEPENDENCY_FIELDS,
+});
 const USAGE_MIGRATION_BOUNDARY_ROLES = Object.freeze({
   legacyOwner: "actustube_ci_usage_legacy_owner",
   migrationExecutor: "actustube_ci_usage_migration_executor",
@@ -1659,6 +1679,7 @@ const EXTERNAL_FIXTURE_PHASE_FAILURES = new WeakMap();
 const EXTERNAL_FIXTURE_NOT_CONFIGURED_FAILURES = new WeakSet();
 const EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS = new WeakSet();
 const GRANT_INVENTORY_DIAGNOSTIC_FAILURES = new WeakMap();
+const GRANT_INVENTORY_GRANTOR_DELTA_DIAGNOSTICS = new WeakMap();
 const GRANT_INVENTORY_CLEANUP_RESULTS = new WeakMap();
 const GRANT_INVENTORY_PRIMARY_MARKERS = Object.freeze({
   CLIENT_FACTORY: "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_FACTORY",
@@ -1702,7 +1723,26 @@ const GRANT_INVENTORY_CLEANUP_SUCCEEDED =
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_SUCCEEDED";
 const GRANT_INVENTORY_CLEANUP_FAILED =
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_FAILED";
+const GRANT_INVENTORY_GRANTOR_DELTA_VERSION =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_GRANTOR_DELTA_V1";
+const GRANT_INVENTORY_WITHOUT_GRANTOR_IDENTITY =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_WITHOUT_GRANTOR_IDENTITY_V1";
+const GRANT_INVENTORY_WITHOUT_GRANTOR_DEPENDENCY =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_WITHOUT_GRANTOR_DEPENDENCY_V1";
+const GRANT_INVENTORY_WITHOUT_GRANTOR_DOMAIN =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_WITHOUT_GRANTOR_DOMAIN_V1";
+const GRANT_INVENTORY_TARGET_GRANTOR_COUNTS =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_TARGET_GRANTOR_COUNTS_V1";
+const GRANT_INVENTORY_TARGET_GRANTOR_REFERENCE_UNAVAILABLE =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_TARGET_GRANTOR_REFERENCE_UNAVAILABLE";
+const GRANT_INVENTORY_OBSERVED_GRANTOR_COUNTS =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_OBSERVED_GRANTOR_COUNTS_V1";
+const GRANT_INVENTORY_OBSERVED_GRANTOR_REFERENCE_UNAVAILABLE =
+  "EXTERNAL_FIXTURE_GRANT_INVENTORY_OBSERVED_GRANTOR_REFERENCE_UNAVAILABLE";
 const GRANT_INVENTORY_SAFE_COUNT_MAXIMUM = 10_000;
+const GRANT_INVENTORY_GRANTOR_DELTA_CLASSIFICATION_FAILURE = Object.freeze(
+  Object.create(null)
+);
 const INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_STATES = new WeakMap();
 const INTERNAL_EXTERNAL_FIXTURE_PHASE_PROBE_OPTIONS = new WeakMap();
 const INITIAL_FIXTURE_CLIENT_LIFECYCLE = Symbol("initial-fixture-client-lifecycle");
@@ -1744,10 +1784,20 @@ function createExternalFixturePhaseFailure(context, phase, sourceFailure = null)
   );
   const diagnostic = GRANT_INVENTORY_DIAGNOSTIC_FAILURES.get(sourceFailure);
   if (diagnostic) GRANT_INVENTORY_DIAGNOSTIC_FAILURES.set(failure, diagnostic);
+  const grantorDelta =
+    GRANT_INVENTORY_GRANTOR_DELTA_DIAGNOSTICS.get(sourceFailure);
+  if (grantorDelta) {
+    GRANT_INVENTORY_GRANTOR_DELTA_DIAGNOSTICS.set(failure, grantorDelta);
+  }
   return failure;
 }
 
-function createGrantInventoryDiagnosticFailure(primary, details = [], counts = null) {
+function createGrantInventoryDiagnosticFailure(
+  primary,
+  details = [],
+  counts = null,
+  grantorDelta = null
+) {
   try {
     if (!Object.prototype.hasOwnProperty.call(GRANT_INVENTORY_PRIMARY_MARKERS, primary)) {
       return null;
@@ -1780,6 +1830,13 @@ function createGrantInventoryDiagnosticFailure(primary, details = [], counts = n
       }
       safeCounts = Object.freeze({ ...counts });
     }
+    if (
+      (primary === "EXACT_SET_MISMATCH" &&
+        !isUsageBodyAclGrantorDeltaDiagnostic(grantorDelta)) ||
+      (primary !== "EXACT_SET_MISMATCH" && grantorDelta !== null)
+    ) {
+      return null;
+    }
     const failure = Object.freeze(Object.create(null));
     GRANT_INVENTORY_DIAGNOSTIC_FAILURES.set(
       failure,
@@ -1789,14 +1846,27 @@ function createGrantInventoryDiagnosticFailure(primary, details = [], counts = n
         counts: safeCounts,
       })
     );
+    if (grantorDelta !== null) {
+      GRANT_INVENTORY_GRANTOR_DELTA_DIAGNOSTICS.set(failure, grantorDelta);
+    }
     return failure;
   } catch {
     return null;
   }
 }
 
-function throwGrantInventoryDiagnostic(primary, details = [], counts = null) {
-  const failure = createGrantInventoryDiagnosticFailure(primary, details, counts);
+function throwGrantInventoryDiagnostic(
+  primary,
+  details = [],
+  counts = null,
+  grantorDelta = null
+) {
+  const failure = createGrantInventoryDiagnosticFailure(
+    primary,
+    details,
+    counts,
+    grantorDelta
+  );
   if (failure === null) {
     throw new HarnessIssue("EXTERNAL_FIXTURE_USAGE_BODY_ACL_INVENTORY_INVALID");
   }
@@ -1829,6 +1899,8 @@ function recordGrantInventoryCleanupResult(failure, attempted, succeeded) {
 function grantInventoryDiagnosticLines(error) {
   try {
     const diagnostic = GRANT_INVENTORY_DIAGNOSTIC_FAILURES.get(error);
+    const grantorDelta =
+      GRANT_INVENTORY_GRANTOR_DELTA_DIAGNOSTICS.get(error);
     const cleanup = GRANT_INVENTORY_CLEANUP_RESULTS.get(error);
     if (
       !exactOwnKeys(diagnostic, ["primary", "details", "counts"]) ||
@@ -1876,7 +1948,14 @@ function grantInventoryDiagnosticLines(error) {
       lines.push(
         `EXTERNAL_FIXTURE_GRANT_INVENTORY_COUNTS_V1 EXPECTED_TOTAL=${counts.expectedTotal} ACTUAL_TOTAL=${counts.actualTotal} MISSING_TOTAL=${counts.missingTotal} EXTRA_TOTAL=${counts.extraTotal} DUPLICATE_TOTAL=${counts.duplicateTotal}`
       );
-    } else if (diagnostic.details.length !== 0 || diagnostic.counts !== null) {
+      const grantorDeltaLines = usageBodyAclGrantorDeltaLines(grantorDelta);
+      if (grantorDeltaLines === null) return Object.freeze([]);
+      lines.push(...grantorDeltaLines);
+    } else if (
+      diagnostic.details.length !== 0 ||
+      diagnostic.counts !== null ||
+      grantorDelta !== undefined
+    ) {
       return Object.freeze([]);
     }
     lines.push(
@@ -4827,6 +4906,304 @@ function usageBodyAclMultiset(rows) {
   return { counts, representatives };
 }
 
+function isUsageBodyAclGrantorFieldPartition(partition) {
+  try {
+    const partitionKeys = [
+      "NON_GRANTOR_FIELDS",
+      "GRANTOR_IDENTITY_FIELDS",
+      "GRANTOR_DEPENDENCY_FIELDS",
+    ];
+    if (!exactOwnKeys(partition, partitionKeys)) return false;
+    const groups = partitionKeys.map((key) => partition[key]);
+    if (
+      groups.some(
+        (group) =>
+          !Array.isArray(group) ||
+          group.length === 0 ||
+          new Set(group).size !== group.length ||
+          group.some(
+            (field) =>
+              typeof field !== "string" ||
+              !USAGE_BODY_ACL_ROW_KEYS.includes(field)
+          )
+      )
+    ) {
+      return false;
+    }
+    const classified = groups.flat();
+    return (
+      JSON.stringify(partition.NON_GRANTOR_FIELDS) ===
+        JSON.stringify(NON_GRANTOR_FIELDS) &&
+      JSON.stringify(partition.GRANTOR_IDENTITY_FIELDS) ===
+        JSON.stringify(GRANTOR_IDENTITY_FIELDS) &&
+      JSON.stringify(partition.GRANTOR_DEPENDENCY_FIELDS) ===
+        JSON.stringify(GRANTOR_DEPENDENCY_FIELDS) &&
+      classified.length === USAGE_BODY_ACL_ROW_KEYS.length &&
+      new Set(classified).size === classified.length &&
+      JSON.stringify([...new Set(classified)].sort()) ===
+        JSON.stringify([...USAGE_BODY_ACL_ROW_KEYS].sort())
+    );
+  } catch {
+    return false;
+  }
+}
+
+function usageBodyAclProjectedMultiset(rows, fields) {
+  const counts = new Map();
+  for (const row of rows) {
+    const key = JSON.stringify(fields.map((field) => row[field]));
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function usageBodyAclProjectionCounts(expected, actual, fields) {
+  const expectedMultiset = usageBodyAclProjectedMultiset(expected, fields);
+  const actualMultiset = usageBodyAclProjectedMultiset(actual, fields);
+  let missingTotal = 0;
+  let extraTotal = 0;
+  for (const [key, expectedCount] of expectedMultiset) {
+    missingTotal += Math.max(
+      0,
+      expectedCount - (actualMultiset.get(key) ?? 0)
+    );
+  }
+  for (const [key, actualCount] of actualMultiset) {
+    extraTotal += Math.max(
+      0,
+      actualCount - (expectedMultiset.get(key) ?? 0)
+    );
+  }
+  const counts = {
+    expectedTotal: expected.length,
+    actualTotal: actual.length,
+    missingTotal,
+    extraTotal,
+    expectedUniqueTotal: expectedMultiset.size,
+    actualUniqueTotal: actualMultiset.size,
+  };
+  return Object.values(counts).every(
+    (value) =>
+      Number.isSafeInteger(value) &&
+      value >= 0 &&
+      value <= GRANT_INVENTORY_SAFE_COUNT_MAXIMUM
+  )
+    ? Object.freeze(counts)
+    : null;
+}
+
+function usageBodyAclDirectionalCounts(expected, actual, predicate) {
+  const counts = {
+    available: true,
+    expectedTotal: expected.filter(predicate).length,
+    actualTotal: actual.filter(predicate).length,
+  };
+  return [counts.expectedTotal, counts.actualTotal].every(
+    (value) =>
+      Number.isSafeInteger(value) &&
+      value >= 0 &&
+      value <= GRANT_INVENTORY_SAFE_COUNT_MAXIMUM
+  )
+    ? Object.freeze(counts)
+    : null;
+}
+
+function unavailableUsageBodyAclDirectionalCounts() {
+  return Object.freeze({ available: false });
+}
+
+function isUsageBodyAclTargetGrantorReference(targetGrantors) {
+  return (
+    Array.isArray(targetGrantors) &&
+    targetGrantors.length > 0 &&
+    targetGrantors.length <= GRANT_INVENTORY_SAFE_COUNT_MAXIMUM &&
+    new Set(targetGrantors).size === targetGrantors.length &&
+    targetGrantors.every(
+      (targetGrantor) =>
+        typeof targetGrantor === "string" && SAFE_IDENTIFIER.test(targetGrantor)
+    )
+  );
+}
+
+function usageBodyAclGrantorDeltaDiagnostic(
+  normalized,
+  expected,
+  {
+    fieldPartition = USAGE_BODY_ACL_GRANTOR_FIELD_PARTITION,
+    targetGrantors = USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,
+    observedGrantor,
+  } = {}
+) {
+  try {
+    if (
+      !Array.isArray(normalized) ||
+      !Array.isArray(expected) ||
+      normalized.length > GRANT_INVENTORY_SAFE_COUNT_MAXIMUM ||
+      expected.length > GRANT_INVENTORY_SAFE_COUNT_MAXIMUM ||
+      !normalized.every((row) => isUsageBodyAclInventoryRowShape(row)) ||
+      !expected.every((row) => isUsageBodyAclInventoryRowShape(row)) ||
+      !isUsageBodyAclGrantorFieldPartition(fieldPartition)
+    ) {
+      return null;
+    }
+    const grantorIdentityFields = new Set(
+      fieldPartition.GRANTOR_IDENTITY_FIELDS
+    );
+    const grantorDependencyFields = new Set(
+      fieldPartition.GRANTOR_DEPENDENCY_FIELDS
+    );
+    const grantorDomainFields = new Set([
+      ...grantorIdentityFields,
+      ...grantorDependencyFields,
+    ]);
+    const withoutGrantorIdentityFields = USAGE_BODY_ACL_ROW_KEYS.filter(
+      (field) => !grantorIdentityFields.has(field)
+    );
+    const withoutGrantorDependencyFields = USAGE_BODY_ACL_ROW_KEYS.filter(
+      (field) => !grantorDependencyFields.has(field)
+    );
+    const withoutGrantorDomainFields = USAGE_BODY_ACL_ROW_KEYS.filter(
+      (field) => !grantorDomainFields.has(field)
+    );
+    const withoutGrantorIdentity = usageBodyAclProjectionCounts(
+      expected,
+      normalized,
+      withoutGrantorIdentityFields
+    );
+    const withoutGrantorDependency = usageBodyAclProjectionCounts(
+      expected,
+      normalized,
+      withoutGrantorDependencyFields
+    );
+    const withoutGrantorDomain = usageBodyAclProjectionCounts(
+      expected,
+      normalized,
+      withoutGrantorDomainFields
+    );
+    if (
+      withoutGrantorIdentity === null ||
+      withoutGrantorDependency === null ||
+      withoutGrantorDomain === null
+    ) {
+      return null;
+    }
+    const targetGrantor = isUsageBodyAclTargetGrantorReference(targetGrantors)
+      ? usageBodyAclDirectionalCounts(expected, normalized, (row) =>
+          targetGrantors.includes(row.grantor_name)
+        )
+      : unavailableUsageBodyAclDirectionalCounts();
+    const observedGrantorRelation =
+      typeof observedGrantor === "string" && SAFE_IDENTIFIER.test(observedGrantor)
+        ? usageBodyAclDirectionalCounts(
+            expected,
+            normalized,
+            (row) => row.grantor_name === observedGrantor
+          )
+        : unavailableUsageBodyAclDirectionalCounts();
+    if (targetGrantor === null || observedGrantorRelation === null) return null;
+    return Object.freeze({
+      withoutGrantorIdentity,
+      withoutGrantorDependency,
+      withoutGrantorDomain,
+      targetGrantor,
+      observedGrantor: observedGrantorRelation,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function isUsageBodyAclProjectionCounts(value) {
+  const keys = [
+    "expectedTotal",
+    "actualTotal",
+    "missingTotal",
+    "extraTotal",
+    "expectedUniqueTotal",
+    "actualUniqueTotal",
+  ];
+  return (
+    exactOwnKeys(value, keys) &&
+    keys.every(
+      (key) =>
+        Number.isSafeInteger(value[key]) &&
+        value[key] >= 0 &&
+        value[key] <= GRANT_INVENTORY_SAFE_COUNT_MAXIMUM
+    )
+  );
+}
+
+function isUsageBodyAclDirectionalCounts(value) {
+  if (exactOwnKeys(value, ["available"]) && value.available === false) {
+    return true;
+  }
+  return (
+    exactOwnKeys(value, ["available", "expectedTotal", "actualTotal"]) &&
+    value.available === true &&
+    [value.expectedTotal, value.actualTotal].every(
+      (count) =>
+        Number.isSafeInteger(count) &&
+        count >= 0 &&
+        count <= GRANT_INVENTORY_SAFE_COUNT_MAXIMUM
+    )
+  );
+}
+
+function isUsageBodyAclGrantorDeltaDiagnostic(value) {
+  return (
+    exactOwnKeys(value, [
+      "withoutGrantorIdentity",
+      "withoutGrantorDependency",
+      "withoutGrantorDomain",
+      "targetGrantor",
+      "observedGrantor",
+    ]) &&
+    isUsageBodyAclProjectionCounts(value.withoutGrantorIdentity) &&
+    isUsageBodyAclProjectionCounts(value.withoutGrantorDependency) &&
+    isUsageBodyAclProjectionCounts(value.withoutGrantorDomain) &&
+    isUsageBodyAclDirectionalCounts(value.targetGrantor) &&
+    isUsageBodyAclDirectionalCounts(value.observedGrantor)
+  );
+}
+
+function formatUsageBodyAclProjectionCounts(marker, counts) {
+  return `${marker} EXPECTED_TOTAL=${counts.expectedTotal} ACTUAL_TOTAL=${counts.actualTotal} MISSING_TOTAL=${counts.missingTotal} EXTRA_TOTAL=${counts.extraTotal} EXPECTED_UNIQUE_TOTAL=${counts.expectedUniqueTotal} ACTUAL_UNIQUE_TOTAL=${counts.actualUniqueTotal}`;
+}
+
+function usageBodyAclGrantorDeltaLines(diagnostic) {
+  try {
+    if (!isUsageBodyAclGrantorDeltaDiagnostic(diagnostic)) return null;
+    const lines = [
+      GRANT_INVENTORY_GRANTOR_DELTA_VERSION,
+      formatUsageBodyAclProjectionCounts(
+        GRANT_INVENTORY_WITHOUT_GRANTOR_IDENTITY,
+        diagnostic.withoutGrantorIdentity
+      ),
+      formatUsageBodyAclProjectionCounts(
+        GRANT_INVENTORY_WITHOUT_GRANTOR_DEPENDENCY,
+        diagnostic.withoutGrantorDependency
+      ),
+      formatUsageBodyAclProjectionCounts(
+        GRANT_INVENTORY_WITHOUT_GRANTOR_DOMAIN,
+        diagnostic.withoutGrantorDomain
+      ),
+    ];
+    lines.push(
+      diagnostic.targetGrantor.available
+        ? `${GRANT_INVENTORY_TARGET_GRANTOR_COUNTS} EXPECTED_TOTAL=${diagnostic.targetGrantor.expectedTotal} ACTUAL_TOTAL=${diagnostic.targetGrantor.actualTotal}`
+        : GRANT_INVENTORY_TARGET_GRANTOR_REFERENCE_UNAVAILABLE
+    );
+    lines.push(
+      diagnostic.observedGrantor.available
+        ? `${GRANT_INVENTORY_OBSERVED_GRANTOR_COUNTS} EXPECTED_TOTAL=${diagnostic.observedGrantor.expectedTotal} ACTUAL_TOTAL=${diagnostic.observedGrantor.actualTotal}`
+        : GRANT_INVENTORY_OBSERVED_GRANTOR_REFERENCE_UNAVAILABLE
+    );
+    return Object.freeze(lines);
+  } catch {
+    return null;
+  }
+}
+
 function usageBodyAclExactSetDiagnostic(normalized, expected, grantorName) {
   try {
     if (
@@ -5019,10 +5396,23 @@ function assertUsageBodyAclInventoryRows(rows, grantorName, expectedGranted) {
       grantorName
     );
     if (diagnostic === null) throwGrantInventoryDiagnostic("RESULT_SHAPE");
+    const grantorDelta = usageBodyAclGrantorDeltaDiagnostic(
+      normalized,
+      expected,
+      {
+        fieldPartition: USAGE_BODY_ACL_GRANTOR_FIELD_PARTITION,
+        targetGrantors: USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE,
+        observedGrantor: grantorName,
+      }
+    );
+    if (grantorDelta === null) {
+      throw GRANT_INVENTORY_GRANTOR_DELTA_CLASSIFICATION_FAILURE;
+    }
     throwGrantInventoryDiagnostic(
       "EXACT_SET_MISMATCH",
       diagnostic.details,
-      diagnostic.counts
+      diagnostic.counts,
+      grantorDelta
     );
   }
 }
@@ -5091,6 +5481,9 @@ async function runUsageBodyAclGrantInventoryClient(
     });
   } catch (error) {
     if (GRANT_INVENTORY_DIAGNOSTIC_FAILURES.has(error)) throw error;
+    if (error === GRANT_INVENTORY_GRANTOR_DELTA_CLASSIFICATION_FAILURE) {
+      throw error;
+    }
     if (!inventoryOperationStarted) {
       throwGrantInventoryDiagnostic(
         !factoryReturned || !factoryShapeValid
@@ -6555,6 +6948,144 @@ export function runGrantInventoryDiagnosticOutputProbeForTests(scenario) {
     });
   }
   GRANT_INVENTORY_DIAGNOSTIC_FAILURES.set(failure, diagnostic);
+  GRANT_INVENTORY_CLEANUP_RESULTS.set(
+    failure,
+    Object.freeze({ attempted: true, succeeded: true })
+  );
+  return Object.freeze({ output: externalFixtureFailureOutput(failure) });
+}
+
+export function grantInventoryGrantorDeltaFieldPartitionForTests() {
+  return Object.freeze({
+    NON_GRANTOR_FIELDS: Object.freeze([...NON_GRANTOR_FIELDS]),
+    GRANTOR_IDENTITY_FIELDS: Object.freeze([...GRANTOR_IDENTITY_FIELDS]),
+    GRANTOR_DEPENDENCY_FIELDS: Object.freeze([
+      ...GRANTOR_DEPENDENCY_FIELDS,
+    ]),
+  });
+}
+
+const GRANT_INVENTORY_GRANTOR_DELTA_PROBE_SCENARIOS = new Set([
+  "target-expected-all-actual-none",
+  "target-reference-unavailable",
+  "observed-reference-unavailable",
+  "observed-per-object-reference-unavailable",
+  "invalid-reference-shape",
+  "expected-side-collision",
+  "actual-side-collision",
+  "duplicate-occurrence",
+  "invalid-partition",
+  "invalid-count",
+  "classifier-exception",
+]);
+
+export function runGrantInventoryGrantorDeltaOutputProbeForTests(scenario) {
+  requireHarness(
+    arguments.length === 1 &&
+      typeof scenario === "string" &&
+      GRANT_INVENTORY_GRANTOR_DELTA_PROBE_SCENARIOS.has(scenario),
+    "EXTERNAL_FIXTURE_GRANT_INVENTORY_GRANTOR_DELTA_PROBE_INVALID"
+  );
+  const failure = createExternalFixturePhaseFailure(
+    Object.freeze(Object.create(null)),
+    EXTERNAL_FIXTURE_PHASES.migrationUsageBodyAclGrantInventory
+  );
+  const observedGrantor = "actustube_ci_grantor_delta_probe";
+  const replacementGrantor = USAGE_FIXTURE_ROLES.deniedRuntime;
+  let expected = usageBodyAclExpectedRows(observedGrantor).map((row) => ({
+    ...row,
+  }));
+  let actual = expected.map((row) => ({
+    ...row,
+    grantor_name: replacementGrantor,
+  }));
+  let fieldPartition = USAGE_BODY_ACL_GRANTOR_FIELD_PARTITION;
+  let targetGrantors = USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE;
+  let observedReference = observedGrantor;
+
+  if (scenario === "target-expected-all-actual-none") {
+    targetGrantors = Object.freeze([observedGrantor]);
+  } else if (scenario === "target-reference-unavailable") {
+    targetGrantors = Object.freeze([]);
+  } else if (scenario === "observed-reference-unavailable") {
+    observedReference = null;
+  } else if (scenario === "observed-per-object-reference-unavailable") {
+    observedReference = Object.freeze({
+      fixedObjectReference: observedGrantor,
+    });
+  } else if (scenario === "invalid-reference-shape") {
+    targetGrantors = Object.freeze([replacementGrantor, replacementGrantor]);
+  } else if (scenario === "expected-side-collision") {
+    expected = expected.map((row, index) =>
+      index === 1
+        ? { ...expected[0], grantor_name: replacementGrantor }
+        : row
+    );
+    actual = expected.map((row, index) =>
+      index === 2 ? { ...row, grantor_name: replacementGrantor } : { ...row }
+    );
+  } else if (scenario === "actual-side-collision") {
+    actual = expected.map((row, index) =>
+      index === 1
+        ? { ...expected[0], grantor_name: replacementGrantor }
+        : { ...row }
+    );
+  } else if (scenario === "duplicate-occurrence") {
+    actual = expected.map((row, index) =>
+      index === 1 ? { ...expected[0] } : { ...row }
+    );
+  } else if (scenario === "invalid-partition") {
+    fieldPartition = Object.freeze({
+      NON_GRANTOR_FIELDS: Object.freeze([
+        ...NON_GRANTOR_FIELDS.slice(1),
+        GRANTOR_IDENTITY_FIELDS[0],
+      ]),
+      GRANTOR_IDENTITY_FIELDS: Object.freeze([NON_GRANTOR_FIELDS[0]]),
+      GRANTOR_DEPENDENCY_FIELDS,
+    });
+  } else if (scenario === "classifier-exception") {
+    actual = new Proxy([], {
+      get() {
+        throw new Error("fixed-grantor-delta-classifier-probe-failure");
+      },
+    });
+  }
+
+  const fullDiagnostic = usageBodyAclExactSetDiagnostic(
+    actual,
+    expected,
+    observedGrantor
+  );
+  const grantorDelta = usageBodyAclGrantorDeltaDiagnostic(actual, expected, {
+    fieldPartition,
+    targetGrantors,
+    observedGrantor: observedReference,
+  });
+  if (fullDiagnostic === null || grantorDelta === null) {
+    return Object.freeze({ output: externalFixtureFailureOutput(failure) });
+  }
+  GRANT_INVENTORY_DIAGNOSTIC_FAILURES.set(
+    failure,
+    Object.freeze({
+      primary: "EXACT_SET_MISMATCH",
+      details: fullDiagnostic.details,
+      counts: fullDiagnostic.counts,
+    })
+  );
+  const storedGrantorDelta =
+    scenario === "invalid-count"
+      ? Object.freeze({
+          ...grantorDelta,
+          withoutGrantorIdentity: Object.freeze({
+            ...grantorDelta.withoutGrantorIdentity,
+            actualTotal: -1,
+          }),
+        })
+      : grantorDelta;
+  GRANT_INVENTORY_GRANTOR_DELTA_DIAGNOSTICS.set(
+    failure,
+    storedGrantorDelta
+  );
   GRANT_INVENTORY_CLEANUP_RESULTS.set(
     failure,
     Object.freeze({ attempted: true, succeeded: true })
