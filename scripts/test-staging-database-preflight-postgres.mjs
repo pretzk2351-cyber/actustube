@@ -44,6 +44,10 @@ const USAGE_FIXTURE_ROLES = Object.freeze({
   deniedRuntime: "actustube_ci_usage_denied",
   publicProbe: "actustube_ci_usage_public_probe",
 });
+const USAGE_MIGRATION_BOUNDARY_ROLES = Object.freeze({
+  legacyOwner: "actustube_ci_usage_legacy_owner",
+  migrationExecutor: "actustube_ci_usage_migration_executor",
+});
 const USAGE_BODY_ACL_RECIPIENTS = Object.freeze([
   USAGE_FIXTURE_ROLES.explicitRuntime,
   USAGE_FIXTURE_ROLES.runtimeGroup,
@@ -53,33 +57,53 @@ const USAGE_BODY_OBJECT_ACL_MANIFEST = Object.freeze([
     objectKind: "table",
     schemaName: "public",
     objectName: "users",
+    ownerAuthority: USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor,
     privileges: Object.freeze(["SELECT", "UPDATE"]),
   }),
   Object.freeze({
     objectKind: "table",
     schemaName: "public",
     objectName: "user_plan_assignments",
+    ownerAuthority: USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor,
     privileges: Object.freeze(["SELECT"]),
   }),
   Object.freeze({
     objectKind: "table",
     schemaName: "public",
     objectName: "plans",
+    ownerAuthority: USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor,
     privileges: Object.freeze(["SELECT"]),
   }),
   Object.freeze({
     objectKind: "table",
     schemaName: "public",
     objectName: "user_usage_buckets",
+    ownerAuthority: USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor,
     privileges: Object.freeze(["SELECT", "INSERT", "UPDATE"]),
   }),
   Object.freeze({
     objectKind: "table",
     schemaName: "public",
     objectName: "usage_reservation_leases",
+    ownerAuthority: USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor,
     privileges: Object.freeze(["SELECT", "INSERT"]),
   }),
 ]);
+const USAGE_BODY_OBJECT_OWNER_AUTHORITY_KEYS = Object.freeze([
+  "objectKind",
+  "schemaName",
+  "objectName",
+  "ownerAuthority",
+]);
+const USAGE_BODY_OBJECT_OWNER_AUTHORITY_CONTRACT = Object.freeze(
+  USAGE_BODY_OBJECT_ACL_MANIFEST.map((entry) =>
+    Object.freeze(
+      Object.fromEntries(
+        USAGE_BODY_OBJECT_OWNER_AUTHORITY_KEYS.map((key) => [key, entry[key]])
+      )
+    )
+  )
+);
 const USAGE_BODY_ACL_ROW_KEYS = Object.freeze([
   "authority_kind",
   "recipient_relation",
@@ -112,10 +136,6 @@ const USAGE_BODY_ACL_GRANTOR_FIELD_PARTITION = Object.freeze({
   NON_GRANTOR_FIELDS,
   GRANTOR_IDENTITY_FIELDS,
   GRANTOR_DEPENDENCY_FIELDS,
-});
-const USAGE_MIGRATION_BOUNDARY_ROLES = Object.freeze({
-  legacyOwner: "actustube_ci_usage_legacy_owner",
-  migrationExecutor: "actustube_ci_usage_migration_executor",
 });
 const LEGACY_USAGE_SIGNATURE =
   "public.reserve_usage_limits(uuid,integer,public.usage_metric,timestamp with time zone)";
@@ -4653,11 +4673,20 @@ function assertUsageBodyObjectAclManifest() {
       USAGE_BODY_OBJECT_ACL_MANIFEST.every(
         (entry) =>
           Object.isFrozen(entry) &&
+          exactOwnKeys(entry, [
+            "objectKind",
+            "schemaName",
+            "objectName",
+            "ownerAuthority",
+            "privileges",
+          ]) &&
           Object.isFrozen(entry.privileges) &&
           entry.objectKind === "table" &&
           entry.schemaName === "public" &&
           SAFE_IDENTIFIER.test(entry.schemaName) &&
           SAFE_IDENTIFIER.test(entry.objectName) &&
+          entry.ownerAuthority ===
+            USAGE_MIGRATION_BOUNDARY_ROLES.migrationExecutor &&
           entry.privileges.length > 0 &&
           new Set(entry.privileges).size === entry.privileges.length &&
           entry.privileges.every((privilege) =>
@@ -4665,6 +4694,48 @@ function assertUsageBodyObjectAclManifest() {
           )
       ),
     "EXTERNAL_FIXTURE_USAGE_BODY_ACL_MANIFEST_INVALID"
+  );
+}
+
+function usageBodyObjectIdentityKey(entry) {
+  return JSON.stringify([entry.objectKind, entry.schemaName, entry.objectName]);
+}
+
+function usageBodyObjectOwnerAuthorityMap(ownerContract) {
+  assertUsageBodyObjectAclManifest();
+  requireHarness(
+    Array.isArray(ownerContract) &&
+      Object.isFrozen(ownerContract) &&
+      ownerContract.length === USAGE_BODY_OBJECT_ACL_MANIFEST.length &&
+      ownerContract.every(
+        (entry) =>
+          entry !== null &&
+          typeof entry === "object" &&
+          Object.isFrozen(entry) &&
+          exactOwnKeys(entry, USAGE_BODY_OBJECT_OWNER_AUTHORITY_KEYS) &&
+          entry.objectKind === "table" &&
+          entry.schemaName === "public" &&
+          SAFE_IDENTIFIER.test(entry.schemaName) &&
+          SAFE_IDENTIFIER.test(entry.objectName) &&
+          SAFE_IDENTIFIER.test(entry.ownerAuthority)
+      ),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_OWNER_CONTRACT_INVALID"
+  );
+  const expectedObjectKeys = new Set(
+    USAGE_BODY_OBJECT_ACL_MANIFEST.map(usageBodyObjectIdentityKey)
+  );
+  const actualObjectKeys = ownerContract.map(usageBodyObjectIdentityKey);
+  requireHarness(
+    new Set(actualObjectKeys).size === ownerContract.length &&
+      actualObjectKeys.every((key) => expectedObjectKeys.has(key)) &&
+      expectedObjectKeys.size === ownerContract.length,
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_OWNER_CONTRACT_INVALID"
+  );
+  return new Map(
+    ownerContract.map((entry) => [
+      usageBodyObjectIdentityKey(entry),
+      entry.ownerAuthority,
+    ])
   );
 }
 
@@ -4825,13 +4896,18 @@ async function executeUsageBodyObjectAclStatements(
   );
 }
 
-function usageBodyAclExpectedRows(grantorName) {
-  requireHarness(
-    SAFE_IDENTIFIER.test(grantorName),
-    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_GRANTOR_INVALID"
-  );
+function buildUsageBodyAclExpectedRows(ownerContract) {
+  const ownerAuthorityByObject =
+    usageBodyObjectOwnerAuthorityMap(ownerContract);
   const rows = [];
   for (const entry of USAGE_BODY_OBJECT_ACL_MANIFEST) {
+    const ownerAuthority = ownerAuthorityByObject.get(
+      usageBodyObjectIdentityKey(entry)
+    );
+    requireHarness(
+      typeof ownerAuthority === "string" && SAFE_IDENTIFIER.test(ownerAuthority),
+      "EXTERNAL_FIXTURE_USAGE_BODY_ACL_OWNER_CONTRACT_INVALID"
+    );
     for (const granteeName of USAGE_BODY_ACL_RECIPIENTS) {
       for (const privilegeType of entry.privileges) {
         rows.push(
@@ -4841,7 +4917,7 @@ function usageBodyAclExpectedRows(grantorName) {
               granteeName === USAGE_FIXTURE_ROLES.explicitRuntime
                 ? "explicit_direct"
                 : "membership_group_direct",
-            grantor_name: grantorName,
+            grantor_name: ownerAuthority,
             grantee_name: granteeName,
             object_kind: entry.objectKind,
             schema_name: entry.schemaName,
@@ -4849,13 +4925,23 @@ function usageBodyAclExpectedRows(grantorName) {
             privilege_type: privilegeType,
             grant_option: false,
             grantee_dependency_count: 1,
-            grantor_dependency_count: 1,
+            grantor_dependency_count: 0,
           })
         );
       }
     }
   }
   return Object.freeze(rows.sort(compareUsageBodyAclRows));
+}
+
+function usageBodyAclExpectedRows(grantorName) {
+  requireHarness(
+    SAFE_IDENTIFIER.test(grantorName),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_GRANTOR_INVALID"
+  );
+  return buildUsageBodyAclExpectedRows(
+    USAGE_BODY_OBJECT_OWNER_AUTHORITY_CONTRACT
+  );
 }
 
 function compareUsageBodyAclRows(left, right) {
@@ -5288,6 +5374,16 @@ function usageBodyAclExactSetDiagnostic(normalized, expected, grantorName) {
         ])
       )
     );
+    const expectedGrantorContracts = new Set(
+      expected.map((row) =>
+        JSON.stringify([
+          row.object_kind,
+          row.schema_name,
+          row.object_name,
+          row.grantor_name,
+        ])
+      )
+    );
     for (const row of extraRows) {
       const objectContract = JSON.stringify([
         row.object_kind,
@@ -5304,6 +5400,12 @@ function usageBodyAclExactSetDiagnostic(normalized, expected, grantorName) {
         row.recipient_relation,
         row.grantee_name,
       ]);
+      const grantorContract = JSON.stringify([
+        row.object_kind,
+        row.schema_name,
+        row.object_name,
+        row.grantor_name,
+      ]);
       if (!expectedObjectContracts.has(objectContract)) addDetail("OBJECT_CONTRACT");
       if (
         expectedObjectContracts.has(objectContract) &&
@@ -5315,7 +5417,9 @@ function usageBodyAclExactSetDiagnostic(normalized, expected, grantorName) {
       if (!expectedRecipientContracts.has(recipientContract)) {
         addDetail("RECIPIENT_CONTRACT");
       }
-      if (row.grantor_name !== grantorName) addDetail("GRANTOR_CONTRACT");
+      if (!expectedGrantorContracts.has(grantorContract)) {
+        addDetail("GRANTOR_CONTRACT");
+      }
       if (row.grantor_name === row.grantee_name) addDetail("SELF_GRANT_CONTRACT");
       if (
         USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE.includes(row.grantee_name) &&
@@ -5325,7 +5429,7 @@ function usageBodyAclExactSetDiagnostic(normalized, expected, grantorName) {
       }
       if (
         USAGE_BODY_ACL_INVENTORY_ROLE_SCOPE.includes(row.grantor_name) &&
-        row.grantor_name !== grantorName
+        !expectedGrantorContracts.has(grantorContract)
       ) {
         addDetail("TARGET_GRANTOR_COVERAGE");
       }
@@ -5336,7 +5440,7 @@ function usageBodyAclExactSetDiagnostic(normalized, expected, grantorName) {
         addDetail("OBSERVED_GRANTOR_COVERAGE");
       }
       if (row.grantee_dependency_count !== 1) addDetail("GRANTEE_DEPENDENCY");
-      if (row.grantor_dependency_count !== 1) addDetail("GRANTOR_DEPENDENCY");
+      if (row.grantor_dependency_count !== 0) addDetail("GRANTOR_DEPENDENCY");
       if (
         row.authority_kind === "uncovered_acl_dependency" ||
         row.privilege_type === "ACL_DEPENDENCY"
@@ -6965,6 +7069,20 @@ export function grantInventoryGrantorDeltaFieldPartitionForTests() {
   });
 }
 
+export function runUsageBodyAclOwnerOracleProbeForTests({
+  ownerContract,
+  originalObservedReference,
+}) {
+  requireHarness(
+    arguments.length === 1 &&
+      SAFE_IDENTIFIER.test(originalObservedReference),
+    "EXTERNAL_FIXTURE_USAGE_BODY_ACL_OWNER_ORACLE_PROBE_INVALID"
+  );
+  return Object.freeze({
+    expectedRows: buildUsageBodyAclExpectedRows(ownerContract),
+  });
+}
+
 const GRANT_INVENTORY_GRANTOR_DELTA_PROBE_SCENARIOS = new Set([
   "target-expected-all-actual-none",
   "target-reference-unavailable",
@@ -7004,7 +7122,9 @@ export function runGrantInventoryGrantorDeltaOutputProbeForTests(scenario) {
   let observedReference = observedGrantor;
 
   if (scenario === "target-expected-all-actual-none") {
-    targetGrantors = Object.freeze([observedGrantor]);
+    targetGrantors = Object.freeze([
+      ...new Set(expected.map((row) => row.grantor_name)),
+    ]);
   } else if (scenario === "target-reference-unavailable") {
     targetGrantors = Object.freeze([]);
   } else if (scenario === "observed-reference-unavailable") {

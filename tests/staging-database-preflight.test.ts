@@ -37,6 +37,7 @@ import {
   runMigrationOwnerBoundaryProbeForTests,
   runOwnershipCanonicalizationProbeForTests,
   runUsageBodyAclBoundaryProbeForTests,
+  runUsageBodyAclOwnerOracleProbeForTests,
   validateExternalFixtureConfigurationForTests,
   validateIndependentExtensionInventoryForTests,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
@@ -2461,12 +2462,20 @@ function sortTestUsageBodyAclRows(rows: TestUsageBodyAclRow[]) {
 }
 
 function validTestUsageBodyAclRows({
-  grantorName = testFixtureSessionRole,
+  objectOwners = testUsageBodyAclObjectOwners,
+  grantorName,
+  grantorDependencyCount,
 }: {
+  objectOwners?: TestUsageBodyAclObjectOwner[];
   grantorName?: string;
+  grantorDependencyCount?: number;
 } = {}): TestUsageBodyAclRow[] {
   const rows: TestUsageBodyAclRow[] = [];
   for (const entry of testUsageBodyAclManifest) {
+    const objectOwner = testUsageBodyAclOwnerForObject(
+      entry.objectName,
+      objectOwners
+    );
     for (const granteeName of testUsageBodyAclRecipients) {
       for (const privilegeType of entry.privileges) {
         rows.push({
@@ -2475,7 +2484,7 @@ function validTestUsageBodyAclRows({
             granteeName === testUsageBodyAclRoles.explicit
               ? "explicit_direct"
               : "membership_group_direct",
-          grantor_name: grantorName,
+          grantor_name: grantorName ?? objectOwner,
           grantee_name: granteeName,
           object_kind: "table",
           schema_name: "public",
@@ -2483,7 +2492,8 @@ function validTestUsageBodyAclRows({
           privilege_type: privilegeType,
           grant_option: false,
           grantee_dependency_count: 1,
-          grantor_dependency_count: 1,
+          grantor_dependency_count:
+            grantorDependencyCount ?? (grantorName === undefined ? 0 : 1),
         });
       }
     }
@@ -2528,13 +2538,13 @@ function testGrantorDeltaRows(
       return { ...row, grantor_name: testUsageBodyAclRoles.denied };
     }
     if (scenario === "dependency-all") {
-      return { ...row, grantor_dependency_count: 0 };
+      return { ...row, grantor_dependency_count: 1 };
     }
     if (scenario === "identity-and-dependency-all") {
       return {
         ...row,
         grantor_name: testUsageBodyAclRoles.denied,
-        grantor_dependency_count: 0,
+        grantor_dependency_count: 1,
       };
     }
     if (scenario === "non-grantor-all") {
@@ -2555,7 +2565,7 @@ function testGrantorDeltaRows(
         return { ...row, grantor_name: testUsageBodyAclRoles.denied };
       }
       if (index < 12) {
-        return { ...row, grantor_dependency_count: 0 };
+        return { ...row, grantor_dependency_count: 1 };
       }
       return { ...row, object_kind: "sequence" };
     }
@@ -2621,12 +2631,23 @@ const testPostgreSql18TableOwnerPrivileges = Object.freeze([
 const testUsageBodyAclFixedObjectOwner =
   testUsageBodyAclRoles.migrationExecutor;
 
+const testUsageBodyAclOwnerAuthorityContract = Object.freeze(
+  testUsageBodyAclManifest.map((entry) =>
+    Object.freeze({
+      objectKind: "table",
+      schemaName: "public",
+      objectName: entry.objectName,
+      ownerAuthority: testUsageBodyAclFixedObjectOwner,
+    })
+  )
+);
+
 const testUsageBodyAclObjectOwners: TestUsageBodyAclObjectOwner[] =
-  testUsageBodyAclManifest.map((entry) => ({
+  testUsageBodyAclOwnerAuthorityContract.map((entry) => ({
     object_kind: "table",
     schema_name: "public",
     object_name: entry.objectName,
-    owner_name: testUsageBodyAclFixedObjectOwner,
+    owner_name: entry.ownerAuthority,
   }));
 
 function testLocalHasExactPostgreSql18OwnerPrivilegeAllowlist(
@@ -2758,11 +2779,29 @@ function testLocalIsExactOwnerSelfAcl(row: TestUsageBodyAclCatalogRow) {
   );
 }
 
-function testLocalIsExactTemporaryUsageBodyAcl(row: TestUsageBodyAclCatalogRow) {
+function testLocalIsExactTemporaryUsageBodyAcl(
+  row: Pick<
+    TestUsageBodyAclCatalogRow,
+    | "grantor_name"
+    | "grantee_name"
+    | "object_kind"
+    | "schema_name"
+    | "object_name"
+    | "privilege_type"
+    | "grant_option"
+  >
+) {
+  const matchingOwners = testUsageBodyAclObjectOwners.filter(
+    (entry) =>
+      entry.object_kind === row.object_kind &&
+      entry.schema_name === row.schema_name &&
+      entry.object_name === row.object_name
+  );
   return (
+    matchingOwners.length === 1 &&
     row.object_kind === "table" &&
     row.schema_name === "public" &&
-    row.grantor_name === testFixtureSessionRole &&
+    row.grantor_name === matchingOwners[0].owner_name &&
     row.grant_option === false &&
     testUsageBodyAclRecipients.some(
       (recipientName) => recipientName === row.grantee_name
@@ -2929,9 +2968,9 @@ function testUsageBodyAclOwnerDefaultCatalogRows(
 
 function testUsageBodyAclTemporaryCatalogRows(
   objectOwners: TestUsageBodyAclObjectOwner[] = testUsageBodyAclObjectOwners,
-  grantorName = testFixtureSessionRole
+  grantorName?: string
 ): TestUsageBodyAclCatalogRow[] {
-  return validTestUsageBodyAclRows({ grantorName }).map((row, index) =>
+  return validTestUsageBodyAclRows({ objectOwners, grantorName }).map((row, index) =>
     testUsageBodyAclCatalogRow({
       physical_key: `temporary-acl-${index}`,
       owner_name: testUsageBodyAclOwnerForObject(row.object_name, objectOwners),
@@ -2955,6 +2994,7 @@ function testUsageBodyAclDefaultCatalogDependencies(
       ["grantee", row.grantee_name],
       ["grantor", row.grantor_name],
     ] as const) {
+      if (side === "grantor" && roleName === row.owner_name) continue;
       const key = `${row.object_name}:${roleName}`;
       if (!dependencies.has(key)) {
         dependencies.set(
@@ -3144,8 +3184,10 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
               row.object_name === entry.objectName &&
               row.privilege_type === privilegeType &&
               row.grant_option === false &&
+              row.grantor_name ===
+                testUsageBodyAclOwnerForObject(entry.objectName, objectOwners) &&
               row.grantee_dependency_count === 1 &&
-              row.grantor_dependency_count === 1
+              row.grantor_dependency_count === 0
           )
         )
       )
@@ -3356,21 +3398,7 @@ function createUsageBodyAclFakeHarness(options: UsageBodyAclFakeOptions = {}) {
           }
           state.aclRows = hasGrantedRowsOverride
             ? state.aclRows.filter(
-                (row) =>
-                  !(
-                    row.authority_kind === "explicit_acl" &&
-                    row.grantor_name === testFixtureSessionRole &&
-                    testUsageBodyAclRecipients.some(
-                      (recipient) => recipient === row.grantee_name
-                    ) &&
-                    testUsageBodyAclManifest.some(
-                      (entry) =>
-                        entry.objectName === row.object_name &&
-                        entry.privileges.some(
-                          (privilege) => privilege === row.privilege_type
-                        )
-                    )
-                  )
+                (row) => !testLocalIsExactTemporaryUsageBodyAcl(row)
               )
             : currentRawCatalogInventoryRows();
           state.aclRows.push(...postRevokeRows.map((row) => ({ ...row })));
@@ -4267,6 +4295,197 @@ describe("temporary usage body-object ACL boundary", () => {
     return { initial, fake, result };
   }
 
+  describe("body ACL owner grantor oracle", () => {
+    it("binds the independent exact 18-row oracle to all five fixed Migration object owners", async () => {
+      const oracle = runUsageBodyAclOwnerOracleProbeForTests({
+        ownerContract: testUsageBodyAclOwnerAuthorityContract,
+        originalObservedReference: testFixtureSessionRole,
+      });
+      const independentExpected = validTestUsageBodyAclRows();
+
+      expect(oracle.expectedRows).toEqual(independentExpected);
+      expect(oracle.expectedRows).toHaveLength(18);
+      expect(
+        new Set(oracle.expectedRows.map((row) => row.object_name))
+      ).toEqual(new Set(testUsageBodyAclManifest.map((entry) => entry.objectName)));
+      for (const row of oracle.expectedRows) {
+        expect(row.grantor_name).toBe(
+          testUsageBodyAclOwnerForObject(row.object_name)
+        );
+        expect(row.grantor_name).not.toBe(testFixtureSessionRole);
+      }
+
+      const { result } = await runBodyAclProbe();
+      expect(result.failureMarker).toBeNull();
+      expect(JSON.stringify(result)).not.toContain(testFixtureSessionRole);
+      expect(JSON.stringify(result)).not.toContain(
+        testUsageBodyAclFixedObjectOwner
+      );
+    });
+
+    it.each([
+      [
+        "missing object",
+        Object.freeze(testUsageBodyAclOwnerAuthorityContract.slice(1)),
+      ],
+      [
+        "extra object",
+        Object.freeze([
+          ...testUsageBodyAclOwnerAuthorityContract,
+          Object.freeze({
+            objectKind: "table",
+            schemaName: "public",
+            objectName: "outside_fixed_scope",
+            ownerAuthority: "fixture_owner_extra",
+          }),
+        ]),
+      ],
+      [
+        "duplicate object",
+        Object.freeze([
+          ...testUsageBodyAclOwnerAuthorityContract.slice(0, -1),
+          testUsageBodyAclOwnerAuthorityContract[0],
+        ]),
+      ],
+      [
+        "invalid mapping shape",
+        Object.freeze(
+          testUsageBodyAclOwnerAuthorityContract.map((entry, index) =>
+            index === 0
+              ? Object.freeze({ ...entry, unexpected: true })
+              : entry
+          )
+        ),
+      ],
+    ] as const)("fails closed for %s", (_label, ownerContract) => {
+      expect(() =>
+        runUsageBodyAclOwnerOracleProbeForTests({
+          ownerContract,
+          originalObservedReference: testFixtureSessionRole,
+        })
+      ).toThrow("EXTERNAL_FIXTURE_USAGE_BODY_ACL_OWNER_CONTRACT_INVALID");
+    });
+  });
+
+  describe("body ACL owner dependency oracle", () => {
+    it("requires owner grantor ACL dependency zero while preserving grantee dependency one", async () => {
+      const expectedRows = validTestUsageBodyAclRows();
+      expect(expectedRows).toHaveLength(18);
+      expect(
+        expectedRows.every(
+          (row) =>
+            row.grantee_dependency_count === 1 &&
+            row.grantor_dependency_count === 0
+        )
+      ).toBe(true);
+
+      const grantorDependencyMutation = expectedRows.map((row, index) =>
+        index === 0 ? { ...row, grantor_dependency_count: 1 } : { ...row }
+      );
+      const crossedDependencyMutation = expectedRows.map((row, index) =>
+        index === 0
+          ? {
+              ...row,
+              grantee_dependency_count: 0,
+              grantor_dependency_count: 1,
+            }
+          : { ...row }
+      );
+      expect(grantorDependencyMutation).not.toEqual(expectedRows);
+      expect(crossedDependencyMutation).not.toEqual(expectedRows);
+
+      for (const grantedRows of [
+        grantorDependencyMutation,
+        crossedDependencyMutation,
+      ]) {
+        const { result } = await runBodyAclProbe({
+          fakeOptions: { grantedRows },
+        });
+        expect(result.failureMarker).toBe(testGrantInventoryGenericMarker);
+        expect(result.runtimeAclConfigurationStartCount).toBe(0);
+        expect(result.postflightStartCount).toBe(0);
+      }
+    });
+  });
+
+  describe("body ACL grantor oracle mutation", () => {
+    const multiOwnerContract = Object.freeze(
+      testUsageBodyAclManifest.map((entry, index) =>
+        Object.freeze({
+          objectKind: "table",
+          schemaName: "public",
+          objectName: entry.objectName,
+          ownerAuthority: `fixture_object_owner_${index}`,
+        })
+      )
+    );
+    const multiObjectOwners: TestUsageBodyAclObjectOwner[] = multiOwnerContract.map(
+      (entry) => ({
+        object_kind: "table",
+        schema_name: "public",
+        object_name: entry.objectName,
+        owner_name: entry.ownerAuthority,
+      })
+    );
+
+    it("uses per-object authority, remains order-independent, and rejects scalar or cross-object substitutions", () => {
+      const original = runUsageBodyAclOwnerOracleProbeForTests({
+        ownerContract: multiOwnerContract,
+        originalObservedReference: testFixtureSessionRole,
+      }).expectedRows;
+      const reordered = runUsageBodyAclOwnerOracleProbeForTests({
+        ownerContract: Object.freeze([...multiOwnerContract].reverse()),
+        originalObservedReference: testFixtureSessionRole,
+      }).expectedRows;
+      const independentExpected = validTestUsageBodyAclRows({
+        objectOwners: multiObjectOwners,
+      });
+      expect(original).toEqual(independentExpected);
+      expect(reordered).toEqual(independentExpected);
+
+      const firstOwnerScalar = independentExpected.map((row) => ({
+        ...row,
+        grantor_name: multiOwnerContract[0].ownerAuthority,
+      }));
+      const crossObjectOwners = independentExpected.map((row) => ({
+        ...row,
+        grantor_name:
+          row.object_name === multiOwnerContract[0].objectName
+            ? multiOwnerContract[1].ownerAuthority
+            : row.grantor_name,
+      }));
+      expect(firstOwnerScalar).not.toEqual(independentExpected);
+      expect(crossObjectOwners).not.toEqual(independentExpected);
+      expect(sortTestUsageBodyAclRows(firstOwnerScalar)).not.toEqual(original);
+      expect(sortTestUsageBodyAclRows(crossObjectOwners)).not.toEqual(original);
+    });
+
+    it("rejects old observed authority, one wrong owner, missing, extra, and duplicate exact-set mutations", async () => {
+      const expectedRows = validTestUsageBodyAclRows();
+      const mutations = [
+        validTestUsageBodyAclRows({
+          grantorName: testFixtureSessionRole,
+          grantorDependencyCount: 1,
+        }),
+        expectedRows.map((row, index) =>
+          index === 0 ? { ...row, grantor_name: testUsageBodyAclRoles.denied } : row
+        ),
+        expectedRows.slice(1),
+        [...expectedRows, { ...expectedRows[0], object_name: "outside_fixed_scope" }],
+        [...expectedRows.slice(1), { ...expectedRows[0] }, { ...expectedRows[0] }],
+      ];
+      for (const grantedRows of mutations) {
+        expect(grantedRows).not.toEqual(expectedRows);
+        const { result } = await runBodyAclProbe({
+          fakeOptions: { grantedRows },
+        });
+        expect(result.failureMarker).toBe(testGrantInventoryGenericMarker);
+        expect(result.runtimeAclConfigurationStartCount).toBe(0);
+        expect(result.postflightStartCount).toBe(0);
+      }
+    });
+  });
+
   it("grant inventory observability keeps success silent and preserves the generic failure identity", async () => {
     const success = await runBodyAclProbe();
     expect(success.result.failureMarker).toBeNull();
@@ -4397,7 +4616,11 @@ describe("temporary usage body-object ACL boundary", () => {
       "one extra row",
       [
         ...validTestUsageBodyAclRows(),
-        { ...validTestUsageBodyAclRows()[0], grantee_name: "unknown_fixture_recipient" },
+        {
+          ...validTestUsageBodyAclRows()[0],
+          grantor_name: testFixtureSessionRole,
+          grantee_name: "unknown_fixture_recipient",
+        },
       ],
       [18, 19, 0, 1, 0],
       ["EXTRA_ROW", "RECIPIENT_CONTRACT", "OBSERVED_GRANTOR_COVERAGE"],
@@ -4468,11 +4691,15 @@ describe("temporary usage body-object ACL boundary", () => {
     ],
     [
       "observed-grantor unknown recipient coverage",
-      { recipient_relation: "unexpected", grantee_name: "unknown_fixture_recipient" },
+      {
+        recipient_relation: "unexpected",
+        grantor_name: testFixtureSessionRole,
+        grantee_name: "unknown_fixture_recipient",
+      },
       "OBSERVED_GRANTOR_COVERAGE",
     ],
     ["grantee dependency", { grantee_dependency_count: 0 }, "GRANTEE_DEPENDENCY"],
-    ["grantor dependency", { grantor_dependency_count: 0 }, "GRANTOR_DEPENDENCY"],
+    ["grantor dependency", { grantor_dependency_count: 1 }, "GRANTOR_DEPENDENCY"],
     [
       "uncovered dependency",
       {
@@ -4770,8 +4997,8 @@ describe("temporary usage body-object ACL boundary", () => {
       [18, 18, 0, 0, 18, 18],
       [18, 18, 18, 18, 18, 18],
       [18, 18, 0, 0, 18, 18],
-      [0, 18],
-      [18, 0],
+      [18, 18],
+      [0, 0],
       testGrantInventoryCleanupFailed,
     ],
     [
@@ -4781,8 +5008,8 @@ describe("temporary usage body-object ACL boundary", () => {
       [18, 18, 18, 18, 18, 18],
       [18, 18, 0, 0, 18, 18],
       [18, 18, 0, 0, 18, 18],
-      [0, 0],
       [18, 18],
+      [0, 0],
       testGrantInventoryCleanupSucceeded,
     ],
     [
@@ -4792,8 +5019,8 @@ describe("temporary usage body-object ACL boundary", () => {
       [18, 18, 18, 18, 18, 18],
       [18, 18, 18, 18, 18, 18],
       [18, 18, 0, 0, 18, 18],
-      [0, 18],
-      [18, 0],
+      [18, 18],
+      [0, 0],
       testGrantInventoryCleanupFailed,
     ],
     [
@@ -4803,9 +5030,9 @@ describe("temporary usage body-object ACL boundary", () => {
       [18, 18, 18, 18, 18, 18],
       [18, 18, 18, 18, 18, 18],
       [18, 18, 18, 18, 18, 18],
-      [0, 0],
       [18, 18],
-      testGrantInventoryCleanupSucceeded,
+      [0, 0],
+      testGrantInventoryCleanupFailed,
     ],
     [
       "grantor and non-grantor mixed replacement",
@@ -4814,8 +5041,8 @@ describe("temporary usage body-object ACL boundary", () => {
       [18, 18, 9, 9, 18, 18],
       [18, 18, 18, 18, 18, 18],
       [18, 18, 9, 9, 18, 18],
-      [0, 9],
-      [18, 9],
+      [18, 18],
+      [0, 0],
       testGrantInventoryCleanupFailed,
     ],
     [
@@ -4825,8 +5052,8 @@ describe("temporary usage body-object ACL boundary", () => {
       [18, 18, 0, 0, 18, 18],
       [18, 18, 1, 1, 18, 18],
       [18, 18, 0, 0, 18, 18],
-      [0, 1],
-      [18, 17],
+      [18, 18],
+      [0, 0],
       testGrantInventoryCleanupFailed,
     ],
     [
@@ -4836,8 +5063,8 @@ describe("temporary usage body-object ACL boundary", () => {
       [18, 18, 12, 12, 18, 18],
       [18, 18, 12, 12, 18, 18],
       [18, 18, 6, 6, 18, 18],
-      [0, 6],
-      [18, 12],
+      [18, 18],
+      [0, 0],
       testGrantInventoryCleanupFailed,
     ],
   ] as const)(
@@ -5006,7 +5233,7 @@ describe("temporary usage body-object ACL boundary", () => {
     expect(targetExpected).toContain(
       testGrantorDeltaDirectionalLine(
         testGrantInventoryObservedGrantorCounts,
-        [18, 0]
+        [0, 0]
       )
     );
     for (const lines of [targetUnavailable, invalidTarget]) {
@@ -6297,14 +6524,7 @@ describe("temporary usage body-object ACL boundary", () => {
     expect(fake.state.executionCount).toBe(0);
     expect(fake.state.exactRevokeCount).toBe(1);
     expect(fake.state.aclRows).toEqual(
-      grantedRows.filter(
-        (row) =>
-          row.grantor_name !== testFixtureSessionRole ||
-          !testUsageBodyAclRecipients.some(
-            (recipient) => recipient === row.grantee_name
-          ) ||
-          row.authority_kind !== "explicit_acl"
-      )
+      grantedRows.filter((row) => !testLocalIsExactTemporaryUsageBodyAcl(row))
     );
   });
 
@@ -6740,7 +6960,6 @@ describe("temporary usage body-object ACL boundary", () => {
         [...dependencies]
       );
       const grantedRows = validTestUsageBodyAclRows().map((row) =>
-        row.grantor_name === dependencyCatalogAclRow.grantor_name &&
         row.grantee_name === dependencyCatalogAclRow.grantee_name &&
         row.object_name === dependencyCatalogAclRow.object_name &&
         row.privilege_type === dependencyCatalogAclRow.privilege_type
@@ -6759,7 +6978,7 @@ describe("temporary usage body-object ACL boundary", () => {
       expect(fake.state.executionCount).toBe(0);
       expect(fake.state.exactRevokeCount).toBe(1);
       expect(fake.state.inventoryCount).toBe(2);
-      expect(fake.state.aclRows).toEqual([]);
+      expect(fake.state.aclRows).toEqual([actualRow]);
       expect(result.runtimeAclConfigurationStartCount).toBe(0);
       expect(result.postflightStartCount).toBe(0);
     }
@@ -7355,6 +7574,7 @@ describe("connection-only external fixture boundary", () => {
         "runMigrationOwnerBoundaryProbeForTests",
         "runOwnershipCanonicalizationProbeForTests",
         "runUsageBodyAclBoundaryProbeForTests",
+        "runUsageBodyAclOwnerOracleProbeForTests",
         "validateExternalFixtureConfigurationForTests",
         "validateIndependentExtensionInventoryForTests",
       ].sort()
