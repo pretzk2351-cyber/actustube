@@ -51,7 +51,7 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - Preview build：合格済み
 - Production反映：未実施。`main`とCurrent Productionは引き続き`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
 - 認証済みApp Shell操作テスト：Next.js versionの文書不一致により未実施
-- 次工程：文書同期後、ProductionとDB・OAuth・Environment Variablesを完全分離した認証済みstaging環境を構築し、認証済み操作を検証する
+- 次工程：認証済みstaging環境の構築と操作検証は、別の明示authorization後に行う将来工程として保持します。現在はreservation-concurrency setup observabilityのlocal実装・validationと必要なdocumentation correctionが未push local chainで完了しており、本documentation correctionを含むcombined rangeの独立review A / Bが即時gateです。両review合格後だけnormal feature-branch pushをexact 1回実施し、そのpushによるnew HEADのautomatic PostgreSQL 18.6 CIを監視します。それまではstaging、Production、provider、Migration、deploymentへ進みません
 
 ## Staging DB preflight / postflight verification基盤
 
@@ -362,7 +362,7 @@ Migration 0006のProduction適用、postflight、Persistence 500復旧、動画�
 
 ## 次の作業
 
-staging関連のinitial feature-branch pushからexpected-owner oracle fixまでの履歴は保持しています。expected-owner fix commit `a14ae01c2c9692f71eaf2cc3b77bb26fa45acbde`のautomatic run `33584551679`はexternal disposable PostgreSQL verifierで`RUN / FAILED`となり、reservation-concurrency setup markerをexact 1件観測しました。grant-inventory markerは再発せず、そのexact-set gateとClient closeはcontrol-flow reachability上PASSしましたが、temporary ACL cleanup terminalとPostgreSQL 18.6 workflow全体は`NOT VERIFIED`です。read-only diagnosisはdirect regressionを`RULED OUT`、newly reachable latent failureを`PROVEN`とし、underlying branchは`PROVEN 0 / UNRESOLVED 10`です。次の作業はreservation setupのbehavior-neutralなpublic-safe branch observabilityをlocal validationし、独立review 2系統でblocking finding 0の場合だけnormal pushして新しいautomatic CIを監視することです。新CIでbranch categoryを取得しても追加fixへは進みません。setup query、QueryConfig、parameter、query / Client operation count、deadline、cleanup、GRANT / REVOKE、grant-inventory、Migration、workflow、production acceptance semanticsは変更しません。Draft PR、ready-for-review、merge、staging構築、Production、provider、deploymentへ進みません。
+staging関連のinitial feature-branch pushからexpected-owner oracle fixまでの履歴は保持しています。expected-owner fix commit `a14ae01c2c9692f71eaf2cc3b77bb26fa45acbde`のautomatic run `33584551679`はexternal disposable PostgreSQL verifierで`RUN / FAILED`となり、reservation-concurrency setup markerをexact 1件観測しました。grant-inventory markerは再発せず、そのexact-set gateとClient closeはcontrol-flow reachability上PASSしましたが、temporary ACL cleanup terminalとPostgreSQL 18.6 workflow全体は`NOT VERIFIED`です。read-only diagnosisはdirect regressionを`RULED OUT`、newly reachable latent failureを`PROVEN`とし、underlying branchは`PROVEN 0 / UNRESOLVED 10`です。reservation-concurrency setup observabilityのlocal実装・validationと必要なdocumentation correctionは未push local chainで完了しています。現在のgateは本documentation correctionを含むcombined rangeの独立review A / Bであり、両review合格後だけnormal feature-branch pushをexact 1回実施し、そのpushによるnew HEADのautomatic PostgreSQL 18.6 CIを監視します。reservation setup failureの場合はpublic-safe diagnosticを記録して追加fixせず停止し、full workflow successの場合だけread-only remote compareへ進みます。setup query、QueryConfig、parameter、query / Client operation count、deadline、cleanup、GRANT / REVOKE、grant-inventory、Migration、workflow、production acceptance semanticsは変更しません。Draft PR、ready-for-review、merge、staging構築、Production、provider、deploymentへ進みません。
 
 この文書同期branchの作成・commit・pushはProduction操作と分離します。`main`へcommit、merge、pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
 
