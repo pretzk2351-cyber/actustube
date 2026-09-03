@@ -36,6 +36,8 @@ import {
   runHarnessTransactionBoundaryProbeForTests,
   runMigrationOwnerBoundaryProbeForTests,
   runOwnershipCanonicalizationProbeForTests,
+  runReservationConcurrencySetupDiagnosticOutputProbeForTests,
+  runReservationConcurrencySetupObservabilityProbeForTests,
   runUsageBodyAclBoundaryProbeForTests,
   runUsageBodyAclOwnerOracleProbeForTests,
   validateExternalFixtureConfigurationForTests,
@@ -2352,6 +2354,47 @@ const testGrantInventoryCleanupFailed =
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_CLEANUP_FAILED";
 const testGrantInventoryGenericMarker =
   "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY";
+const testReservationSetupDiagnosticVersion =
+  "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_DIAGNOSTIC_V1";
+const testReservationSetupPrimaryMarkers = Object.freeze({
+  factoryThrow:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_FACTORY_THROW",
+  factoryAsyncResult:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_FACTORY_ASYNC_RESULT",
+  clientShape:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_SHAPE",
+  connectRejected:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_CONNECT_REJECTED",
+  connectTimeout:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_CONNECT_TIMEOUT",
+  queryRejected:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_SETUP_QUERY_REJECTED",
+  queryTimeout:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_SETUP_QUERY_TIMEOUT",
+  closeRejected:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_CLOSE_REJECTED",
+  closeTimeout:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_CLOSE_TIMEOUT",
+});
+const testReservationSetupPrimaryMarkerList: readonly string[] = Object.values(
+  testReservationSetupPrimaryMarkers
+);
+const testReservationSetupOpenCleanupAttempted =
+  "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_DETAIL_OPEN_CLEANUP_ATTEMPTED";
+const testReservationSetupOpenCleanupSucceeded =
+  "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_DETAIL_OPEN_CLEANUP_SUCCEEDED";
+const testReservationSetupOpenCleanupFailed =
+  "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_DETAIL_OPEN_CLEANUP_FAILED";
+const testReservationSetupGenericMarker =
+  "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENCY_SETUP";
+const testReservationSetupFixedMarkerAllowlist = new Set<string>([
+  testReservationSetupDiagnosticVersion,
+  ...Object.values(testReservationSetupPrimaryMarkers),
+  testReservationSetupOpenCleanupAttempted,
+  testReservationSetupOpenCleanupSucceeded,
+  testReservationSetupOpenCleanupFailed,
+  testReservationSetupGenericMarker,
+]);
 const testGrantInventoryGrantorDeltaVersion =
   "EXTERNAL_FIXTURE_GRANT_INVENTORY_GRANTOR_DELTA_V1";
 const testGrantInventoryWithoutGrantorIdentity =
@@ -2379,6 +2422,35 @@ function testGrantInventoryOutputLines(diagnosticOutput: string) {
   return diagnosticOutput.endsWith("\n")
     ? diagnosticOutput.slice(0, -1).split("\n")
     : diagnosticOutput.split("\n");
+}
+
+function testReservationSetupOutputLines(output: string): string[] {
+  if (output.length === 0) return [];
+  return output.endsWith("\n")
+    ? output.slice(0, -1).split("\n")
+    : output.split("\n");
+}
+
+function testReservationSetupSequenceIsValid(lines: readonly string[]): boolean {
+  const attemptedIndex = lines.indexOf(testReservationSetupOpenCleanupAttempted);
+  const terminalIndexes = [
+    lines.indexOf(testReservationSetupOpenCleanupSucceeded),
+    lines.indexOf(testReservationSetupOpenCleanupFailed),
+  ].filter((index) => index >= 0);
+  return (
+    lines.length >= 3 &&
+    lines[0] === testReservationSetupDiagnosticVersion &&
+    testReservationSetupPrimaryMarkerList.includes(lines[1]) &&
+    lines.filter((line) => testReservationSetupPrimaryMarkerList.includes(line))
+      .length === 1 &&
+    lines.at(-1) === testReservationSetupGenericMarker &&
+    lines.every((line) => testReservationSetupFixedMarkerAllowlist.has(line)) &&
+    ((attemptedIndex < 0 && terminalIndexes.length === 0 && lines.length === 3) ||
+      (attemptedIndex === 2 &&
+        terminalIndexes.length === 1 &&
+        terminalIndexes[0] === 3 &&
+        lines.length === 5))
+  );
 }
 
 const testGrantorDeltaNonGrantorFields = [
@@ -7507,6 +7579,372 @@ describe("temporary usage body-object ACL boundary", () => {
   });
 });
 
+describe("reservation concurrency setup observability", () => {
+  it.each([
+    ["factory-throw", testReservationSetupPrimaryMarkers.factoryThrow, 0, 0, 0],
+    [
+      "factory-async-result",
+      testReservationSetupPrimaryMarkers.factoryAsyncResult,
+      0,
+      0,
+      0,
+    ],
+    [
+      "client-shape-missing-method",
+      testReservationSetupPrimaryMarkers.clientShape,
+      0,
+      0,
+      0,
+    ],
+    [
+      "client-shape-invalid-method",
+      testReservationSetupPrimaryMarkers.clientShape,
+      0,
+      0,
+      0,
+    ],
+    [
+      "connect-deadline-exhausted-before",
+      testReservationSetupPrimaryMarkers.connectTimeout,
+      0,
+      0,
+      0,
+    ],
+    [
+      "connect-timeout-during",
+      testReservationSetupPrimaryMarkers.connectTimeout,
+      1,
+      0,
+      0,
+    ],
+    [
+      "query-rejected-close-succeeds",
+      testReservationSetupPrimaryMarkers.queryRejected,
+      1,
+      1,
+      1,
+    ],
+    [
+      "query-rejected-close-fails",
+      testReservationSetupPrimaryMarkers.queryRejected,
+      1,
+      1,
+      1,
+    ],
+    [
+      "query-timeout-close-fails",
+      testReservationSetupPrimaryMarkers.queryTimeout,
+      1,
+      1,
+      1,
+    ],
+    [
+      "query-deadline-exhausted-before",
+      testReservationSetupPrimaryMarkers.queryTimeout,
+      1,
+      0,
+      0,
+    ],
+    [
+      "query-timeout-during",
+      testReservationSetupPrimaryMarkers.queryTimeout,
+      1,
+      1,
+      0,
+    ],
+    [
+      "close-rejected",
+      testReservationSetupPrimaryMarkers.closeRejected,
+      1,
+      1,
+      1,
+    ],
+    [
+      "close-timeout",
+      testReservationSetupPrimaryMarkers.closeTimeout,
+      1,
+      1,
+      1,
+    ],
+  ] as const)(
+    "reservation concurrency setup primary classifier maps %s from its execution stage",
+    async (scenario, expectedPrimary, connectCount, queryCount, closeCount) => {
+      const result =
+        await runReservationConcurrencySetupObservabilityProbeForTests(scenario);
+      const lines = testReservationSetupOutputLines(result.output);
+
+      expect(result.completed).toBe(false);
+      expect(result.failureMarker).toBe(testReservationSetupGenericMarker);
+      expect(lines).toEqual([
+        testReservationSetupDiagnosticVersion,
+        expectedPrimary,
+        testReservationSetupGenericMarker,
+      ]);
+      expect(testReservationSetupSequenceIsValid(lines)).toBe(true);
+      expect(
+        lines.filter((line) =>
+          testReservationSetupPrimaryMarkerList.includes(line)
+        )
+      ).toHaveLength(1);
+      expect(result.counters).toMatchObject({
+        factory: 1,
+        connect: connectCount,
+        query: queryCount,
+        close: closeCount,
+      });
+      expect(result.activeClientCount).toBe(0);
+      expect(result.trackerResidue).toBe(false);
+    }
+  );
+
+  it.each([
+    [
+      "connect-rejected-cleanup-succeeds",
+      testReservationSetupPrimaryMarkers.connectRejected,
+      testReservationSetupOpenCleanupSucceeded,
+      0,
+    ],
+    [
+      "connect-rejected-cleanup-fails",
+      testReservationSetupPrimaryMarkers.connectRejected,
+      testReservationSetupOpenCleanupFailed,
+      1,
+    ],
+    [
+      "connect-timeout-cleanup-succeeds",
+      testReservationSetupPrimaryMarkers.connectTimeout,
+      testReservationSetupOpenCleanupSucceeded,
+      0,
+    ],
+    [
+      "connect-timeout-cleanup-fails",
+      testReservationSetupPrimaryMarkers.connectTimeout,
+      testReservationSetupOpenCleanupFailed,
+      1,
+    ],
+  ] as const)(
+    "reservation concurrency setup open cleanup details preserve %s primary and terminal state",
+    async (scenario, expectedPrimary, expectedTerminal, destroyCount) => {
+      const result =
+        await runReservationConcurrencySetupObservabilityProbeForTests(scenario);
+      const lines = testReservationSetupOutputLines(result.output);
+
+      expect(lines).toEqual([
+        testReservationSetupDiagnosticVersion,
+        expectedPrimary,
+        testReservationSetupOpenCleanupAttempted,
+        expectedTerminal,
+        testReservationSetupGenericMarker,
+      ]);
+      expect(testReservationSetupSequenceIsValid(lines)).toBe(true);
+      expect(lines.filter((line) => line === expectedPrimary)).toHaveLength(1);
+      expect(
+        lines.filter(
+          (line) => line === testReservationSetupOpenCleanupAttempted
+        )
+      ).toHaveLength(1);
+      expect(
+        lines.filter(
+          (line) =>
+            line === testReservationSetupOpenCleanupSucceeded ||
+            line === testReservationSetupOpenCleanupFailed
+        )
+      ).toHaveLength(1);
+      expect(result.counters).toEqual({
+        factory: 1,
+        connect: 1,
+        query: 0,
+        close: 1,
+        destroy: destroyCount,
+      });
+      expect(result.activeClientCount).toBe(0);
+      expect(result.trackerResidue).toBe(false);
+    }
+  );
+
+  it("reservation concurrency setup observability preserves success and behavior-neutral operation counts", async () => {
+    const beforeUnhandled = process.listenerCount("unhandledRejection");
+    const beforeUncaught = process.listenerCount("uncaughtException");
+    const success =
+      await runReservationConcurrencySetupObservabilityProbeForTests("success");
+    const queryRejected =
+      await runReservationConcurrencySetupObservabilityProbeForTests(
+        "query-rejected-close-succeeds"
+      );
+    const queryTimedOut =
+      await runReservationConcurrencySetupObservabilityProbeForTests(
+        "query-timeout-during"
+      );
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
+
+    expect(success).toMatchObject({
+      completed: true,
+      output: "",
+      failureMarker: null,
+      counters: { factory: 1, connect: 1, query: 1, close: 1, destroy: 0 },
+      operationStarts: { connect: 1, query: 1, close: 1, phase: 0, migration: 0 },
+      timedOut: false,
+      activeClientCount: 0,
+      trackerResidue: false,
+    });
+    expect(success.output).not.toMatch(/DIAGNOSTIC|PRIMARY_|DETAIL_|FAILED_PHASE/);
+    expect(queryRejected.operationStarts).toMatchObject({
+      connect: 1,
+      query: 1,
+      close: 1,
+    });
+    expect(queryTimedOut.operationStarts).toMatchObject({
+      connect: 1,
+      query: 1,
+      close: 0,
+    });
+    expect(queryTimedOut.counters.destroy).toBe(1);
+    expect(queryTimedOut.activeClientCount).toBe(0);
+    expect(process.listenerCount("unhandledRejection")).toBe(beforeUnhandled);
+    expect(process.listenerCount("uncaughtException")).toBe(beforeUncaught);
+  });
+
+  it("reservation concurrency setup primary classifier mutation controls change code or marker sequence", async () => {
+    const connectRejected = testReservationSetupOutputLines(
+      (
+        await runReservationConcurrencySetupObservabilityProbeForTests(
+          "connect-rejected-cleanup-succeeds"
+        )
+      ).output
+    );
+    const connectTimeout = testReservationSetupOutputLines(
+      (
+        await runReservationConcurrencySetupObservabilityProbeForTests(
+          "connect-timeout-cleanup-succeeds"
+        )
+      ).output
+    );
+    const queryRejected = testReservationSetupOutputLines(
+      (
+        await runReservationConcurrencySetupObservabilityProbeForTests(
+          "query-rejected-close-succeeds"
+        )
+      ).output
+    );
+    const queryTimeout = testReservationSetupOutputLines(
+      (
+        await runReservationConcurrencySetupObservabilityProbeForTests(
+          "query-timeout-close-fails"
+        )
+      ).output
+    );
+    const closeRejected = testReservationSetupOutputLines(
+      (
+        await runReservationConcurrencySetupObservabilityProbeForTests(
+          "close-rejected"
+        )
+      ).output
+    );
+    const closeTimeout = testReservationSetupOutputLines(
+      (
+        await runReservationConcurrencySetupObservabilityProbeForTests(
+          "close-timeout"
+        )
+      ).output
+    );
+    const cleanupFailed = testReservationSetupOutputLines(
+      (
+        await runReservationConcurrencySetupObservabilityProbeForTests(
+          "connect-rejected-cleanup-fails"
+        )
+      ).output
+    );
+    const unknownPrimary = testReservationSetupOutputLines(
+      runReservationConcurrencySetupDiagnosticOutputProbeForTests(
+        "unknown-primary"
+      ).output
+    );
+    const rawInjection = testReservationSetupOutputLines(
+      runReservationConcurrencySetupDiagnosticOutputProbeForTests(
+        "raw-error-injection"
+      ).output
+    );
+
+    for (const [before, after] of [
+      [connectRejected, connectTimeout],
+      [queryRejected, queryTimeout],
+      [closeRejected, closeTimeout],
+      [connectRejected, cleanupFailed],
+      [connectRejected, unknownPrimary],
+      [connectRejected, rawInjection],
+    ]) {
+      expect(after).not.toEqual(before);
+    }
+    expect(testReservationSetupSequenceIsValid(connectRejected)).toBe(true);
+    const outOfOrder = [...connectRejected];
+    [outOfOrder[0], outOfOrder[1]] = [outOfOrder[1], outOfOrder[0]];
+    expect(outOfOrder).not.toEqual(connectRejected);
+    expect(testReservationSetupSequenceIsValid(outOfOrder)).toBe(false);
+  });
+
+  it("reservation concurrency setup observability redaction fails closed for malformed or forged diagnostics", async () => {
+    const applicationSensitiveCandidate =
+      /sensitive|identity|role|oid|catalog|sql|parameter|postgresql:|credential|path|stack|cause/i;
+    expect("application_unmasked_identity_candidate").toMatch(
+      applicationSensitiveCandidate
+    );
+
+    for (const scenario of [
+      "unknown-primary",
+      "duplicate-primary",
+      "missing-primary",
+      "invalid-cleanup-state",
+      "cleanup-terminal-without-connect",
+      "cleanup-terminal-conflict",
+      "malformed-diagnostic",
+      "unbranded-diagnostic",
+      "classifier-throw",
+      "raw-error-injection",
+    ]) {
+      const result = runReservationConcurrencySetupDiagnosticOutputProbeForTests(
+        scenario
+      );
+      expect(result.output).toBe(`${testReservationSetupGenericMarker}\n`);
+      expect(result.output).not.toMatch(/DIAGNOSTIC|PRIMARY_|DETAIL_/);
+      expect(result.output).not.toMatch(applicationSensitiveCandidate);
+    }
+
+    for (const scenario of [
+      "factory-throw",
+      "connect-rejected-cleanup-fails",
+      "query-rejected-close-fails",
+      "close-rejected",
+    ]) {
+      const result =
+        await runReservationConcurrencySetupObservabilityProbeForTests(scenario);
+      const lines = testReservationSetupOutputLines(result.output);
+      expect(testReservationSetupSequenceIsValid(lines)).toBe(true);
+      expect(lines.every((line) => testReservationSetupFixedMarkerAllowlist.has(line))).toBe(
+        true
+      );
+      expect(result.output).not.toMatch(applicationSensitiveCandidate);
+    }
+
+    const runnerPreambleCandidates = [
+      "RUNNER_CONTEXT_FIELD=fixed-runner-preamble",
+      "RUNNER_MASKED_ASSIGNMENT=***",
+    ];
+    const applicationOutput = (
+      await runReservationConcurrencySetupObservabilityProbeForTests(
+        "query-rejected-close-succeeds"
+      )
+    ).output;
+    expect(runnerPreambleCandidates.every((line) => !applicationOutput.includes(line))).toBe(
+      true
+    );
+    expect(
+      testReservationSetupOutputLines(applicationOutput).every((line) =>
+        testReservationSetupFixedMarkerAllowlist.has(line)
+      )
+    ).toBe(true);
+  });
+});
+
 describe("connection-only external fixture boundary", () => {
   it("has no database lifecycle authority or lifecycle adapter seam", async () => {
     expect(harnessAuthorityBoundaryForTests()).toEqual({
@@ -7573,6 +8011,8 @@ describe("connection-only external fixture boundary", () => {
         "runHarnessTransactionBoundaryProbeForTests",
         "runMigrationOwnerBoundaryProbeForTests",
         "runOwnershipCanonicalizationProbeForTests",
+        "runReservationConcurrencySetupDiagnosticOutputProbeForTests",
+        "runReservationConcurrencySetupObservabilityProbeForTests",
         "runUsageBodyAclBoundaryProbeForTests",
         "runUsageBodyAclOwnerOracleProbeForTests",
         "validateExternalFixtureConfigurationForTests",

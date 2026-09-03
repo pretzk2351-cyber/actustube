@@ -1701,6 +1701,42 @@ const EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS = new WeakSet();
 const GRANT_INVENTORY_DIAGNOSTIC_FAILURES = new WeakMap();
 const GRANT_INVENTORY_GRANTOR_DELTA_DIAGNOSTICS = new WeakMap();
 const GRANT_INVENTORY_CLEANUP_RESULTS = new WeakMap();
+const RESERVATION_SETUP_DIAGNOSTIC_FAILURES = new WeakMap();
+const RESERVATION_SETUP_DIAGNOSTIC_VALUES = new WeakSet();
+const RESERVATION_SETUP_TRACKERS = new WeakMap();
+const RESERVATION_SETUP_PRIMARY_MARKERS = Object.freeze({
+  CLIENT_FACTORY_THROW:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_FACTORY_THROW",
+  CLIENT_FACTORY_ASYNC_RESULT:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_FACTORY_ASYNC_RESULT",
+  CLIENT_SHAPE:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_SHAPE",
+  CLIENT_CONNECT_REJECTED:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_CONNECT_REJECTED",
+  CLIENT_CONNECT_TIMEOUT:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_CONNECT_TIMEOUT",
+  SETUP_QUERY_REJECTED:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_SETUP_QUERY_REJECTED",
+  SETUP_QUERY_TIMEOUT:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_SETUP_QUERY_TIMEOUT",
+  CLIENT_CLOSE_REJECTED:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_CLOSE_REJECTED",
+  CLIENT_CLOSE_TIMEOUT:
+    "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_PRIMARY_CLIENT_CLOSE_TIMEOUT",
+});
+const RESERVATION_SETUP_DIAGNOSTIC_VERSION =
+  "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_DIAGNOSTIC_V1";
+const RESERVATION_SETUP_OPEN_CLEANUP_ATTEMPTED =
+  "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_DETAIL_OPEN_CLEANUP_ATTEMPTED";
+const RESERVATION_SETUP_OPEN_CLEANUP_SUCCEEDED =
+  "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_DETAIL_OPEN_CLEANUP_SUCCEEDED";
+const RESERVATION_SETUP_OPEN_CLEANUP_FAILED =
+  "EXTERNAL_FIXTURE_RESERVATION_CONCURRENCY_SETUP_DETAIL_OPEN_CLEANUP_FAILED";
+const RESERVATION_SETUP_OPEN_CLEANUP_STATES = Object.freeze([
+  "NOT_ATTEMPTED",
+  "SUCCEEDED",
+  "FAILED",
+]);
 const GRANT_INVENTORY_PRIMARY_MARKERS = Object.freeze({
   CLIENT_FACTORY: "EXTERNAL_FIXTURE_GRANT_INVENTORY_PRIMARY_CLIENT_FACTORY",
   CLIENT_CONNECT_REJECTED:
@@ -1897,6 +1933,122 @@ function isHarnessTimeout(error) {
   return error instanceof HarnessIssue && error.code === "EXTERNAL_FIXTURE_OPERATION_TIMEOUT";
 }
 
+function recordReservationSetupPrimary(context, primary) {
+  try {
+    const tracker = RESERVATION_SETUP_TRACKERS.get(context);
+    if (
+      tracker &&
+      tracker.primary === null &&
+      Object.prototype.hasOwnProperty.call(
+        RESERVATION_SETUP_PRIMARY_MARKERS,
+        primary
+      )
+    ) {
+      tracker.primary = primary;
+    }
+  } catch {
+    // Observability must not alter the existing setup failure.
+  }
+}
+
+function recordReservationSetupOpenCleanup(context, state) {
+  try {
+    const tracker = RESERVATION_SETUP_TRACKERS.get(context);
+    if (!tracker) return;
+    if (state === "ATTEMPTED" && tracker.openCleanup === "NOT_ATTEMPTED") {
+      tracker.openCleanup = state;
+    } else if (
+      (state === "SUCCEEDED" || state === "FAILED") &&
+      tracker.openCleanup === "ATTEMPTED"
+    ) {
+      tracker.openCleanup = state;
+    }
+  } catch {
+    // Observability must not alter the existing open-cleanup path.
+  }
+}
+
+function createReservationSetupDiagnostic(primary, openCleanup) {
+  try {
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        RESERVATION_SETUP_PRIMARY_MARKERS,
+        primary
+      ) ||
+      !RESERVATION_SETUP_OPEN_CLEANUP_STATES.includes(openCleanup) ||
+      (openCleanup !== "NOT_ATTEMPTED" &&
+        primary !== "CLIENT_CONNECT_REJECTED" &&
+        primary !== "CLIENT_CONNECT_TIMEOUT")
+    ) {
+      return null;
+    }
+    const diagnostic = Object.freeze({ primary, openCleanup });
+    RESERVATION_SETUP_DIAGNOSTIC_VALUES.add(diagnostic);
+    return diagnostic;
+  } catch {
+    return null;
+  }
+}
+
+function attachReservationSetupDiagnostic(context, failure) {
+  try {
+    const brand = EXTERNAL_FIXTURE_PHASE_FAILURES.get(failure);
+    const tracker = RESERVATION_SETUP_TRACKERS.get(context);
+    if (
+      brand?.context !== context ||
+      brand.phase !== EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencySetup ||
+      !tracker
+    ) {
+      return;
+    }
+    const diagnostic = createReservationSetupDiagnostic(
+      tracker.primary,
+      tracker.openCleanup
+    );
+    if (diagnostic) {
+      RESERVATION_SETUP_DIAGNOSTIC_FAILURES.set(failure, diagnostic);
+    }
+  } catch {
+    // Classification failure intentionally falls back to the generic marker.
+  }
+}
+
+function reservationSetupDiagnosticLines(error) {
+  try {
+    const brand = EXTERNAL_FIXTURE_PHASE_FAILURES.get(error);
+    const diagnostic = RESERVATION_SETUP_DIAGNOSTIC_FAILURES.get(error);
+    if (
+      brand?.phase !== EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencySetup ||
+      !RESERVATION_SETUP_DIAGNOSTIC_VALUES.has(diagnostic) ||
+      !exactOwnKeys(diagnostic, ["primary", "openCleanup"])
+    ) {
+      return Object.freeze([]);
+    }
+    const primaryMarker = RESERVATION_SETUP_PRIMARY_MARKERS[diagnostic.primary];
+    if (
+      typeof primaryMarker !== "string" ||
+      !RESERVATION_SETUP_OPEN_CLEANUP_STATES.includes(diagnostic.openCleanup) ||
+      (diagnostic.openCleanup !== "NOT_ATTEMPTED" &&
+        diagnostic.primary !== "CLIENT_CONNECT_REJECTED" &&
+        diagnostic.primary !== "CLIENT_CONNECT_TIMEOUT")
+    ) {
+      return Object.freeze([]);
+    }
+    const lines = [RESERVATION_SETUP_DIAGNOSTIC_VERSION, primaryMarker];
+    if (diagnostic.openCleanup !== "NOT_ATTEMPTED") {
+      lines.push(
+        RESERVATION_SETUP_OPEN_CLEANUP_ATTEMPTED,
+        diagnostic.openCleanup === "SUCCEEDED"
+          ? RESERVATION_SETUP_OPEN_CLEANUP_SUCCEEDED
+          : RESERVATION_SETUP_OPEN_CLEANUP_FAILED
+      );
+    }
+    return Object.freeze(lines);
+  } catch {
+    return Object.freeze([]);
+  }
+}
+
 function recordGrantInventoryCleanupResult(failure, attempted, succeeded) {
   try {
     if (
@@ -1992,7 +2144,11 @@ function grantInventoryDiagnosticLines(error) {
 
 function externalFixtureFailureOutput(error) {
   const marker = externalFixtureFailureMarker(error);
-  return `${[...grantInventoryDiagnosticLines(error), marker].join("\n")}\n`;
+  return `${[
+    ...grantInventoryDiagnosticLines(error),
+    ...reservationSetupDiagnosticLines(error),
+    marker,
+  ].join("\n")}\n`;
 }
 
 function externalFixtureFailureMarker(error) {
@@ -2302,21 +2458,29 @@ function createOwnedClient(context, rawClient) {
 }
 
 async function queryOwnedClient(context, ownedClient, ...argumentsList) {
-  requireHarness(
-    ownedClient.usable && !ownedClient.destroyed && !ownedClient.closed,
-    context.timedOut
-      ? "EXTERNAL_FIXTURE_OPERATION_TIMEOUT"
-      : "EXTERNAL_FIXTURE_CONNECTION_UNUSABLE"
-  );
-  return await runBoundedOperation(
-    context,
-    {
-      category: "query",
-      maximumMilliseconds: context.limits.queryMilliseconds,
-      ownedClient,
-    },
-    () => ownedClient.rawClient.query(...argumentsList)
-  );
+  try {
+    requireHarness(
+      ownedClient.usable && !ownedClient.destroyed && !ownedClient.closed,
+      context.timedOut
+        ? "EXTERNAL_FIXTURE_OPERATION_TIMEOUT"
+        : "EXTERNAL_FIXTURE_CONNECTION_UNUSABLE"
+    );
+    return await runBoundedOperation(
+      context,
+      {
+        category: "query",
+        maximumMilliseconds: context.limits.queryMilliseconds,
+        ownedClient,
+      },
+      () => ownedClient.rawClient.query(...argumentsList)
+    );
+  } catch (error) {
+    recordReservationSetupPrimary(
+      context,
+      isHarnessTimeout(error) ? "SETUP_QUERY_TIMEOUT" : "SETUP_QUERY_REJECTED"
+    );
+    throw error;
+  }
 }
 
 async function closeOwnedClient(context, ownedClient) {
@@ -2325,15 +2489,25 @@ async function closeOwnedClient(context, ownedClient) {
     return;
   }
   try {
-    await runBoundedOperation(
-      context,
-      {
-        category: "close",
-        maximumMilliseconds: context.limits.closeMilliseconds,
-        ownedClient,
-      },
-      () => ownedClient.rawClient.end()
-    );
+    try {
+      await runBoundedOperation(
+        context,
+        {
+          category: "close",
+          maximumMilliseconds: context.limits.closeMilliseconds,
+          ownedClient,
+        },
+        () => ownedClient.rawClient.end()
+      );
+    } catch (error) {
+      recordReservationSetupPrimary(
+        context,
+        isHarnessTimeout(error)
+          ? "CLIENT_CLOSE_TIMEOUT"
+          : "CLIENT_CLOSE_REJECTED"
+      );
+      throw error;
+    }
     ownedClient.closed = true;
     ownedClient.usable = false;
   } finally {
@@ -2785,12 +2959,21 @@ function runMigrationReservationLifecyclePhase(context, operation) {
   );
 }
 
-function runMigrationReservationConcurrencySetupPhase(context, operation) {
-  return runFixedMigrationSubphase(
-    context,
-    EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencySetup,
-    operation
-  );
+async function runMigrationReservationConcurrencySetupPhase(context, operation) {
+  const tracker = { primary: null, openCleanup: "NOT_ATTEMPTED" };
+  RESERVATION_SETUP_TRACKERS.set(context, tracker);
+  try {
+    return await runFixedMigrationSubphase(
+      context,
+      EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencySetup,
+      operation
+    );
+  } catch (error) {
+    attachReservationSetupDiagnostic(context, error);
+    throw error;
+  } finally {
+    RESERVATION_SETUP_TRACKERS.delete(context);
+  }
 }
 
 function runMigrationReservationConcurrentLimitPhase(context, operation) {
@@ -3019,12 +3202,34 @@ function createPgClientFactory(deadlineLimits = HARNESS_DEADLINE_LIMITS) {
 }
 
 async function openClient(context, clientFactory, credentials) {
-  const client = clientFactory(credentials);
+  let client;
+  try {
+    client = clientFactory(credentials);
+  } catch (error) {
+    recordReservationSetupPrimary(context, "CLIENT_FACTORY_THROW");
+    throw error;
+  }
+  let asyncFactoryResult;
+  try {
+    asyncFactoryResult = Boolean(client && typeof client.then === "function");
+  } catch (error) {
+    recordReservationSetupPrimary(context, "CLIENT_SHAPE");
+    throw error;
+  }
+  if (asyncFactoryResult) {
+    recordReservationSetupPrimary(context, "CLIENT_FACTORY_ASYNC_RESULT");
+  }
   requireHarness(
-    !client || typeof client.then !== "function",
+    !asyncFactoryResult,
     "EXTERNAL_FIXTURE_CONNECTION_FACTORY_INVALID"
   );
-  const ownedClient = createOwnedClient(context, client);
+  let ownedClient;
+  try {
+    ownedClient = createOwnedClient(context, client);
+  } catch (error) {
+    recordReservationSetupPrimary(context, "CLIENT_SHAPE");
+    throw error;
+  }
   try {
     await runBoundedOperation(
       context,
@@ -3037,10 +3242,19 @@ async function openClient(context, clientFactory, credentials) {
     );
     return ownedClient;
   } catch (error) {
+    recordReservationSetupPrimary(
+      context,
+      isHarnessTimeout(error)
+        ? "CLIENT_CONNECT_TIMEOUT"
+        : "CLIENT_CONNECT_REJECTED"
+    );
     if (!ownedClient.destroyed) {
+      recordReservationSetupOpenCleanup(context, "ATTEMPTED");
       try {
         await closeOwnedClient(context, ownedClient);
+        recordReservationSetupOpenCleanup(context, "SUCCEEDED");
       } catch {
+        recordReservationSetupOpenCleanup(context, "FAILED");
         if (!ownedClient.destroyed) destroyOwnedClient(ownedClient);
       }
     }
@@ -6994,6 +7208,263 @@ export const HARNESS_DEADLINE_LIMITS_FOR_TESTS = HARNESS_DEADLINE_LIMITS;
 export function validateIndependentExtensionInventoryForTests(rows) {
   validateIndependentExtensionInventory(rows);
   return Object.freeze({ match: true });
+}
+
+const RESERVATION_SETUP_OBSERVABILITY_PROBE_SCENARIOS = new Set([
+  "success",
+  "factory-throw",
+  "factory-async-result",
+  "client-shape-missing-method",
+  "client-shape-invalid-method",
+  "connect-rejected-cleanup-succeeds",
+  "connect-rejected-cleanup-fails",
+  "connect-timeout-cleanup-succeeds",
+  "connect-timeout-cleanup-fails",
+  "connect-deadline-exhausted-before",
+  "connect-timeout-during",
+  "query-rejected-close-succeeds",
+  "query-rejected-close-fails",
+  "query-timeout-close-fails",
+  "query-deadline-exhausted-before",
+  "query-timeout-during",
+  "close-rejected",
+  "close-timeout",
+]);
+
+const RESERVATION_SETUP_DIAGNOSTIC_PROBE_SCENARIOS = new Set([
+  "unknown-primary",
+  "duplicate-primary",
+  "missing-primary",
+  "invalid-cleanup-state",
+  "cleanup-terminal-without-connect",
+  "cleanup-terminal-conflict",
+  "malformed-diagnostic",
+  "unbranded-diagnostic",
+  "classifier-throw",
+  "raw-error-injection",
+]);
+
+function reservationSetupProbeClient(scenario, context, counters) {
+  const fixedFailure = () =>
+    new Error(
+      "reservation_setup_sensitive_identity_role_oid_catalog_sql_url_credential_path"
+    );
+  const client = {
+    connection: {
+      stream: {
+        destroy() {
+          counters.destroy += 1;
+        },
+      },
+    },
+    connect() {
+      counters.connect += 1;
+      if (scenario === "query-deadline-exhausted-before") {
+        context.absoluteDeadline = performance.now() - 1;
+      }
+      if (
+        scenario === "connect-rejected-cleanup-succeeds" ||
+        scenario === "connect-rejected-cleanup-fails"
+      ) {
+        return Promise.reject(fixedFailure());
+      }
+      if (
+        scenario === "connect-timeout-cleanup-succeeds" ||
+        scenario === "connect-timeout-cleanup-fails"
+      ) {
+        return Promise.reject(
+          new HarnessIssue("EXTERNAL_FIXTURE_OPERATION_TIMEOUT")
+        );
+      }
+      return scenario === "connect-timeout-during"
+        ? new Promise(() => undefined)
+        : Promise.resolve(undefined);
+    },
+    query() {
+      counters.query += 1;
+      if (
+        scenario === "query-rejected-close-succeeds" ||
+        scenario === "query-rejected-close-fails"
+      ) {
+        return Promise.reject(fixedFailure());
+      }
+      if (scenario === "query-timeout-close-fails") {
+        return Promise.reject(
+          new HarnessIssue("EXTERNAL_FIXTURE_OPERATION_TIMEOUT")
+        );
+      }
+      return scenario === "query-timeout-during"
+        ? new Promise(() => undefined)
+        : Promise.resolve({ rows: [] });
+    },
+    end() {
+      counters.close += 1;
+      if (
+        scenario === "connect-rejected-cleanup-fails" ||
+        scenario === "connect-timeout-cleanup-fails" ||
+        scenario === "query-rejected-close-fails" ||
+        scenario === "query-timeout-close-fails" ||
+        scenario === "close-rejected"
+      ) {
+        return Promise.reject(fixedFailure());
+      }
+      return scenario === "close-timeout"
+        ? new Promise(() => undefined)
+        : Promise.resolve(undefined);
+    },
+  };
+  if (scenario === "client-shape-missing-method") {
+    return Object.freeze({
+      connection: client.connection,
+      connect: client.connect,
+      end: client.end,
+    });
+  }
+  if (scenario === "client-shape-invalid-method") {
+    return Object.freeze({ ...client, query: null });
+  }
+  return client;
+}
+
+export async function runReservationConcurrencySetupObservabilityProbeForTests(
+  scenario
+) {
+  requireHarness(
+    arguments.length === 1 &&
+      typeof scenario === "string" &&
+      RESERVATION_SETUP_OBSERVABILITY_PROBE_SCENARIOS.has(scenario),
+    "EXTERNAL_FIXTURE_RESERVATION_SETUP_OBSERVABILITY_PROBE_INVALID"
+  );
+  const context = createDeadlineContext({
+    totalMilliseconds: 100,
+    connectMilliseconds: 5,
+    queryMilliseconds: 5,
+    closeMilliseconds: 5,
+  });
+  const counters = { factory: 0, connect: 0, query: 0, close: 0, destroy: 0 };
+  const clientFactory = () => {
+    counters.factory += 1;
+    if (scenario === "factory-throw") {
+      throw new Error(
+        "reservation_setup_sensitive_identity_role_oid_catalog_sql_url_credential_path"
+      );
+    }
+    const client = reservationSetupProbeClient(scenario, context, counters);
+    return scenario === "factory-async-result" ? Promise.resolve(client) : client;
+  };
+  if (scenario === "connect-deadline-exhausted-before") {
+    context.absoluteDeadline = performance.now() - 1;
+  }
+  EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.add(context);
+  let failure = null;
+  let completed = false;
+  try {
+    await Reflect.apply(runMigrationReservationConcurrencySetupPhase, undefined, [
+      context,
+      () =>
+        Reflect.apply(executeFixtureQuery, undefined, [
+          context,
+          clientFactory,
+          Object.freeze({
+            host: "127.0.0.1",
+            port: 5432,
+            database: "actustube_ci_fixture",
+            role: "actustube_ci_fixture",
+          }),
+          "RESERVATION_SETUP_OBSERVABILITY_PROBE",
+          [],
+        ]),
+    ]);
+    completed = true;
+  } catch (error) {
+    failure = error;
+  } finally {
+    EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.delete(context);
+  }
+  return Object.freeze({
+    completed,
+    output: failure === null ? "" : externalFixtureFailureOutput(failure),
+    failureMarker:
+      failure === null ? null : externalFixtureFailureMarker(failure),
+    counters: Object.freeze({ ...counters }),
+    operationStarts: Object.freeze({ ...context.operationStarts }),
+    timedOut: context.timedOut,
+    activeClientCount: context.activeClients.size,
+    trackerResidue: RESERVATION_SETUP_TRACKERS.has(context),
+  });
+}
+
+export function runReservationConcurrencySetupDiagnosticOutputProbeForTests(
+  scenario
+) {
+  requireHarness(
+    arguments.length === 1 &&
+      typeof scenario === "string" &&
+      RESERVATION_SETUP_DIAGNOSTIC_PROBE_SCENARIOS.has(scenario),
+    "EXTERNAL_FIXTURE_RESERVATION_SETUP_DIAGNOSTIC_PROBE_INVALID"
+  );
+  const context = Object.freeze(Object.create(null));
+  const failure = createExternalFixturePhaseFailure(
+    context,
+    EXTERNAL_FIXTURE_PHASES.migrationReservationConcurrencySetup
+  );
+  let diagnostic;
+  if (scenario === "classifier-throw") {
+    diagnostic = new Proxy(Object.create(null), {
+      ownKeys() {
+        throw new Error("fixed-reservation-setup-classifier-probe-failure");
+      },
+    });
+  } else if (scenario === "malformed-diagnostic") {
+    diagnostic = null;
+  } else if (scenario === "missing-primary") {
+    diagnostic = Object.freeze({ openCleanup: "NOT_ATTEMPTED" });
+  } else if (scenario === "duplicate-primary") {
+    diagnostic = Object.freeze({
+      primary: Object.freeze([
+        "CLIENT_CONNECT_REJECTED",
+        "CLIENT_CONNECT_TIMEOUT",
+      ]),
+      openCleanup: "NOT_ATTEMPTED",
+    });
+  } else if (scenario === "unknown-primary") {
+    diagnostic = Object.freeze({
+      primary: "UNKNOWN",
+      openCleanup: "NOT_ATTEMPTED",
+    });
+  } else if (scenario === "invalid-cleanup-state") {
+    diagnostic = Object.freeze({
+      primary: "CLIENT_CONNECT_REJECTED",
+      openCleanup: "UNKNOWN",
+    });
+  } else if (scenario === "cleanup-terminal-without-connect") {
+    diagnostic = Object.freeze({
+      primary: "CLIENT_FACTORY_THROW",
+      openCleanup: "SUCCEEDED",
+    });
+  } else if (scenario === "cleanup-terminal-conflict") {
+    diagnostic = Object.freeze({
+      primary: "CLIENT_CONNECT_REJECTED",
+      openCleanup: Object.freeze(["SUCCEEDED", "FAILED"]),
+    });
+  } else if (scenario === "raw-error-injection") {
+    diagnostic = Object.freeze({
+      primary: "CLIENT_CONNECT_REJECTED",
+      openCleanup: "FAILED",
+      rawError:
+        "reservation_setup_sensitive_identity_role_oid_catalog_sql_url_credential_path",
+    });
+  } else {
+    diagnostic = Object.freeze({
+      primary: "CLIENT_CONNECT_REJECTED",
+      openCleanup: "FAILED",
+    });
+  }
+  RESERVATION_SETUP_DIAGNOSTIC_FAILURES.set(failure, diagnostic);
+  if (scenario !== "unbranded-diagnostic" && diagnostic !== null) {
+    RESERVATION_SETUP_DIAGNOSTIC_VALUES.add(diagnostic);
+  }
+  return Object.freeze({ output: externalFixtureFailureOutput(failure) });
 }
 
 const GRANT_INVENTORY_DIAGNOSTIC_PROBE_SCENARIOS = new Set([
