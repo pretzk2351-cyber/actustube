@@ -87,7 +87,7 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - 実staging owner / ACL：未検証
 - Production DB：未接続・未変更
 - Migration：履歴上の明示承認済みlocal使い捨てDBだけへ適用。GitHub Actions run `32684794700`のbroad-marker failure、run `32695896204`のexplicit runtime execution failure、run `33291908052`のgrant-inventory generic-marker failure、run `33347045917`のgrant-inventory exact-set mismatchはimmutable historyです。実staging / Production DBへのMigration適用は0回です
-- 次工程：expected owner oracle candidateのlocal validationと独立review 2系統を完了し、P0 / P1 / P2とblocking NOT VERIFIEDが0の場合だけfeature branchへnormal push exact 1回を行い、新HEADのautomatic PostgreSQL 18.6 workflowを監視する。full CI successの場合だけread-only remote compareへ進み、Draft PRは作成しない。CI failure時は追加fix、追加commit、rerun、same-SHA repushへ進まない。staging構築、Production、provider、Migration、deploymentは別承認まで開始しない
+- 次工程：reservation-concurrency setup observabilityのlocal implementation、validation、direct-child commit `12261d131d456405b5ca684ea66fe3b44b25a796`までは完了し、pushは未実行です。現在のgateは、この文書P2修正を含むcombined rangeの独立review A / B再確認です。両reviewのP0 / P1 / P2とblocking NOT VERIFIEDが0の場合だけ、未pushのobservability commitとdocs follow-up commitをfeature branchへnormal push exact 1回で送信し、新HEADのautomatic PostgreSQL 18.6 workflowをexact 1件監視します。reservation setup failureの場合はpublic-safe primary categoryを記録して追加fixせず停止し、full CI successの場合だけread-only remote compareへ進みます。Draft PRは作成せず、staging構築、Production、provider、Migration、deploymentは別承認まで開始しません
 
 local unit PASSまたは将来のGitHub Actions disposable fixture PASSを「実staging DB検証済み」「staging構築完了」とは扱いません。1件でもFAIL、NOT VERIFIED、timeout、結果不明があればauthenticated staging工程へ進みません。
 
