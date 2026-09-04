@@ -38,6 +38,8 @@ import {
   runOwnershipCanonicalizationProbeForTests,
   runReservationConcurrencySetupDiagnosticOutputProbeForTests,
   runReservationConcurrencySetupObservabilityProbeForTests,
+  runReservationSetupTransactionPrimaryProbeForTests,
+  runReservationSetupTransactionProbeForTests,
   runUsageBodyAclBoundaryProbeForTests,
   runUsageBodyAclOwnerOracleProbeForTests,
   validateExternalFixtureConfigurationForTests,
@@ -7579,6 +7581,827 @@ describe("temporary usage body-object ACL boundary", () => {
   });
 });
 
+type ReservationSetupTransactionKind = "concurrency" | "release" | "stale";
+
+type ReservationSetupTransactionCall = {
+  clientToken: symbol;
+  argumentCount: number;
+  statement: string;
+  values: unknown;
+};
+
+type ReservationSetupTransactionFakeOptions = {
+  rejectAtQueryOrdinal?: number;
+  hangAtQueryOrdinal?: number;
+  lateRejectDelayMilliseconds?: number;
+  rejectRollback?: boolean;
+  hangRollback?: boolean;
+  rejectEnd?: boolean;
+};
+
+const testReservationSetupTransactionContracts = {
+  concurrency: {
+    fixtureUser: "40000000-0000-4000-8000-000000000001",
+    phaseMarker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENCY_SETUP",
+    statements: [
+      `INSERT INTO public.users (
+  id, status, session_version
+) VALUES ($1, 'active', 1)`,
+      `INSERT INTO public.user_plan_assignments (
+  user_id, plan_code, status, source, starts_at
+) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
+    ],
+  },
+  release: {
+    fixtureUser: "40000000-0000-4000-8000-000000000002",
+    phaseMarker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_RELEASE_SETUP",
+    statements: [
+      `INSERT INTO public.users (
+  id, status, session_version
+) VALUES ($1, 'active', 1)`,
+      `INSERT INTO public.user_plan_assignments (
+  user_id, plan_code, status, source, starts_at
+) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
+    ],
+  },
+  stale: {
+    fixtureUser: "40000000-0000-4000-8000-000000000003",
+    phaseMarker:
+      "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_STALE_SETUP",
+    statements: [
+      `INSERT INTO public.users (
+  id, status, session_version
+) VALUES ($1, 'active', 1)`,
+      `INSERT INTO public.user_plan_assignments (
+  user_id, plan_code, status, source, starts_at
+) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
+      `SELECT reservation_id
+FROM public.reserve_usage_limits_v2(
+  $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+  '2026-09-01T12:00:00Z'::timestamptz
+)`,
+    ],
+  },
+} as const;
+
+function inspectTestSqlStatements(sql: string) {
+  let state:
+    | "normal"
+    | "single-quote"
+    | "double-quote"
+    | "line-comment"
+    | "block-comment"
+    | "dollar-quote" = "normal";
+  let blockDepth = 0;
+  let dollarDelimiter = "";
+  let statementHasContent = false;
+  let statementCount = 0;
+  let index = 0;
+  while (index < sql.length) {
+    const character = sql[index];
+    const nextCharacter = sql[index + 1];
+    if (state === "single-quote") {
+      if (character === "'" && nextCharacter === "'") {
+        index += 2;
+      } else {
+        if (character === "'") state = "normal";
+        index += 1;
+      }
+      continue;
+    }
+    if (state === "double-quote") {
+      if (character === '"' && nextCharacter === '"') {
+        index += 2;
+      } else {
+        if (character === '"') state = "normal";
+        index += 1;
+      }
+      continue;
+    }
+    if (state === "line-comment") {
+      if (character === "\n") state = "normal";
+      index += 1;
+      continue;
+    }
+    if (state === "block-comment") {
+      if (character === "/" && nextCharacter === "*") {
+        blockDepth += 1;
+        index += 2;
+      } else if (character === "*" && nextCharacter === "/") {
+        blockDepth -= 1;
+        index += 2;
+        if (blockDepth === 0) state = "normal";
+      } else {
+        index += 1;
+      }
+      continue;
+    }
+    if (state === "dollar-quote") {
+      if (sql.startsWith(dollarDelimiter, index)) {
+        index += dollarDelimiter.length;
+        state = "normal";
+      } else {
+        index += 1;
+      }
+      continue;
+    }
+    if (character === "-" && nextCharacter === "-") {
+      state = "line-comment";
+      index += 2;
+      continue;
+    }
+    if (character === "/" && nextCharacter === "*") {
+      state = "block-comment";
+      blockDepth = 1;
+      index += 2;
+      continue;
+    }
+    if (character === "'") {
+      statementHasContent = true;
+      state = "single-quote";
+      index += 1;
+      continue;
+    }
+    if (character === '"') {
+      statementHasContent = true;
+      state = "double-quote";
+      index += 1;
+      continue;
+    }
+    if (character === "$") {
+      const delimiterMatch = sql
+        .slice(index)
+        .match(/^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/);
+      if (delimiterMatch) {
+        statementHasContent = true;
+        dollarDelimiter = delimiterMatch[0];
+        state = "dollar-quote";
+        index += dollarDelimiter.length;
+        continue;
+      }
+    }
+    if (character === ";") {
+      if (statementHasContent) statementCount += 1;
+      statementHasContent = false;
+      index += 1;
+      continue;
+    }
+    if (!/\s/u.test(character)) statementHasContent = true;
+    index += 1;
+  }
+  const valid = state === "normal" || state === "line-comment";
+  return {
+    valid,
+    statementCount: statementCount + (statementHasContent ? 1 : 0),
+  };
+}
+
+function normalizeTestSqlBoundary(sql: string) {
+  return sql.replace(/\r\n?/gu, "\n").trim();
+}
+
+function isParameterizedSingleStatement(call: ReservationSetupTransactionCall) {
+  if (!Array.isArray(call.values) || call.values.length === 0) return true;
+  const inspection = inspectTestSqlStatements(call.statement);
+  return (
+    call.argumentCount === 2 &&
+    inspection.valid &&
+    inspection.statementCount === 1
+  );
+}
+
+function createReservationSetupTransactionFake(
+  options: ReservationSetupTransactionFakeOptions = {}
+) {
+  const clientToken = Symbol("reservation-setup-owned-client");
+  const primaryFailure = Object.freeze({
+    fixedSensitiveCanary:
+      "sensitive-primary-role-oid-url-credential-sql-parameter",
+  });
+  const rollbackFailure = Object.freeze({
+    fixedSensitiveCanary:
+      "sensitive-rollback-role-oid-url-credential-sql-parameter",
+  });
+  const state = {
+    clientToken,
+    calls: [] as ReservationSetupTransactionCall[],
+    connectCount: 0,
+    endCount: 0,
+    destroyCount: 0,
+    transactionOpen: false,
+    stagedEffects: [] as number[],
+    committedEffects: [] as number[],
+    commitAttemptCount: 0,
+    commitSuccessCount: 0,
+    rollbackAttemptCount: 0,
+    rollbackSuccessCount: 0,
+  };
+  const rejectLater = (failure: unknown) =>
+    options.lateRejectDelayMilliseconds === undefined
+      ? new Promise<never>(() => undefined)
+      : new Promise<never>((_resolvePromise, rejectPromise) => {
+          setTimeout(
+            () => rejectPromise(failure),
+            options.lateRejectDelayMilliseconds
+          );
+        });
+  const client = {
+    connection: {
+      stream: {
+        destroy() {
+          state.destroyCount += 1;
+          state.transactionOpen = false;
+          state.stagedEffects.length = 0;
+        },
+      },
+    },
+    async connect() {
+      state.connectCount += 1;
+    },
+    query(statementValue: unknown, values?: unknown) {
+      const argumentCount = arguments.length;
+      const statement = typeof statementValue === "string" ? statementValue : "";
+      const call = { clientToken, argumentCount, statement, values };
+      state.calls.push(call);
+      const queryOrdinal = state.calls.length;
+      const normalized = normalizeTestSqlBoundary(statement);
+      if (
+        typeof statementValue !== "string" ||
+        !isParameterizedSingleStatement(call)
+      ) {
+        return Promise.reject(primaryFailure);
+      }
+      if (normalized === "ROLLBACK") {
+        state.rollbackAttemptCount += 1;
+        if (options.hangRollback) return rejectLater(rollbackFailure);
+        if (options.rejectRollback) return Promise.reject(rollbackFailure);
+        state.rollbackSuccessCount += 1;
+        state.transactionOpen = false;
+        state.stagedEffects.length = 0;
+        return Promise.resolve({ rows: [] });
+      }
+      if (normalized === "COMMIT") state.commitAttemptCount += 1;
+      if (options.hangAtQueryOrdinal === queryOrdinal) {
+        return rejectLater(primaryFailure);
+      }
+      if (options.rejectAtQueryOrdinal === queryOrdinal) {
+        return Promise.reject(primaryFailure);
+      }
+      if (normalized === "BEGIN") {
+        state.transactionOpen = true;
+      } else if (normalized === "COMMIT") {
+        state.commitSuccessCount += 1;
+        state.committedEffects.push(...state.stagedEffects);
+        state.stagedEffects.length = 0;
+        state.transactionOpen = false;
+      } else {
+        state.stagedEffects.push(queryOrdinal);
+      }
+      return Promise.resolve({ rows: [] });
+    },
+    end() {
+      state.endCount += 1;
+      if (options.rejectEnd) return Promise.reject(rollbackFailure);
+      state.transactionOpen = false;
+      state.stagedEffects.length = 0;
+      return Promise.resolve(undefined);
+    },
+  };
+  return { client, state, primaryFailure };
+}
+
+function reservationSetupSuccessTranscriptMatches(
+  kind: ReservationSetupTransactionKind,
+  calls: readonly ReservationSetupTransactionCall[]
+) {
+  const contract = testReservationSetupTransactionContracts[kind];
+  if (calls.length !== contract.statements.length + 2) return false;
+  if (!calls.every((call) => call.clientToken === calls[0]?.clientToken)) {
+    return false;
+  }
+  const first = calls[0];
+  const last = calls.at(-1);
+  if (
+    first?.argumentCount !== 1 ||
+    first.values !== undefined ||
+    normalizeTestSqlBoundary(first.statement) !== "BEGIN" ||
+    last?.argumentCount !== 1 ||
+    last.values !== undefined ||
+    normalizeTestSqlBoundary(last.statement) !== "COMMIT"
+  ) {
+    return false;
+  }
+  return contract.statements.every((expectedStatement, statementIndex) => {
+    const call = calls[statementIndex + 1];
+    return (
+      call !== undefined &&
+      isParameterizedSingleStatement(call) &&
+      normalizeTestSqlBoundary(call.statement) ===
+        normalizeTestSqlBoundary(expectedStatement) &&
+      Array.isArray(call.values) &&
+      call.values.length === 1 &&
+      call.values[0] === contract.fixtureUser
+    );
+  });
+}
+
+function reservationSetupProbeIsPublicSafe(result: unknown) {
+  const serialized = JSON.stringify(result);
+  return (
+    !/sensitive|credential|parameter|postgresql:\/\/|select |insert |rollback/iu.test(
+      serialized
+    ) &&
+    !/40000000-0000-4000-8000-/u.test(serialized)
+  );
+}
+
+const testReservationSetupDeadlineLimits = Object.freeze({
+  totalMilliseconds: 500,
+  connectMilliseconds: 100,
+  queryMilliseconds: 25,
+  closeMilliseconds: 100,
+});
+
+describe("reservation setup transaction protocol", () => {
+  it("uses a test-local protocol oracle that rejects parameterized multi-command text", () => {
+    const inspect = (statement: string) => inspectTestSqlStatements(statement);
+    expect(inspect("SELECT $1; SELECT 2")).toEqual({
+      valid: true,
+      statementCount: 2,
+    });
+    expect(inspect("SELECT ';' AS value")).toEqual({
+      valid: true,
+      statementCount: 1,
+    });
+    expect(inspect('SELECT "semi;colon"')).toEqual({
+      valid: true,
+      statementCount: 1,
+    });
+    expect(inspect("SELECT $$begin; end$$")).toEqual({
+      valid: true,
+      statementCount: 1,
+    });
+    expect(inspect("SELECT 1 /* outer; /* nested; */ still; */;")).toEqual({
+      valid: true,
+      statementCount: 1,
+    });
+    expect(inspect("SELECT 1 -- ignored;\n;")).toEqual({
+      valid: true,
+      statementCount: 1,
+    });
+    expect(inspect("SELECT 1;")).toEqual({ valid: true, statementCount: 1 });
+    expect(inspect("SELECT 'unterminated").valid).toBe(false);
+    expect(inspect('SELECT "unterminated').valid).toBe(false);
+    expect(inspect("SELECT /* unterminated").valid).toBe(false);
+    expect(inspect("SELECT $body$unterminated").valid).toBe(false);
+    expect(
+      isParameterizedSingleStatement({
+        clientToken: Symbol("oracle-control"),
+        argumentCount: 2,
+        statement: "SELECT $1; SELECT 2",
+        values: [1],
+      })
+    ).toBe(false);
+  });
+
+  it.each([
+    ["concurrency", 4, 2],
+    ["release", 4, 2],
+    ["stale", 5, 3],
+  ] as const)(
+    "%s setup uses one owned Client and commits only after its single-statement queries",
+    async (setupKind, expectedQueryCount, expectedEffectCount) => {
+      const fake = createReservationSetupTransactionFake();
+      const result = await runReservationSetupTransactionProbeForTests({
+        setupKind,
+        client: fake.client,
+        deadlineLimits: testReservationSetupDeadlineLimits,
+      });
+
+      expect(result).toMatchObject({
+        completed: true,
+        output: "",
+        failureMarker: null,
+        factoryCount: 1,
+        continuationStartCount: 1,
+        timedOut: false,
+        activeClientCount: 0,
+        ownedClientCount: 1,
+        clientClosed: true,
+        clientDestroyed: false,
+        destroyCount: 0,
+        trackerResidue: false,
+      });
+      expect(result.operationStarts).toMatchObject({
+        connect: 1,
+        query: expectedQueryCount,
+        close: 1,
+      });
+      expect(fake.state.connectCount).toBe(1);
+      expect(fake.state.endCount).toBe(1);
+      expect(fake.state.destroyCount).toBe(0);
+      expect(fake.state.commitAttemptCount).toBe(1);
+      expect(fake.state.commitSuccessCount).toBe(1);
+      expect(fake.state.rollbackAttemptCount).toBe(0);
+      expect(fake.state.committedEffects).toHaveLength(expectedEffectCount);
+      expect(fake.state.stagedEffects).toHaveLength(0);
+      expect(
+        reservationSetupSuccessTranscriptMatches(setupKind, fake.state.calls)
+      ).toBe(true);
+      expect(reservationSetupProbeIsPublicSafe(result)).toBe(true);
+    }
+  );
+
+  it.each([
+    ["concurrency", 1],
+    ["concurrency", 2],
+    ["release", 1],
+    ["release", 2],
+    ["stale", 1],
+    ["stale", 2],
+    ["stale", 3],
+  ] as const)(
+    "%s setup rolls back and stops after DML %i rejects",
+    async (setupKind, failingDmlOrdinal) => {
+      const fake = createReservationSetupTransactionFake({
+        rejectAtQueryOrdinal: failingDmlOrdinal + 1,
+      });
+      const result = await runReservationSetupTransactionProbeForTests({
+        setupKind,
+        client: fake.client,
+        deadlineLimits: testReservationSetupDeadlineLimits,
+      });
+
+      expect(result.completed).toBe(false);
+      expect(result.failureMarker).toBe(
+        testReservationSetupTransactionContracts[setupKind].phaseMarker
+      );
+      expect(result.continuationStartCount).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(fake.state.calls).toHaveLength(failingDmlOrdinal + 2);
+      expect(
+        normalizeTestSqlBoundary(fake.state.calls.at(-1)?.statement ?? "") ===
+          "ROLLBACK" &&
+          fake.state.calls.at(-1)?.argumentCount === 1 &&
+          fake.state.calls.at(-1)?.values === undefined
+      ).toBe(true);
+      expect(fake.state.commitAttemptCount).toBe(0);
+      expect(fake.state.rollbackAttemptCount).toBe(1);
+      expect(fake.state.rollbackSuccessCount).toBe(1);
+      expect(fake.state.committedEffects).toHaveLength(0);
+      expect(fake.state.stagedEffects).toHaveLength(0);
+      expect(fake.state.endCount).toBe(1);
+      expect(fake.state.destroyCount).toBe(0);
+      expect(result.activeClientCount).toBe(0);
+      expect(reservationSetupProbeIsPublicSafe(result)).toBe(true);
+    }
+  );
+
+  it.each(["concurrency", "release", "stale"] as const)(
+    "%s setup does not roll back when BEGIN rejects",
+    async (setupKind) => {
+      const fake = createReservationSetupTransactionFake({
+        rejectAtQueryOrdinal: 1,
+      });
+      const result = await runReservationSetupTransactionProbeForTests({
+        setupKind,
+        client: fake.client,
+        deadlineLimits: testReservationSetupDeadlineLimits,
+      });
+
+      expect(result.completed).toBe(false);
+      expect(fake.state.calls).toHaveLength(1);
+      expect(fake.state.rollbackAttemptCount).toBe(0);
+      expect(fake.state.commitAttemptCount).toBe(0);
+      expect(fake.state.committedEffects).toHaveLength(0);
+      expect(fake.state.endCount).toBe(1);
+      expect(result.continuationStartCount).toBe(0);
+    }
+  );
+
+  it.each([
+    ["concurrency", 4],
+    ["release", 4],
+    ["stale", 5],
+  ] as const)(
+    "%s setup rolls back when COMMIT rejects",
+    async (setupKind, commitQueryOrdinal) => {
+      const fake = createReservationSetupTransactionFake({
+        rejectAtQueryOrdinal: commitQueryOrdinal,
+      });
+      const result = await runReservationSetupTransactionProbeForTests({
+        setupKind,
+        client: fake.client,
+        deadlineLimits: testReservationSetupDeadlineLimits,
+      });
+
+      expect(result.completed).toBe(false);
+      expect(fake.state.calls).toHaveLength(commitQueryOrdinal + 1);
+      expect(
+        normalizeTestSqlBoundary(fake.state.calls.at(-1)?.statement ?? "") ===
+          "ROLLBACK" &&
+          fake.state.calls.at(-1)?.argumentCount === 1 &&
+          fake.state.calls.at(-1)?.values === undefined
+      ).toBe(true);
+      expect(fake.state.commitAttemptCount).toBe(1);
+      expect(fake.state.commitSuccessCount).toBe(0);
+      expect(fake.state.rollbackAttemptCount).toBe(1);
+      expect(fake.state.rollbackSuccessCount).toBe(1);
+      expect(fake.state.committedEffects).toHaveLength(0);
+      expect(fake.state.stagedEffects).toHaveLength(0);
+      expect(fake.state.endCount).toBe(1);
+      expect(result.continuationStartCount).toBe(0);
+    }
+  );
+
+  it.each(["concurrency", "release", "stale"] as const)(
+    "%s setup preserves its DML primary when ROLLBACK rejects",
+    async (setupKind) => {
+      const fake = createReservationSetupTransactionFake({
+        rejectAtQueryOrdinal: 2,
+        rejectRollback: true,
+      });
+      const result = await runReservationSetupTransactionProbeForTests({
+        setupKind,
+        client: fake.client,
+        deadlineLimits: testReservationSetupDeadlineLimits,
+      });
+
+      expect(result.completed).toBe(false);
+      expect(result.failureMarker).toBe(
+        testReservationSetupTransactionContracts[setupKind].phaseMarker
+      );
+      expect(fake.state.rollbackAttemptCount).toBe(1);
+      expect(fake.state.rollbackSuccessCount).toBe(0);
+      expect(fake.state.commitAttemptCount).toBe(0);
+      expect(fake.state.committedEffects).toHaveLength(0);
+      expect(fake.state.endCount).toBe(1);
+      expect(result.continuationStartCount).toBe(0);
+      if (setupKind === "concurrency") {
+        expect(testReservationSetupOutputLines(result.output)).toEqual([
+          testReservationSetupDiagnosticVersion,
+          testReservationSetupPrimaryMarkers.queryRejected,
+          testReservationSetupGenericMarker,
+        ]);
+      }
+    }
+  );
+
+  it.each(["concurrency", "release", "stale"] as const)(
+    "%s setup timeout destroys only its owned Client and starts no ROLLBACK",
+    async (setupKind) => {
+      const beforeUnhandled = process.listenerCount("unhandledRejection");
+      const fake = createReservationSetupTransactionFake({
+        hangAtQueryOrdinal: 2,
+        lateRejectDelayMilliseconds: 40,
+      });
+      const result = await runReservationSetupTransactionProbeForTests({
+        setupKind,
+        client: fake.client,
+        deadlineLimits: {
+          ...testReservationSetupDeadlineLimits,
+          queryMilliseconds: 5,
+        },
+      });
+      await new Promise((resolveWait) => setTimeout(resolveWait, 55));
+
+      expect(result.completed).toBe(false);
+      expect(result.timedOut).toBe(true);
+      expect(result.clientDestroyed).toBe(true);
+      expect(result.destroyCount).toBe(1);
+      expect(result.activeClientCount).toBe(0);
+      expect(fake.state.calls).toHaveLength(2);
+      expect(fake.state.rollbackAttemptCount).toBe(0);
+      expect(fake.state.commitAttemptCount).toBe(0);
+      expect(fake.state.endCount).toBe(0);
+      expect(fake.state.destroyCount).toBe(1);
+      expect(result.continuationStartCount).toBe(0);
+      expect(process.listenerCount("unhandledRejection")).toBe(beforeUnhandled);
+      if (setupKind === "concurrency") {
+        expect(testReservationSetupOutputLines(result.output)).toEqual([
+          testReservationSetupDiagnosticVersion,
+          testReservationSetupPrimaryMarkers.queryTimeout,
+          testReservationSetupGenericMarker,
+        ]);
+      }
+      expect(reservationSetupProbeIsPublicSafe(result)).toBe(true);
+    }
+  );
+
+  it("preserves the DML primary when its bounded ROLLBACK times out", async () => {
+    const fake = createReservationSetupTransactionFake({
+      rejectAtQueryOrdinal: 2,
+      hangRollback: true,
+      lateRejectDelayMilliseconds: 40,
+    });
+    const result = await runReservationSetupTransactionProbeForTests({
+      setupKind: "concurrency",
+      client: fake.client,
+      deadlineLimits: {
+        ...testReservationSetupDeadlineLimits,
+        queryMilliseconds: 5,
+      },
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 55));
+
+    expect(result.completed).toBe(false);
+    expect(result.timedOut).toBe(true);
+    expect(result.destroyCount).toBe(1);
+    expect(fake.state.rollbackAttemptCount).toBe(1);
+    expect(fake.state.rollbackSuccessCount).toBe(0);
+    expect(fake.state.commitAttemptCount).toBe(0);
+    expect(fake.state.endCount).toBe(0);
+    expect(testReservationSetupOutputLines(result.output)).toEqual([
+      testReservationSetupDiagnosticVersion,
+      testReservationSetupPrimaryMarkers.queryRejected,
+      testReservationSetupGenericMarker,
+    ]);
+  });
+
+  it.each([
+    "ROLLBACK rejection",
+    "ROLLBACK timeout",
+    "close rejection",
+  ] as const)(
+    "preserves the exact original primary reference over %s",
+    async (scenario) => {
+      const rollbackTimeout = scenario === "ROLLBACK timeout";
+      const fake = createReservationSetupTransactionFake({
+        rejectAtQueryOrdinal: 2,
+        rejectRollback: scenario === "ROLLBACK rejection",
+        hangRollback: rollbackTimeout,
+        lateRejectDelayMilliseconds: rollbackTimeout ? 40 : undefined,
+        rejectEnd: scenario === "close rejection",
+      });
+      const result =
+        await runReservationSetupTransactionPrimaryProbeForTests({
+          setupKind: "concurrency",
+          client: fake.client,
+          deadlineLimits: {
+            ...testReservationSetupDeadlineLimits,
+            queryMilliseconds: rollbackTimeout ? 5 : 25,
+          },
+          isExpectedPrimaryFailure: (failure: unknown) =>
+            failure === fake.primaryFailure,
+        });
+      if (rollbackTimeout) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 55));
+      }
+
+      expect(result.completed).toBe(false);
+      expect(result.operationStarts).toMatchObject({
+        connect: 1,
+        query: 3,
+        close: rollbackTimeout ? 0 : 1,
+      });
+      expect(fake.state.calls).toHaveLength(3);
+      expect(fake.state.rollbackAttemptCount).toBe(1);
+      expect(fake.state.endCount).toBe(rollbackTimeout ? 0 : 1);
+      expect(result.failureClassification).toBe("EXPECTED_PRIMARY");
+      expect(result.primaryFailurePreserved).toBe(true);
+      expect(result.activeClientCount).toBe(0);
+      expect(result.ownedClientCount).toBe(1);
+      expect(result.timedOut).toBe(rollbackTimeout);
+      expect(result.destroyCount).toBe(rollbackTimeout ? 1 : 0);
+      expect(fake.state.commitAttemptCount).toBe(0);
+      expect(fake.state.committedEffects).toHaveLength(0);
+      expect(reservationSetupProbeIsPublicSafe(result)).toBe(true);
+    }
+  );
+
+  it("removes the bounded timeout timer and handles the late query rejection", async () => {
+    const unhandled: unknown[] = [];
+    const unhandledListener = (error: unknown) => unhandled.push(error);
+    process.on("unhandledRejection", unhandledListener);
+    vi.useFakeTimers();
+    try {
+      const fake = createReservationSetupTransactionFake({
+        hangAtQueryOrdinal: 2,
+        lateRejectDelayMilliseconds: 40,
+      });
+      const resultPromise = runReservationSetupTransactionProbeForTests({
+        setupKind: "release",
+        client: fake.client,
+        deadlineLimits: {
+          ...testReservationSetupDeadlineLimits,
+          queryMilliseconds: 5,
+        },
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      const result = await resultPromise;
+      await vi.advanceTimersByTimeAsync(40);
+
+      expect(result.timedOut).toBe(true);
+      expect(result.destroyCount).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(unhandled.length).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      process.off("unhandledRejection", unhandledListener);
+    }
+  });
+
+  it("preserves the DML primary over close rejection after rollback", async () => {
+    const fake = createReservationSetupTransactionFake({
+      rejectAtQueryOrdinal: 2,
+      rejectEnd: true,
+    });
+    const result = await runReservationSetupTransactionProbeForTests({
+      setupKind: "concurrency",
+      client: fake.client,
+      deadlineLimits: testReservationSetupDeadlineLimits,
+    });
+
+    expect(result.completed).toBe(false);
+    expect(fake.state.rollbackSuccessCount).toBe(1);
+    expect(fake.state.endCount).toBe(1);
+    expect(testReservationSetupOutputLines(result.output)).toEqual([
+      testReservationSetupDiagnosticVersion,
+      testReservationSetupPrimaryMarkers.queryRejected,
+      testReservationSetupGenericMarker,
+    ]);
+  });
+
+  it("does not report setup success when close rejects after COMMIT", async () => {
+    const fake = createReservationSetupTransactionFake({ rejectEnd: true });
+    const result = await runReservationSetupTransactionProbeForTests({
+      setupKind: "stale",
+      client: fake.client,
+      deadlineLimits: testReservationSetupDeadlineLimits,
+    });
+
+    expect(result.completed).toBe(false);
+    expect(result.continuationStartCount).toBe(0);
+    expect(fake.state.commitSuccessCount).toBe(1);
+    expect(fake.state.committedEffects).toHaveLength(3);
+    expect(fake.state.rollbackAttemptCount).toBe(0);
+    expect(fake.state.endCount).toBe(1);
+    expect(result.failureMarker).toBe(
+      testReservationSetupTransactionContracts.stale.phaseMarker
+    );
+    expect(reservationSetupProbeIsPublicSafe(result)).toBe(true);
+  });
+
+  it("binds all three production setup phases to the tested transaction path", async () => {
+    const source = await readFile(postgresHarnessModule, "utf8");
+    const transactionSource = sourceSection(
+      source,
+      "async function executeReservationSetupTransaction(",
+      "async function runReservationConcurrencySetup("
+    );
+    const setupSource = sourceSection(
+      source,
+      "async function runReservationConcurrencySetup(",
+      "async function verifyTransactionRollback("
+    );
+    const lifecycleSource = sourceSection(
+      source,
+      "async function verifyReservationLifecycle(",
+      "async function verifyTransactionRollback("
+    );
+
+    expect(literalOccurrenceCount(setupSource, "executeReservationSetupTransaction(")).toBe(
+      3
+    );
+    expect(literalOccurrenceCount(transactionSource, "withClient(")).toBe(1);
+    expect(literalOccurrenceCount(transactionSource, 'client.query("BEGIN")')).toBe(1);
+    expect(literalOccurrenceCount(transactionSource, 'client.query("COMMIT")')).toBe(1);
+    expect(literalOccurrenceCount(transactionSource, 'client.query("ROLLBACK")')).toBe(1);
+    expect(transactionSource).toContain(
+      "reservationSetupTransactionCanRollback(context, ownedClient)"
+    );
+    expect(transactionSource).toMatch(
+      /catch \(primaryFailure\)[\s\S]+catch \{[\s\S]+throw primaryFailure;/u
+    );
+    expect(literalOccurrenceCount(setupSource, "runMigrationReservationConcurrencySetupPhase(")).toBe(
+      1
+    );
+    expect(literalOccurrenceCount(setupSource, "runMigrationReservationReleaseSetupPhase(")).toBe(
+      1
+    );
+    expect(literalOccurrenceCount(setupSource, "runMigrationReservationStaleSetupPhase(")).toBe(
+      1
+    );
+    expect(literalOccurrenceCount(lifecycleSource, "runReservationConcurrencySetup(")).toBe(
+      1
+    );
+    expect(literalOccurrenceCount(lifecycleSource, "runReservationReleaseSetup(")).toBe(1);
+    expect(literalOccurrenceCount(lifecycleSource, "runReservationStaleSetup(")).toBe(1);
+    expect(lifecycleSource).toMatch(
+      /await runReservationConcurrencySetup\(context, clientFactory, configuration\);\s*await runMigrationReservationConcurrentLimitPhase\(/u
+    );
+    expect(lifecycleSource).toMatch(
+      /await runReservationReleaseSetup\(context, clientFactory, configuration\);\s*const reservationId = await runMigrationReservationReleaseCreatePhase\(/u
+    );
+    expect(lifecycleSource).toMatch(
+      /await runReservationStaleSetup\(context, clientFactory, configuration\);\s*await runMigrationReservationStaleRecoveryPhase\(/u
+    );
+    expect(lifecycleSource).not.toContain("VALUES ($1, 'active', 1);");
+  });
+});
+
 describe("reservation concurrency setup observability", () => {
   it.each([
     ["factory-throw", testReservationSetupPrimaryMarkers.factoryThrow, 0, 0, 0],
@@ -8013,6 +8836,8 @@ describe("connection-only external fixture boundary", () => {
         "runOwnershipCanonicalizationProbeForTests",
         "runReservationConcurrencySetupDiagnosticOutputProbeForTests",
         "runReservationConcurrencySetupObservabilityProbeForTests",
+        "runReservationSetupTransactionPrimaryProbeForTests",
+        "runReservationSetupTransactionProbeForTests",
         "runUsageBodyAclBoundaryProbeForTests",
         "runUsageBodyAclOwnerOracleProbeForTests",
         "validateExternalFixtureConfigurationForTests",
@@ -11946,7 +12771,7 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
 
     const reservationSubphaseSection = sourceSection(
       productionSource,
-      "async function verifyReservationLifecycle(",
+      "async function runReservationConcurrencySetup(",
       "async function verifyTransactionRollback("
     );
     for (const wrapper of [

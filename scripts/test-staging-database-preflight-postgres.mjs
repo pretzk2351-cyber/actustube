@@ -6872,6 +6872,139 @@ async function executeFixtureQuery(
   );
 }
 
+const RESERVATION_SETUP_KINDS = Object.freeze({
+  concurrency: "concurrency",
+  release: "release",
+  stale: "stale",
+});
+
+const RESERVATION_SETUP_FIXTURE_USERS = Object.freeze({
+  [RESERVATION_SETUP_KINDS.concurrency]:
+    "40000000-0000-4000-8000-000000000001",
+  [RESERVATION_SETUP_KINDS.release]: "40000000-0000-4000-8000-000000000002",
+  [RESERVATION_SETUP_KINDS.stale]: "40000000-0000-4000-8000-000000000003",
+});
+
+const RESERVATION_SETUP_USER_INSERT = `INSERT INTO public.users (
+  id, status, session_version
+) VALUES ($1, 'active', 1)`;
+
+const RESERVATION_SETUP_PLAN_INSERT = `INSERT INTO public.user_plan_assignments (
+  user_id, plan_code, status, source, starts_at
+) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`;
+
+const RESERVATION_SETUP_STALE_RESERVATION = `SELECT reservation_id
+FROM public.reserve_usage_limits_v2(
+  $1::uuid, 1, 'channel_analysis'::public.usage_metric,
+  '2026-09-01T12:00:00Z'::timestamptz
+)`;
+
+function reservationSetupStatements(setupKind) {
+  requireHarness(
+    Object.values(RESERVATION_SETUP_KINDS).includes(setupKind),
+    "EXTERNAL_FIXTURE_RESERVATION_SETUP_KIND_INVALID"
+  );
+  return setupKind === RESERVATION_SETUP_KINDS.stale
+    ? Object.freeze([
+        RESERVATION_SETUP_USER_INSERT,
+        RESERVATION_SETUP_PLAN_INSERT,
+        RESERVATION_SETUP_STALE_RESERVATION,
+      ])
+    : Object.freeze([
+        RESERVATION_SETUP_USER_INSERT,
+        RESERVATION_SETUP_PLAN_INSERT,
+      ]);
+}
+
+function reservationSetupTransactionCanRollback(context, ownedClient) {
+  return (
+    !context.timedOut &&
+    remainingTotalMilliseconds(context) > 0 &&
+    ownedClient.usable &&
+    !ownedClient.destroyed &&
+    !ownedClient.closed &&
+    context.activeClients.has(ownedClient)
+  );
+}
+
+async function executeReservationSetupTransaction(
+  context,
+  clientFactory,
+  configuration,
+  setupKind
+) {
+  const statements = reservationSetupStatements(setupKind);
+  const fixtureUser = RESERVATION_SETUP_FIXTURE_USERS[setupKind];
+  return await withClient(
+    context,
+    clientFactory,
+    fixtureCredentials(configuration),
+    async (client, ownedClient) => {
+      let transactionStarted = false;
+      let transactionCommitted = false;
+      try {
+        await client.query("BEGIN");
+        transactionStarted = true;
+        for (const statement of statements) {
+          await client.query(statement, [fixtureUser]);
+        }
+        await client.query("COMMIT");
+        transactionCommitted = true;
+      } catch (primaryFailure) {
+        if (
+          transactionStarted &&
+          !transactionCommitted &&
+          reservationSetupTransactionCanRollback(context, ownedClient)
+        ) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {
+            // Preserve the original setup failure; the bounded query path owns cleanup.
+          }
+        }
+        throw primaryFailure;
+      }
+    }
+  );
+}
+
+async function runReservationConcurrencySetup(
+  context,
+  clientFactory,
+  configuration
+) {
+  return await runMigrationReservationConcurrencySetupPhase(context, () =>
+    executeReservationSetupTransaction(
+      context,
+      clientFactory,
+      configuration,
+      RESERVATION_SETUP_KINDS.concurrency
+    )
+  );
+}
+
+async function runReservationReleaseSetup(context, clientFactory, configuration) {
+  return await runMigrationReservationReleaseSetupPhase(context, () =>
+    executeReservationSetupTransaction(
+      context,
+      clientFactory,
+      configuration,
+      RESERVATION_SETUP_KINDS.release
+    )
+  );
+}
+
+async function runReservationStaleSetup(context, clientFactory, configuration) {
+  return await runMigrationReservationStaleSetupPhase(context, () =>
+    executeReservationSetupTransaction(
+      context,
+      clientFactory,
+      configuration,
+      RESERVATION_SETUP_KINDS.stale
+    )
+  );
+}
+
 async function fixtureScalar(
   context,
   clientFactory,
@@ -6890,20 +7023,9 @@ async function fixtureScalar(
 }
 
 async function verifyReservationLifecycle(context, clientFactory, configuration) {
-  const concurrentUser = "40000000-0000-4000-8000-000000000001";
-  await runMigrationReservationConcurrencySetupPhase(context, () =>
-    executeFixtureQuery(
-      context,
-      clientFactory,
-      configuration,
-      `INSERT INTO public.users (id, status, session_version)
-       VALUES ($1, 'active', 1);
-       INSERT INTO public.user_plan_assignments (
-         user_id, plan_code, status, source, starts_at
-       ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
-      [concurrentUser]
-    )
-  );
+  const concurrentUser =
+    RESERVATION_SETUP_FIXTURE_USERS[RESERVATION_SETUP_KINDS.concurrency];
+  await runReservationConcurrencySetup(context, clientFactory, configuration);
   await runMigrationReservationConcurrentLimitPhase(context, async () => {
     const concurrent = await Promise.all(
       Array.from({ length: 10 }, () =>
@@ -6952,20 +7074,9 @@ async function verifyReservationLifecycle(context, clientFactory, configuration)
     )
   );
 
-  const releaseUser = "40000000-0000-4000-8000-000000000002";
-  await runMigrationReservationReleaseSetupPhase(context, () =>
-    executeFixtureQuery(
-      context,
-      clientFactory,
-      configuration,
-      `INSERT INTO public.users (id, status, session_version)
-       VALUES ($1, 'active', 1);
-       INSERT INTO public.user_plan_assignments (
-         user_id, plan_code, status, source, starts_at
-       ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z')`,
-      [releaseUser]
-    )
-  );
+  const releaseUser =
+    RESERVATION_SETUP_FIXTURE_USERS[RESERVATION_SETUP_KINDS.release];
+  await runReservationReleaseSetup(context, clientFactory, configuration);
   const reservationId = await runMigrationReservationReleaseCreatePhase(
     context,
     async () => {
@@ -7028,24 +7139,9 @@ async function verifyReservationLifecycle(context, clientFactory, configuration)
     );
   });
 
-  const staleUser = "40000000-0000-4000-8000-000000000003";
-  await runMigrationReservationStaleSetupPhase(context, () =>
-    executeFixtureQuery(
-      context,
-      clientFactory,
-      configuration,
-      `INSERT INTO public.users (id, status, session_version)
-       VALUES ($1, 'active', 1);
-       INSERT INTO public.user_plan_assignments (
-         user_id, plan_code, status, source, starts_at
-       ) VALUES ($1, 'free', 'active', 'system', '2026-01-01T00:00:00Z');
-       SELECT reservation_id FROM public.reserve_usage_limits_v2(
-         $1::uuid, 1, 'channel_analysis'::public.usage_metric,
-         '2026-09-01T12:00:00Z'::timestamptz
-       )`,
-      [staleUser]
-    )
-  );
+  const staleUser =
+    RESERVATION_SETUP_FIXTURE_USERS[RESERVATION_SETUP_KINDS.stale];
+  await runReservationStaleSetup(context, clientFactory, configuration);
   await runMigrationReservationStaleRecoveryPhase(context, async () => {
     const recoveries = await Promise.all(
       Array.from({ length: 2 }, () =>
@@ -7391,6 +7487,138 @@ export async function runReservationConcurrencySetupObservabilityProbeForTests(
     timedOut: context.timedOut,
     activeClientCount: context.activeClients.size,
     trackerResidue: RESERVATION_SETUP_TRACKERS.has(context),
+  });
+}
+
+const RESERVATION_SETUP_TRANSACTION_PROBE_OPERATIONS = Object.freeze({
+  [RESERVATION_SETUP_KINDS.concurrency]: runReservationConcurrencySetup,
+  [RESERVATION_SETUP_KINDS.release]: runReservationReleaseSetup,
+  [RESERVATION_SETUP_KINDS.stale]: runReservationStaleSetup,
+});
+
+export async function runReservationSetupTransactionProbeForTests(options) {
+  requireHarness(
+    exactOwnKeys(options, ["setupKind", "client", "deadlineLimits"]) &&
+      Object.prototype.hasOwnProperty.call(
+        RESERVATION_SETUP_TRANSACTION_PROBE_OPERATIONS,
+        options.setupKind
+      ),
+    "EXTERNAL_FIXTURE_RESERVATION_SETUP_TRANSACTION_PROBE_INVALID"
+  );
+  const context = createDeadlineContext(options.deadlineLimits);
+  const operation = RESERVATION_SETUP_TRANSACTION_PROBE_OPERATIONS[options.setupKind];
+  const configuration = Object.freeze({
+    host: "127.0.0.1",
+    port: 5432,
+    database: "actustube_ci_fixture",
+    role: "actustube_ci_fixture",
+    password: "fixed_test_only_password",
+  });
+  let factoryCount = 0;
+  const clientFactory = () => {
+    factoryCount += 1;
+    return options.client;
+  };
+  let failure = null;
+  let completed = false;
+  let continuationStartCount = 0;
+  EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.add(context);
+  try {
+    await Reflect.apply(operation, undefined, [
+      context,
+      clientFactory,
+      configuration,
+    ]);
+    completed = true;
+    continuationStartCount += 1;
+  } catch (error) {
+    failure = error;
+  } finally {
+    EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.delete(context);
+  }
+  const ownedClient = [...context.ownedClients][0];
+  return Object.freeze({
+    completed,
+    output: failure === null ? "" : externalFixtureFailureOutput(failure),
+    failureMarker:
+      failure === null ? null : externalFixtureFailureMarker(failure),
+    factoryCount,
+    continuationStartCount,
+    operationStarts: Object.freeze({ ...context.operationStarts }),
+    timedOut: context.timedOut,
+    activeClientCount: context.activeClients.size,
+    ownedClientCount: context.ownedClients.size,
+    clientClosed: ownedClient?.closed === true,
+    clientDestroyed: ownedClient?.destroyed === true,
+    destroyCount: ownedClient?.destroyCount ?? 0,
+    trackerResidue: RESERVATION_SETUP_TRACKERS.has(context),
+  });
+}
+
+export async function runReservationSetupTransactionPrimaryProbeForTests(options) {
+  requireHarness(
+    exactOwnKeys(options, [
+      "setupKind",
+      "client",
+      "deadlineLimits",
+      "isExpectedPrimaryFailure",
+    ]) &&
+      typeof options.isExpectedPrimaryFailure === "function" &&
+      Object.prototype.hasOwnProperty.call(
+        RESERVATION_SETUP_TRANSACTION_PROBE_OPERATIONS,
+        options.setupKind
+      ),
+    "EXTERNAL_FIXTURE_RESERVATION_SETUP_TRANSACTION_PROBE_INVALID"
+  );
+  const context = createDeadlineContext(options.deadlineLimits);
+  const configuration = Object.freeze({
+    host: "127.0.0.1",
+    port: 5432,
+    database: "actustube_ci_fixture",
+    role: "actustube_ci_fixture",
+    password: "fixed_test_only_password",
+  });
+  let failure = null;
+  let failed = false;
+  try {
+    await Reflect.apply(executeReservationSetupTransaction, undefined, [
+      context,
+      () => options.client,
+      configuration,
+      options.setupKind,
+    ]);
+  } catch (error) {
+    failed = true;
+    failure = error;
+  }
+  const ownedClient = [...context.ownedClients][0];
+  let primaryFailurePreserved = false;
+  if (failed) {
+    try {
+      primaryFailurePreserved = options.isExpectedPrimaryFailure(failure) === true;
+    } catch {
+      primaryFailurePreserved = false;
+    }
+  }
+  return Object.freeze({
+    completed: !failed,
+    primaryFailurePreserved,
+    failureClassification: primaryFailurePreserved
+      ? "EXPECTED_PRIMARY"
+      : EXTERNAL_FIXTURE_PHASE_FAILURES.has(failure)
+        ? "PHASE_FAILURE"
+        : failure instanceof HarnessIssue
+          ? "HARNESS_FAILURE"
+          : failed
+            ? "OTHER_FAILURE"
+            : "NO_FAILURE",
+    timedOut: context.timedOut,
+    activeClientCount: context.activeClients.size,
+    ownedClientCount: context.ownedClients.size,
+    clientClosed: ownedClient?.closed === true,
+    clientDestroyed: ownedClient?.destroyed === true,
+    destroyCount: ownedClient?.destroyCount ?? 0,
+    operationStarts: Object.freeze({ ...context.operationStarts }),
   });
 }
 
