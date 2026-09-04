@@ -699,7 +699,6 @@ describe("test network guard occurrence markers", () => {
     const posixSocket = "/tmp/actustube-local.sock";
     const child = runGuardedDnsChild(
       `
-        const net = process.getBuiltinModule("net");
         const guard = require(${JSON.stringify(preloadPath)});
         const localPipe = ${JSON.stringify(localPipe)};
         const remoteTargets = [
@@ -748,11 +747,18 @@ describe("test network guard occurrence markers", () => {
           "NON_LOOPBACK_TCP_REJECTED",
           { platform: "win32", reject: (code) => { throw new Error(code); } }
         );
-        let actualGuardCode = null;
+        let markerWritingOriginalCalls = 0;
+        let markerWritingGuardCode = null;
         try {
-          net.Socket.prototype.connect.call({}, ${JSON.stringify(remotePipe)});
+          guard.invokeGuardedConnection(
+            () => { markerWritingOriginalCalls += 1; },
+            null,
+            [${JSON.stringify(remotePipe)}],
+            "NON_LOOPBACK_TCP_REJECTED",
+            { platform: "win32" }
+          );
         } catch (error) {
-          actualGuardCode = error?.message;
+          markerWritingGuardCode = error?.message;
         }
         console.log(JSON.stringify({
           localPipe: guard.connectionTarget([localPipe], "win32"),
@@ -765,7 +771,8 @@ describe("test network guard occurrence markers", () => {
           remoteOriginalCalls,
           localOriginalCalls,
           remoteCodes,
-          actualGuardCode,
+          markerWritingOriginalCalls,
+          markerWritingGuardCode,
         }));
       `,
       {}
@@ -792,7 +799,8 @@ describe("test network guard occurrence markers", () => {
     expect(result.remoteCodes).toEqual(
       Array(4).fill("REMOTE_NAMED_PIPE_REJECTED")
     );
-    expect(result.actualGuardCode).toBe("REMOTE_NAMED_PIPE_REJECTED");
+    expect(result.markerWritingOriginalCalls).toBe(0);
+    expect(result.markerWritingGuardCode).toBe("REMOTE_NAMED_PIPE_REJECTED");
     expect(child.unexpectedViolationMarkers).toHaveLength(1);
     expect(child.unexpectedViolationMarkers[0].role).toBe("network_violation");
   });
