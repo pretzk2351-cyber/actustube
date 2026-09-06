@@ -1,12 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 
 import {
   useAppWorkspace,
   type WorkspaceConsultResult,
-  type WorkspaceVideo,
 } from "@/app/components/app-workspace-provider";
 import { BETA_ONBOARDING_DISMISSED_KEY, BetaOnboardingGuide } from "@/app/components/beta-onboarding-guide";
 import { SignOutButton } from "@/app/components/auth-buttons";
@@ -15,11 +14,7 @@ import { WeeklyImprovementCycle } from "@/app/components/weekly-improvement-cycl
 import { averageViews, buildWorkspaceAISummary } from "@/app/lib/analysis-summary";
 import {
   canRequestAIConsult,
-  evaluateChannelAnalysisResponse,
-  getSafeClientApiErrorFeedback,
-  getSafeClientNetworkErrorFeedback,
   hasUsageRemaining,
-  type ClientErrorFeedback,
 } from "@/app/lib/youtube-form-flow";
 
 function PageHeader({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) {
@@ -61,60 +56,23 @@ export function DashboardView() {
 }
 
 export function AnalysisView() {
-  const { usageStatus, usageLoading, usageError, ownedChannels, channelsLoading, channelsError, selectedOwnedChannelId, setSelectedOwnedChannelId, refreshUsage, refreshHistory, history, historyLoading, historyError, analysisResult, setAnalysisResult, setConsultResult, activeWriteAction, beginWriteAction, endWriteAction } = useAppWorkspace();
-  const [loading, setLoading] = useState(false);
-  const [progress, setProgress] = useState<"idle" | "requesting" | "applying" | "complete">("idle");
-  const [emptyChannel, setEmptyChannel] = useState("");
-  const [error, setError] = useState<ClientErrorFeedback | null>(null);
-  const inFlight = useRef(false);
+  const { usageStatus, usageLoading, usageError, ownedChannels, channelsLoading, channelsError, selectedOwnedChannelId, setSelectedOwnedChannelId, history, historyLoading, historyError, analysisResult, activeWriteAction, analysisOperation, analyze } = useAppWorkspace();
+  const loading = activeWriteAction === "analysis";
+  const { status: progress, emptyChannel, error, refreshError } = analysisOperation;
   const selected = ownedChannels.find((channel) => channel.id === selectedOwnedChannelId);
-  const canAnalyze = Boolean(selected && usageStatus && hasUsageRemaining(usageStatus.usage.channelAnalysis) && !loading && activeWriteAction === null);
-
-  async function analyze() {
-    if (inFlight.current || !selectedOwnedChannelId || !usageStatus || !beginWriteAction("analysis")) return;
-    inFlight.current = true;
-    setLoading(true);
-    setProgress("requesting");
-    setError(null);
-    setEmptyChannel("");
-    setAnalysisResult(null);
-    setConsultResult(null);
-    try {
-      const response = await fetch(`/api/youtube/channel?channelId=${encodeURIComponent(selectedOwnedChannelId)}`);
-      const data: unknown = await response.json().catch(() => null);
-      const decision = evaluateChannelAnalysisResponse(response.status, data);
-      if (!decision.accepted) {
-        if (decision.kind === "empty") setEmptyChannel(decision.empty.channelTitle.trim());
-        else setError(decision.feedback);
-        if (decision.kind === "empty" || decision.feedback.requiresUsageRefresh) await refreshUsage();
-        setProgress("idle");
-        return;
-      }
-      setProgress("applying");
-      setAnalysisResult({ analysisRunId: decision.analysis.analysisRunId, channelId: decision.analysis.channelId, channelTitle: decision.analysis.channelTitle.trim(), regularVideos: (decision.analysis.regularVideos ?? []) as WorkspaceVideo[], shortVideos: (decision.analysis.shortVideos ?? []) as WorkspaceVideo[] });
-      await Promise.all([refreshUsage(), refreshHistory()]);
-      setProgress("complete");
-    } catch (caught) {
-      const refreshed = await refreshUsage();
-      setError(getSafeClientNetworkErrorFeedback(caught instanceof DOMException && (caught.name === "AbortError" || caught.name === "TimeoutError") ? "timeout" : "network", refreshed !== null));
-      setProgress("idle");
-    } finally {
-      inFlight.current = false;
-      endWriteAction("analysis");
-      setLoading(false);
-    }
-  }
+  const canAnalyze = Boolean(selected && usageStatus && !usageLoading && hasUsageRemaining(usageStatus.usage.channelAnalysis) && activeWriteAction === null);
 
   return <div className="workspace-page"><PageHeader eyebrow="ANALYZE" title="動画分析" description="所有チャンネルの通常動画とShortsを分けて取得し、実績を確認します。" />
     <BetaOnboardingGuide analysisHistoryCount={!historyLoading && !historyError ? history?.items.length ?? 0 : null} />
-    {!analysisResult && !loading && !error && !emptyChannel && <StatusPanel tone="info" title="分析前です">所有チャンネルを確認し、「動画を分析」を押した後に動画取得が始まります。通常動画とShortsを分けて処理します。</StatusPanel>}
-    <section className="workspace-card"><div className="workspace-form-row"><label htmlFor="owned-channel">所有チャンネル</label>{channelsLoading ? <span>確認中…</span> : channelsError ? <StatusPanel tone="error" title="チャンネルを取得できません">{channelsError}</StatusPanel> : ownedChannels.length === 0 ? <StatusPanel tone="empty" title="所有チャンネルが見つかりません" /> : <select id="owned-channel" value={selectedOwnedChannelId} disabled={loading || activeWriteAction !== null} onChange={(event) => { if (activeWriteAction !== null) return; setSelectedOwnedChannelId(event.target.value); setAnalysisResult(null); setConsultResult(null); setEmptyChannel(""); setError(null); setProgress("idle"); }}><option value="">選択してください</option>{ownedChannels.map((channel) => <option key={channel.id} value={channel.id}>{channel.title}</option>)}</select>}</div>
+    {!analysisResult && !loading && !error && emptyChannel === null && <StatusPanel tone="info" title="分析前です">所有チャンネルを確認し、「動画を分析」を押した後に動画取得が始まります。通常動画とShortsを分けて処理します。</StatusPanel>}
+    <section className="workspace-card"><div className="workspace-form-row"><label htmlFor="owned-channel">所有チャンネル</label>{channelsLoading ? <span>確認中…</span> : channelsError ? <StatusPanel tone="error" title="チャンネルを取得できません">{channelsError}</StatusPanel> : ownedChannels.length === 0 ? <StatusPanel tone="empty" title="所有チャンネルが見つかりません" /> : <select id="owned-channel" value={selectedOwnedChannelId} disabled={loading || activeWriteAction !== null} onChange={(event) => setSelectedOwnedChannelId(event.target.value)}><option value="">選択してください</option>{ownedChannels.map((channel) => <option key={channel.id} value={channel.id}>{channel.title}</option>)}</select>}</div>
       {usageLoading ? <StatusPanel tone="loading" title="利用枠を確認しています" /> : usageError ? <StatusPanel tone="error" title="利用枠を確認できません">{usageError}</StatusPanel> : usageStatus && <p className="workspace-inline-note">分析枠：本日残り {usageStatus.usage.channelAnalysis.daily.remaining} 回／今月残り {usageStatus.usage.channelAnalysis.monthly.remaining} 回<br />1回の処理上限：通常動画 {usageStatus.plan.regularVideoLimit}本／Shorts {usageStatus.plan.shortsVideoLimit}本</p>}
       <button type="button" className="workspace-button workspace-button--primary" disabled={!canAnalyze} aria-busy={loading} onClick={analyze}>{loading ? "分析しています…" : "動画を分析"}</button>
     </section>
     {loading && <StatusPanel tone="loading" title={progress === "applying" ? "結果を反映しています" : "動画の取得と分析を行っています"}>完了までこのページでお待ちください。割合は推測表示しません。</StatusPanel>}
     {error && <StatusPanel tone="error" title={error.title}>{error.message}</StatusPanel>}
-    {emptyChannel && <StatusPanel tone="empty" title="分析できる動画がありません">{emptyChannel}には、現在取得できる通常動画またはShortsがありません。利用枠と履歴は消費されません。YouTubeへ動画を投稿し、YouTube側の処理完了後にもう一度分析してください。</StatusPanel>}
+    {emptyChannel !== null && <StatusPanel tone="empty" title="分析できる動画がありません">{emptyChannel}には、現在取得できる通常動画またはShortsがありません。利用枠と履歴は消費されません。YouTubeへ動画を投稿し、YouTube側の処理完了後にもう一度分析してください。</StatusPanel>}
+    {refreshError && <StatusPanel tone="error" title="表示の更新を確認してください">{refreshError}</StatusPanel>}
     {analysisResult && <AnalysisResults />}
   </div>;
 }
@@ -128,34 +86,14 @@ function AnalysisResults() {
   </section>;
 }
 
-function isConsultResult(value: unknown): value is WorkspaceConsultResult {
-  if (typeof value !== "object" || value === null) return false;
-  const candidate = value as Partial<WorkspaceConsultResult>;
-  return typeof candidate.overallDiagnosis === "string" && [candidate.strongPoints, candidate.weakPoints, candidate.currentImprovements, candidate.nextSuggestions].every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"));
-}
-
 export function ConsultView() {
-  const { analysisResult, consultResult, setConsultResult, usageStatus, usageLoading, usageError, refreshUsage, refreshHistory, activeWriteAction, beginWriteAction, endWriteAction } = useAppWorkspace();
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<ClientErrorFeedback | null>(null);
-  const inFlight = useRef(false);
+  const { analysisResult, consultResult, usageStatus, usageLoading, usageError, activeWriteAction, consultOperation, consult } = useAppWorkspace();
+  const loading = activeWriteAction === "consult";
+  const { error, refreshError } = consultOperation;
   const summary = useMemo(() => analysisResult ? buildWorkspaceAISummary(analysisResult) : null, [analysisResult]);
-  const canConsult = Boolean(summary && canRequestAIConsult(summary) && usageStatus && hasUsageRemaining(usageStatus.usage.aiConsult) && !loading && activeWriteAction === null);
-  async function consult() {
-    if (inFlight.current || !analysisResult || !summary || !canConsult || !beginWriteAction("consult")) return;
-    inFlight.current = true; setLoading(true); setError(null); setConsultResult(null);
-    try {
-      const response = await fetch("/api/ai-consult", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ aiSummary: summary, analysisRunId: analysisResult.analysisRunId }) });
-      const data: unknown = await response.json().catch(() => null);
-      if (!response.ok || !isConsultResult(data)) { const feedback = getSafeClientApiErrorFeedback(response.status, data, "ai_consult"); setError(feedback); if (feedback.requiresUsageRefresh) await refreshUsage(); return; }
-      setConsultResult(data); await Promise.all([refreshUsage(), refreshHistory()]);
-    } catch (caught) {
-      const refreshed = await refreshUsage();
-      setError(getSafeClientNetworkErrorFeedback(caught instanceof DOMException && (caught.name === "AbortError" || caught.name === "TimeoutError") ? "timeout" : "network", refreshed !== null));
-    } finally { inFlight.current = false; endWriteAction("consult"); setLoading(false); }
-  }
+  const canConsult = Boolean(summary && canRequestAIConsult(summary) && usageStatus && !usageLoading && hasUsageRemaining(usageStatus.usage.aiConsult) && activeWriteAction === null);
   return <div className="workspace-page"><PageHeader eyebrow="AI CONSULT" title="AIコンサル" description="直前の分析結果を根拠に、次の改善候補を整理します。自由質問には対応していません。" />
-    {!analysisResult ? <EmptyState title="先に動画分析が必要です">AI提案は、この画面を開く前に実行した分析結果だけを使います。保存済み履歴から内容を推測しません。<Link className="workspace-button workspace-button--primary" href="/app/analysis">動画分析へ</Link></EmptyState> : <><section className="workspace-card"><p><strong>対象：</strong>{analysisResult.channelTitle}</p>{usageLoading ? <StatusPanel tone="loading" title="利用枠を確認しています" /> : usageError ? <StatusPanel tone="error" title="利用枠を確認できません">{usageError}</StatusPanel> : usageStatus && <p className="workspace-inline-note">AI提案枠：本日残り {usageStatus.usage.aiConsult.daily.remaining} 回／今月残り {usageStatus.usage.aiConsult.monthly.remaining} 回</p>}<button type="button" className="workspace-button workspace-button--primary" disabled={!canConsult} aria-busy={loading} onClick={consult}>{loading ? "提案を作成しています…" : "AI提案を作成"}</button></section>{error && <StatusPanel tone="error" title={error.title}>{error.message}</StatusPanel>}{consultResult && <ConsultResults result={consultResult} />}</>}
+    {!analysisResult ? <EmptyState title="先に動画分析が必要です">AI提案は、この画面を開く前に実行した分析結果だけを使います。保存済み履歴から内容を推測しません。<Link className="workspace-button workspace-button--primary" href="/app/analysis">動画分析へ</Link></EmptyState> : <><section className="workspace-card"><p><strong>対象：</strong>{analysisResult.channelTitle}</p>{usageLoading ? <StatusPanel tone="loading" title="利用枠を確認しています" /> : usageError ? <StatusPanel tone="error" title="利用枠を確認できません">{usageError}</StatusPanel> : usageStatus && <p className="workspace-inline-note">AI提案枠：本日残り {usageStatus.usage.aiConsult.daily.remaining} 回／今月残り {usageStatus.usage.aiConsult.monthly.remaining} 回</p>}<button type="button" className="workspace-button workspace-button--primary" disabled={!canConsult} aria-busy={loading} onClick={consult}>{loading ? "提案を作成しています…" : "AI提案を作成"}</button></section>{error && <StatusPanel tone="error" title={error.title}>{error.message}</StatusPanel>}{refreshError && <StatusPanel tone="error" title="表示の更新を確認してください">{refreshError}</StatusPanel>}{consultResult && <ConsultResults result={consultResult} />}</>}
   </div>;
 }
 
@@ -164,8 +102,8 @@ function ConsultResults({ result }: { result: WorkspaceConsultResult }) {
 }
 
 export function ImprovementsView() {
-  const { analysisResult, consultResult, history, historyLoading, historyError, replaceHistory } = useAppWorkspace();
-  return <div className="workspace-page"><PageHeader eyebrow="ACTION" title="改善サイクル" description="分析を1つの行動へ落とし込み、実行後の結果を記録します。" />{historyLoading ? <StatusPanel tone="loading" title="改善サイクルを読み込んでいます" /> : historyError && !history ? <StatusPanel tone="error" title="改善サイクルを表示できません">{historyError}</StatusPanel> : <WeeklyImprovementCycle currentAnalysisRunId={analysisResult?.analysisRunId ?? null} suggestedAction={consultResult?.currentImprovements[0] ?? consultResult?.nextSuggestions[0] ?? ""} refreshKey={0} initialHistory={history} onHistoryChange={replaceHistory} />}</div>;
+  const { analysisResult, consultResult, history, historyLoading, historyError, beginHistoryUpdate, captureHistoryRead } = useAppWorkspace();
+  return <div className="workspace-page"><PageHeader eyebrow="ACTION" title="改善サイクル" description="分析を1つの行動へ落とし込み、実行後の結果を記録します。" />{historyLoading && !history ? <StatusPanel tone="loading" title="改善サイクルを読み込んでいます" /> : historyError && !history?.items.length ? <StatusPanel tone="error" title="改善サイクルを表示できません">{historyError}</StatusPanel> : <>{historyError && <StatusPanel tone="error" title="履歴の更新を確認してください">{historyError}</StatusPanel>}<WeeklyImprovementCycle currentAnalysisRunId={analysisResult?.analysisRunId ?? null} suggestedAction={consultResult?.currentImprovements[0] ?? consultResult?.nextSuggestions[0] ?? ""} refreshKey={0} initialHistory={history} onHistoryRequestStart={beginHistoryUpdate} onHistoryReadStart={captureHistoryRead} historyRefreshing={historyLoading} /></>}</div>;
 }
 
 export function HistoryView() {
@@ -174,7 +112,7 @@ export function HistoryView() {
   const visible = (history?.items ?? []).filter((item) => filter === "analysis" || (filter === "consult" ? item.hasAIConsult : item.action !== null));
   return <div className="workspace-page"><PageHeader eyebrow="HISTORY" title="履歴" description="保存済みの分析、AI提案の有無、改善項目を時系列で確認します。" />
     <div className="workspace-tabs" role="group" aria-label="履歴の種類">{([{ value: "analysis", label: "分析履歴" }, { value: "consult", label: "AI提案履歴" }, { value: "action", label: "改善項目あり" }] as const).map((item) => <button key={item.value} type="button" aria-pressed={filter === item.value} onClick={() => setFilter(item.value)}>{item.label}</button>)}</div>
-    {historyLoading ? <StatusPanel tone="loading" title="履歴を読み込んでいます" /> : historyError && !history ? <StatusPanel tone="error" title="履歴を表示できません">{historyError}</StatusPanel> : !history?.items.length ? <EmptyState title="履歴はまだありません">動画分析を行うと、ここに保存済みの要約が表示されます。</EmptyState> : <section className="workspace-history-list">{visible.map((item) => <article className="workspace-card" key={item.id}><div className="workspace-card__heading"><div><h2>{item.channelTitle}</h2><span>{formatDate(item.analyzedAt)}</span></div><span className="workspace-status-badge">{item.action?.status ?? (item.hasAIConsult ? "AI提案あり" : "分析のみ")}</span></div><dl className="workspace-history-metrics"><div><dt>通常動画</dt><dd>{item.regularVideoCount}本／平均 {item.regularAverageViews.toLocaleString("ja-JP")}回</dd></div><div><dt>Shorts</dt><dd>{item.shortVideoCount}本／平均 {item.shortAverageViews.toLocaleString("ja-JP")}回</dd></div></dl>{item.action && <p><strong>改善項目：</strong>{item.action.title}</p>}</article>)}{visible.length === 0 && <EmptyState title="該当する履歴はありません">絞り込み条件を変更してください。</EmptyState>}{history.nextCursor && <button type="button" className="workspace-button workspace-button--secondary" disabled={historyLoadingMore} onClick={() => void loadMoreHistory()}>{historyLoadingMore ? "読み込み中…" : "さらに10件読み込む"}</button>}{historyError && <StatusPanel tone="error" title="続きの履歴を読み込めません">{historyError}</StatusPanel>}</section>}
+    {historyLoading ? <StatusPanel tone="loading" title="履歴を読み込んでいます" /> : historyError && !history?.items.length ? <StatusPanel tone="error" title="履歴を表示できません">{historyError}</StatusPanel> : !history?.items.length ? <EmptyState title="履歴はまだありません">動画分析を行うと、ここに保存済みの要約が表示されます。</EmptyState> : <section className="workspace-history-list">{visible.map((item) => <article className="workspace-card" key={item.id}><div className="workspace-card__heading"><div><h2>{item.channelTitle}</h2><span>{formatDate(item.analyzedAt)}</span></div><span className="workspace-status-badge">{item.action?.status ?? (item.hasAIConsult ? "AI提案あり" : "分析のみ")}</span></div><dl className="workspace-history-metrics"><div><dt>通常動画</dt><dd>{item.regularVideoCount}本／平均 {item.regularAverageViews.toLocaleString("ja-JP")}回</dd></div><div><dt>Shorts</dt><dd>{item.shortVideoCount}本／平均 {item.shortAverageViews.toLocaleString("ja-JP")}回</dd></div></dl>{item.action && <p><strong>改善項目：</strong>{item.action.title}</p>}</article>)}{visible.length === 0 && <EmptyState title="該当する履歴はありません">絞り込み条件を変更してください。</EmptyState>}{history.nextCursor && <button type="button" className="workspace-button workspace-button--secondary" disabled={historyLoadingMore} onClick={() => void loadMoreHistory()}>{historyLoadingMore ? "読み込み中…" : "さらに10件読み込む"}</button>}{historyError && <StatusPanel tone="error" title="履歴の更新を確認してください">{historyError}</StatusPanel>}</section>}
   </div>;
 }
 
