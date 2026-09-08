@@ -1,8 +1,8 @@
 # ActusTube Project Status
 
-最終更新日：2026-07-26
+最終更新日：2026-09-03
 
-> 2026-07-23 02:10:39 JSTの読み取り専用確認に基づく状態スナップショットです。`main` / `origin/main` は `e036d34db3939a79073fcb05db9c27acda06d0e9` で同期し、Productionは `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`（`main@e036d34db3939a79073fcb05db9c27acda06d0e9`）をREADY / Currentで配信しています。トップ・主要CSS・主要JavaScriptはHTTP 200です。アプリコードの直近基準は `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` であり、そこから現在の `main` までの変更は承認済み文書ファイルだけです。認証済みProduction主要機能スモークは未実施です。この文書自体の後続docs-only commitやdeploymentによりGit / Production識別子が進む可能性があり、その場合もAGENTS / Runbookの全条件を満たすdocs-only限定例外だけが適用候補です。Production DB接続復旧は完了済みで、通常の環境変数変更禁止規則が引き続き適用されています。
+> Production節は2026-07-27 JSTの確認に基づく履歴スナップショットです。expected-owner oracle fix commit `a14ae01c2c9692f71eaf2cc3b77bb26fa45acbde`に対するautomatic push run `33584551679`はPostgreSQL 18.6 external fixtureで`RUN / FAILED`、failed stepはexternal disposable PostgreSQL verifierでした。TypeScript、full Vitest、full ESLintはskippedです。grant-inventory markerは再発せず、grant-inventory exact-set gateとそのClient closeはcontrol-flow reachability上PASSしましたが、workflow全体のPASSではありません。observed markerは`EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENCY_SETUP`です。read-only diagnosisではexpected-owner fixのdirect regressionは`RULED OUT`、reservation setupは`NEWLY REACHABLE LATENT FAILURE`で、underlying root-cause branchは`PROVEN 0 / UNRESOLVED 10`です。identity candidate 3件はすべてGitHub runner preamble由来で、application identity output 0、application sensitive output 0です。temporary ACL cleanupは開始経路まで確認しましたがterminal resultは`NOT VERIFIED`です。今回のcandidateはreservation setupのfixed branch categoryをpublic-safeに出すobservabilityだけを追加し、setup query、QueryConfig、parameter、operation count、Client lifecycle、deadline、cleanup、GRANT / REVOKE、grant-inventory、Migration、workflow、success / failure判定を変更しません。新しいautomatic CIはcommit時点で`NOT RUN`、PostgreSQL 18.6 workflow全体は`NOT VERIFIED PASS`、actual staging / Production / Neon / poolerは`NOT VERIFIED`、Production Migration / deploymentは`NOT RUN`です。
 
 ## プロジェクト概要
 
@@ -29,7 +29,7 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 
 `package.json`、Drizzle設定、実装を確認した構成です。
 
-- Next.js 15.5.20
+- Next.js 15.5.21
 - React / React DOM 19.0.0
 - TypeScript 5系
 - Auth.js（`next-auth` 5.0.0 beta 25以降）
@@ -40,17 +40,81 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 - Vitest 4.1.10以降
 - Vercel
 - Stripe SDK 18.0.0以降は依存関係に存在するが、Stripe機能は今回の公開対象外
+- Node.js 24.x
+- npm 11.18.0
+- `package-lock.json` lockfileVersion 3
+
+## App Shell feature状態
+
+- branch：`feat/app-shell-vidiq-inspired-beta-ux`
+- HEAD：`a643e09303929537be6cc24bc34db5f756ab0447`
+- Preview build：合格済み
+- Production反映：未実施。`main`とCurrent Productionは引き続き`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
+- 認証済みApp Shell操作テスト：Next.js versionの文書不一致により未実施
+- 次工程：認証済みstaging環境の構築と操作検証は、別の明示authorization後に行う将来工程として保持します。現在はreservation-concurrency setup observabilityのlocal実装・validationと必要なdocumentation correctionが未push local chainで完了しており、本documentation correctionを含むcombined rangeの独立review A / Bが即時gateです。両review合格後だけnormal feature-branch pushをexact 1回実施し、そのpushによるnew HEADのautomatic PostgreSQL 18.6 CIを監視します。それまではstaging、Production、provider、Migration、deploymentへ進みません
+
+## Staging DB preflight / postflight verification基盤
+
+- Migration前preflight command：`npm run db:preflight:staging`
+- preflight entry：`scripts/verify-staging-database-preflight.mjs`
+- Migration後postflight command：`npm run db:verify:staging`
+- postflight entry：`scripts/verify-staging-database-postflight.mjs`
+- Runbook：[STAGING_DATABASE_RUNBOOK.md](./STAGING_DATABASE_RUNBOOK.md)
+- preflightは、既存postflightのstaging URL分類、provider identity照合、read-only transaction、timeout、固定エラー分類、bounded cleanupを共用しつつ、Migration適用済みschema判定とは分離する。URL queryは`sslmode=require`と`channel_binding=require`だけをdecode後のpositive allowlistで受理し、未知・重複・空key / value・routing / credential / local-file参照parameterを接続前に拒否する。database / usernameは非曖昧なsafe grammarへ限定し、percent-encoded delimiter、double encoding、malformed escapeを拒否する。接続せず生成したNeon clientの実効host / port / database / userとsafety layerをdirect / pooledごとに照合し、driver実効databaseへstaging markerを適用する。固定read-only queryでPostgreSQL versionと`current_user`を取得し、URL roleとの一致を要求する。正式対象をmajor 18だけに限定し、direct / pooledのbefore / afterすべてでmajor 18かつ同一versionを要求する。取得不能はexit code 3、major 18以外または検証済み不一致はexit code 1でMigrationを禁止する。reportへ実versionやroleは出さず固定statusだけを返す
+- preflightが許可する初期状態は、Migration管理schema自体がないpristine状態、またはDrizzle runnerが事前作成し得るexact形状のmigration tableが履歴0件で存在する状態だけ。既知のActusTube名に限定せずuser-defined residual objectを固定catalog queryで列挙し、system schemaを限定除外する。extension evidenceをcandidate signature単位へ集約し、direct membershipと正式`_RETURN` rule／FK enforcement triggerだけを`managed support`、generic `deptype='a'`・非許可internal・後付けobjectを`residual support`、candidate markerと通常構造参照`deptype='n'`を`neutral evidence`とする。managed＋residual混在、neutral-only、未知・欠落・重複はexit code 3であり、managed supportの存在だけでresidual evidenceを無視しない。`pg_extension.extnamespace`一致やprovider風名称だけでは許可しない。candidate／evidence、computed／SQL managed、computed／SQL residualをすべて双方向完全照合し、candidate・evidence signature一意、candidate総数＝managed＋residual、両集合の交差0件、residual／object signature／集計一致を要求する。hidden residual、片側へ寄せるfalse-clean、direct / pooled差、before / after差を拒否する
+- 空migration tableは正式3 columns、primary key、serial sequence、relation property、ownership / default dependencyに加え、sequence現在状態が`last_value=1`かつ`is_called=false`であることまで検証する。`pg_attribute`はrelation対応、物理列数、attnum順序、drop / inheritance、built-in type、length / pass-by-value / alignment、typmod / dimension、domain、identity / generated、collation、NOT NULL、default有無、ACL / option / FDW option、storage / compression、fresh PostgreSQL 18での単一`attstattarget IS NULL`状態をexact検証する。`pg_class`はrelation kind、namespace、access method、persistence、replica identity、RLS、populated / partition / shared / rewrite / row-type / typed-table、TOAST、tablespace等のstable fieldを検証し、物理配置・planner統計・VACUUM / freeze / transaction依存fieldだけをfield別理由付きで除外する。`pg_index`は正式全fieldをexact値、relation対応、sanitized vector、null状態へ分類し、`pg_constraint`はprimary key／NOT NULLの正式全field、action chars、FK／exclusion配列、expressionまでcoverageする。stable fieldの未検査とcatalog field取得不能を拒否し、direct / pooled初回・相互比較・再取得・前後比較へ同じversion / catalog / sequence evidenceを含める。applied 0件、pending 0000〜0006 exact 7件、user-defined object / data 0件を要求し、実値はreportへ出さず固定statusだけを返す
+- direct / pooled双方をread-only transactionで確認し、Migration 0000〜0006のjournal、file hash、DB履歴、schema / object、function signature、owner、ACL、implicit PUBLIC EXECUTE、default privilege、security mode、fixed search path、runtime role権限、RLS / policy、同一論理database、合成UUIDによるread-only smoke、前後件数不変をfail-closedで判定する基盤を実装
+- external fixture verification：PostgreSQLの起動、停止、port確保、data directory、PID、kill、filesystem cleanupはrepository harnessから完全に除外し、GitHub Actions Linux service containerだけをlifecycle ownerとします。接続専用verifierは5個の専用Environment Variableだけから、lowercase `postgres` / `postgresql`、raw numeric `127.0.0.1`、明示port、expected database / role、major 18、Migration max 0006を接続前に検証し、missing時は`EXTERNAL_FIXTURE_NOT_CONFIGURED`で停止します。GitHub Actionsではdigest固定`postgres:18.6-bookworm`の使い捨てfixtureへ、空migration ledgerのproduction preflight、fresh before / after、第三session drift、extension分類4種、Migration 0000〜0006、再適用時重複0、transaction rollback、schema / owner / ACL / function / index / FK / unique / check / type / default / nullability / ledgerを含むpostflight、postflight driftを通します。通常のlocal Vitestは実DBへ接続せず、URL boundary、秘密情報非出力、権限境界、distinct owner / executorのfake Client検証、独立deadline context、固定benign Node childによる親観測P3だけを実行します。このworkflowの実行履歴は下記のimmutable recordに記載します。run `32639709042`は`RUN / FAILED`であり、generic markerへ集約されたため、external fixture内のpreflight、Migration、cleanup、postflightのどこまで到達・完了したかは確定していません。実Neon catalog／transaction pooler／staging owner／ACL、provider driverのnative cancellation、advisory lockは引き続きNOT VERIFIEDまたはNOT TESTEDです
+- repository-owned lifecycle authority removal：旧local postflight command、旧local Migration command、対応する4 script、`embedded-postgres`とplatform package設定を削除し、connection-only verifierが直接使う`pg`だけを既存lock内versionで固定します。使い捨てexternal fixture内だけにfixed `NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`のdistinct legacy ownerとMigration executorを作成する設計です。0000〜0005はexecutorの実効roleで適用し、legacy functionをlegacy ownerへ変更して必要なmembershipを付与します。0006直前にsession / effective role、owner / executor名・OID、membershipをcatalogで照合し、legacy ownerとは異なるexecutorとして0006を適用した後、legacy functionと全versioned functionのowner名・OIDがexact legacy ownerであることをACL、security mode、search pathとともに確認します。旧usage Migration harnessのDB意味契約は、0005互換性、PUBLIC依存時の0006原子的拒否、plan fallback / fail-closed、同時予約上限、release / finalize / stale recoveryとしてconnection-only verifierへ統合しました。fixture extension expectedは固定`plpgsql` / `1.0` / `pg_catalog` contractから生成し、actualはProduction SQLと共有しない独立catalog queryで照合します。全DB operationは単一のmonotonic total deadline 300,000ms以下に束縛し、connect 10,000ms、client query 30,000ms、statement 20,000ms、lock 5,000ms、idle transaction 20,000ms、close 5,000ms以下です。timeout時は対象contextのowned `pg.Client` socketだけを破棄し、同じClientの追加query、ROLLBACK、`RESET ROLE`、owner query、probe、再利用を行いません。独立contextのunrelated Clientは自身のbounded closeで終了します。P3 benign child oracleは別moduleへ分離し、connection-only verifierは`node:child_process`をimportしません。local fake Client / unit testはactual PostgreSQL PASSではありません。GitHub Actions run `32684794700`がbroad `MIGRATION_POSTCONDITIONS`で`RUN / FAILED`だったことはimmutable historyです。後続run `32695896204`はexplicit runtime executionを示し、combined five-commit qualification runはcandidate commit snapshot時点で`NOT RUN`です
+- final ownership workflow candidate：productionとlocal fake-client testは、role作成、executor / distinct legacy ownerの初期属性検証、限定grant、同一bounded Client上の0000〜0005 / 0006 / replay callback、0006直前precondition、直後とreplay後のowner postconditionを管理する単一のinternal orchestrationを共有します。executorには使い捨てfixtureの`drizzle` schemaだけへ`USAGE, CREATE`を付与し、PUBLIC、runtime role、production postflight契約は緩和しません。distinct legacy-owner inheritance、ACL、SECURITY INVOKER、固定search path、membership、replayを検証した後だけ、固定repository allowlistと独立catalog inventoryが一致する場合に限り、expected table / index依存、enum、exact function signature、migration ledger、`public` / `drizzle` schemaをfixture session ownerへtype-specificにcanonicalizeします。`REASSIGN OWNED`は使用しません。独立post-canonical snapshotで全ownerがsession roleであることを確認した後、temporary executor / legacy ownerについてACLのgrantee側とgrantor側、direct / recursive / effective membership、ownership、shared dependencyを独立inventoryします。正常contractはfixture session roleからexecutorまたはlegacy ownerへ付与されたexplicit ACL 11行とmembership evidence 3行の合計14行で、target roleがgrantorとなるACLはunexpected authorityとしてcleanup前に拒否します。`pg_shdepend.deptype = 'a'`はclass / object / column subobject単位でexplicit ACLとのcoverageを照合する未列挙ACL dependency backstopとし、covered ACLを二重計上しません。固定14行との完全一致時だけdatabase / schema / ledger table / sequenceの限定REVOKE 6件とlegacy membership REVOKE 1件を実行し、bounded cleanupを7 REVOKEから拡張しません。cleanup後はACLのgrantee / grantor、未列挙ACL dependency、membership、ownershipを含む同じinventoryのexact 0行とcanonical ownerの維持を再確認し、bounded Clientの正常close後にだけproduction postflightを1回開始します。local testの7 REVOKE oracleはproduction実装から独立したexact SQL / parameter contractで、wrong object / role / privilege / orderではfake authority stateを削除しません。欠落・余分・重複・未知権限、REVOKE失敗、残存、owner drift、timeoutではpostflight開始0です。`DROP OWNED`、`REASSIGN OWNED`、role / database / schema削除は行いません。local fake-client検証はactual PostgreSQLの権限・catalog・Migration成功を証明しません。GitHub Actions PostgreSQL 18.6 gateのrun `32639709042`は`RUN / FAILED`で、underlying failure phaseは`NOT IDENTIFIED`です。実staging / Production / Neon / pooler owner・ACLは引き続きNOT VERIFIEDで、repositoryがPostgreSQL process、port、PID、data directory、停止、削除を所有するauthorityは0のままです
+- grantor identity binding：connection configurationのroleは最初のMigration ClientでDB identityを照合するための事前期待値に限定します。productionとfake probeが共有するpre-mutation boundaryは、接続とtimeout設定後の最初のfixture-level queryとして`session_user`と`current_user`をexact 1-row contractで観測し、両者とconfiguration roleの一致を検証してからだけ`ALTER DEFAULT PRIVILEGES`、role作成、GRANT、Migration callbackを開始します。mismatch、query failure、timeout時のfixture mutationは0です。最初のactual `session_user`から作成したexact `sessionRole` keyだけのfrozen objectを唯一のdownstream grantor authorityとして保持し、Migration boundaryの再観測は値比較だけに使ってobjectを置換しません。expected 11 ACL rowsのgrantor、owner canonicalization、temporary-authority contract、cleanup identity比較は同じoriginal object referenceへ束縛します。cleanup Clientでは最初のqueryで`session_user` / `current_user`を再観測し、ownership inventory、canonicalization、`ALTER ... OWNER`より前にoriginal frozen identityとの一致を要求します。cleanup identity mismatch、query failure、timeout時はowner change、ownership / authority inventory、REVOKE、postflightを0にします。caller configuration、initial / boundary / cleanup DB-observed identity、fake actual ACL grantorはtest fixtureで独立した入力・stateとして扱います。fake Clientはactual PostgreSQLの証明ではありません。run `32684794700`のbroad-marker failureはimmutable historyであり、後続run `32695896204`はexplicit runtime executionで`RUN / FAILED`でした。combined five-commit qualification runはcandidate commit snapshot時点で`NOT RUN`、実staging / Production / Neon / poolerは`NOT VERIFIED`、repository-owned PostgreSQL lifecycle authorityは0のままです
+
+- GitHub Actions external fixture execution history（immutable）：workflow `Staging database preflight fixture`、run `32639709042`、head SHA `6aa050888b24a20b231d245b05d292bcebec3ccb`、PostgreSQL 18.6 service-container gate `RUN / FAILED`、observed public marker `EXTERNAL_FIXTURE_VERIFICATION_FAILED`、underlying failure phase `NOT IDENTIFIED`。failureはgeneric markerへ集約され、どのproduction phaseで失敗したか、fixture内のpreflight / Migration / cleanup / postflightがどこまで開始・完了したかは特定できません。この履歴はactual PostgreSQL defectを修正済み、root cause確定、またはPostgreSQL 18.6 gate PASSとは扱いません。
+- GitHub Actions phase observability execution history（immutable）：workflow `Staging database preflight fixture`、run `32684794700`、head SHA `a8b6cfbc9fb5e9ac7fd29729adff52c4226aa327`、PostgreSQL 18.6 external fixture gate `RUN / FAILED`、observed fixed marker `EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_POSTCONDITIONS` exact 1件、phase localization `MIGRATION_POSTCONDITIONS`、exact call site `NOT IDENTIFIED`、underlying root cause `NOT IDENTIFIED`。known marker exact 1件によりpublic-safe observabilityはqualifiedですが、このphaseはfinal Migration直後のowner postcondition、Migration replay直後のowner postcondition、後段usage-security verification groupの3箇所に再利用されていたためcall siteまでは特定できません。この履歴はactual PostgreSQL behaviorを修正済みまたはgate PASSとは扱いません。
+- Migration postcondition subphase observability candidate：今回の変更は上記3箇所を固定ASCII subphaseへ分け、後段helper内もowner / ACL / privilege / security、plan-resolution control、reservation lifecycle、runtime ACL configurationの異なるexisting await境界へ追加queryなしで分類するobservability-only変更です。旧`MIGRATION_POSTCONDITIONS`はimmutable履歴とnegative test以外のruntime allowlistから外し、unbranded messageは`UNKNOWN`へ固定します。underlying PostgreSQL behavior、SQL、query parameter / count / order、Migration、ownership、ACL、cleanup、deadline、Client lifecycleは修正対象にしません。新subphase-marker commitのexternal gateはcommit時点で`NOT RUN`です。raw error、error message、stack、cause、SQL、URL、credential、host、port、database、session / executor / legacy-owner role、OID、ACL / membership / catalog rowをpublic outputへ追加しません。fake Clientはactual PostgreSQL semanticsの証明ではなく、actual Neon / staging / Production / poolerは`NOT VERIFIED`、actual staging preflight / Migration / postflightは`NOT RUN`、repository-owned PostgreSQL lifecycle authorityは0です。
+- explicit runtime body ACL fix candidate：GitHub Actions run `32695896204`はPostgreSQL 18.6 external fixtureで`RUN / FAILED`、observed markerは`EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_EXPLICIT_RUNTIME_EXECUTION`でした。raw PostgreSQL errorではなく、Migration 0006の`SECURITY INVOKER` function bodyとactual verifier invocationの静的照合によりbody-object privilege不足をroot causeとして確定しました。final Migration、owner postcondition、replay、replay owner postconditionの後だけ、fixed manifestからtemporary explicit runtime roleとmembership runtime groupへ必要最小限のtable privilegeをdirect grantし、membership leafはgroup inheritanceだけを使用します。各GRANT / REVOKEはoriginal DB-observed frozen session identityを`GRANTED BY`へ固定し、configuration / caller roleへfallbackしません。denied role、PUBLIC、Production runtime role、Migration executor、legacy ownerへの拡張は0です。GRANT後はgrantor / grantee / grant option / shared ACL dependencyを含む18-row catalog inventoryとの完全一致を要求し、usage / plan / reservation verificationの成功・失敗後に同じfixed manifestのbounded REVOKEを試行します。`configureRuntimeAcl()`より前に同じinventoryのexact zero residueを要求し、未確認または残存時は後段へ進みません。Migration、application runtime、workflowは変更しません。fake Client oracleはactual PostgreSQL semanticsを証明せず、新commitのPostgreSQL 18.6 external gateはcommit時点で`NOT RUN`、actual staging / Production / Neon / poolerは`NOT VERIFIED`、Production Migration / deploymentは`NOT RUN`、repository-owned PostgreSQL lifecycle authorityは0です。
+- body ACL review findings follow-up：local commit `5ac1849a0dbf4418bf820b09b120a95c51aff83b`の独立reviewで確認された、timeout後のactual REVOKE、fresh mutation Client identity、observed-grantor inventory、REVOKE oracle、文書current-stateのP2 5件は、direct child `15cffbb71f85643d292604a635a26e8ff4f95329`で修正しました。最初のtemporary GRANT前にconnect 1、identity query 1、REVOKE query 1、zero-residue query 1、close 1の既存上限からcleanup budgetを静的予約し、business timeout後もoriginal absolute deadlineを延長・resetせず、別`timedOut` stateとfresh owned Clientを持つcleanup-only contextでidentity-first、actual bounded REVOKE、zero-residue、bounded closeを実行して元のprimary failureを維持します。fresh GRANT / REVOKE Clientはoriginal DB-observed frozen identityとの一致後だけmutationを開始します。test-local REVOKE oracleはaction-awareなSQL / parameter mutationを各caseで実差分確認し、unknown / unrelated authorityを誤って消しません。
+- ACL coverage / dependency provenance follow-up：`15cffbb7...`の独立reviewで、system-wide recipientとtarget-as-grantorの既存selection armがobserved-grantor armへの変更時に欠落したこと、grantee-sideとgrantor-sideのshared dependencyが単一booleanへ統合され片側だけで両側を満たせたことを新規P2 2件として確認し、direct child `84650da7ba238fbbecef481dd7a64241fd79e518`で修正しました。fixed objectsに対するsystem-wide grantee、fixed target-as-grantor、original observed grantorの3 armをsemantic unionとして維持し、重なる同一physical ACL rowだけを1回列挙します。dependency evidenceはgrantee側とgrantor側のexact countへ分離し、正常18行は各側exact 1、片側欠落・duplicate・wrong boundaryを拒否します。expected setはfixed manifest由来のままで、unknown recipientを追加しません。
+- owner-self ACL exclusion follow-up：`84650da7...`の独立reviewで、temporary GRANTによってmaterializeされるobject-owner自身のACLが3-arm selectionへ混入し、正常18行をextra扱いし得るP2を確認しました。fourth local commit `a98eaecb5170428fa0cf3c0881762966a364d8ff`では、各fixed tableのcatalog `relowner`だけをauthorityとし、granteeとgrantorがともにそのobject ownerであるexact owner-self rowだけを3-arm unionの前で除外しました。expected temporary inventoryは18行のままで、ownerからnon-owner、non-ownerからowner、non-owner self-grant、PUBLIC、target-as-grantor、observed-grantorとdependency-side分離は維持します。bounded REVOKEはtemporary authorityだけを除去し、owner ACLを変更しません。このfourth-commit snapshotではexternal gateを実行していません。actual staging / Production / Neon / poolerは`NOT VERIFIED`、Production Migration / deploymentは`NOT RUN`、repository-owned PostgreSQL lifecycle authorityは0です。
+- owner ACL oracle fifth candidate：`a98eaecb...`でproduction owner-self predicateを実装しましたが、その独立reviewでtest-local fakeがowner ACLを各object 1行だけとし、owner authorityをobserved grantorと再利用していたP2を確認しました。fifth candidateではproduction harnessを変更せず、PostgreSQL 18 TABLE owner privilegeのfixed 8（`INSERT`、`SELECT`、`UPDATE`、`DELETE`、`TRUNCATE`、`REFERENCES`、`TRIGGER`、`MAINTAIN`）をtest-local literalで独立固定します。5 objectsのowner-self evidenceを40行へ展開し、distinct Migration-executor owner authorityの下でpost-GRANT raw 58 / filtered 18、post-REVOKE raw 40 / filtered 0と、GRANT前後・REVOKE後のexact 40-row multiset不変を検証します。owner ACL mutation / REVOKEは0です。fake oracleはactual PostgreSQL semanticsの最終証明ではありません。このcandidate snapshotでexternal gateが`NOT RUN`だったことは履歴として維持します。actual staging / Production / Neon / poolerは`NOT VERIFIED`、Production Migration / deploymentは`NOT RUN`です。
+- grant-inventory observability history：combined candidateを含むpushed HEAD `0199154710dfdc157953360323d8f27ba9ff7e24`に対するGitHub Actions run `33291908052`はPostgreSQL 18.6 external fixtureで`RUN / FAILED`となり、failed stepは`Run external disposable PostgreSQL verifier`、observed generic markerは`EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_USAGE_BODY_ACL_GRANT_INVENTORY`でした。read-only診断は`PROVEN 0 / UNRESOLVED 25`で、actual PostgreSQL root causeは未特定でした。後続のpublic-safe observabilityは、production acceptance semantics、inventory SQL / parameter、query / Client operation count、total deadline 300,000ms、cleanup reserve 105,000ms、cleanup、Migration、workflowを変更せずに追加しました。
+- grant-inventory classification history and grantor-delta candidate：current pushed HEAD `82f4b3da86e33ad9d2e01118be477223cc186e95`に対するautomatic push run `33347045917`は`RUN / FAILED`で、failed stepは`Run external disposable PostgreSQL verifier`、primaryはexact-set mismatchでした。safe countsはexpected / actual / missing / extra / duplicateが`18 / 18 / 18 / 18 / 0`、detailsはmissing / extraに加えてgrantor contract、target-grantor coverage、grantor-side dependencyを含みますが、各detailはexistential evidenceであり全18行の同一原因を証明しません。cleanupは`SUCCEEDED`、旧OWNER_SELF marker 0、SELF_GRANT marker 0、unknown marker 0、sensitive candidate 0です。PostgreSQL 18.6 fixture PASSとcurrent root causeは`NOT VERIFIED`で、expected oracle側、GRANT execution context側、inventory attribution側のどれが正しいかも`UNRESOLVED`です。今回のcandidateはvalidated expected / actual rowsだけからnon-grantor、grantor identity、grantor-side dependencyのfield domainをmultiset aggregateへ分解するobservability-only変更です。SQL / projection / QueryConfig / parameter、query / Client / GRANT / REVOKE operation count、expected 18、acceptance、cleanup、deadline、Migration、workflowは変更しません。fake Clientはactual PostgreSQL evidenceではなく、actual staging / Production / Neon / poolerは`NOT VERIFIED`、Production Migration / deploymentは`NOT RUN`です。
+- expected owner oracle root-cause decision and fix candidate：current pre-fix HEAD `26e8a306fc5643a5d4a709bd6ade1ca79537a862`に対するautomatic run `33349418965`は`RUN / FAILED`で、failed stepはexternal disposable PostgreSQL verifierでした。public-safe aggregateはnon-grantor residual 0を示し、差分をgrantor identityとgrantor-side dependency domainへ限定しました。PostgreSQL 18ではsuperuserによるobject privilege GRANTは対象object ownerからのgrantとしてstored ACLへ記録され、object ownerはACL dependencyではなくownership dependencyを持ちます。このためroot cause A（expected oracle defect）は`PROVEN`、execution authority defect、inventory attribution defect、今回のsuperuser branchでのnondeterministic selectionは`RULED_OUT`です。candidateはfixed 5-object manifestの各objectを既存Migration ownership contractのowner authorityへ明示的に束縛し、expected 18-rowのgrantorをper-object owner、grantor-side ACL dependencyを0とします。original DB-observed authorityはfresh GRANT / REVOKE Client identity gateと互換性入力だけに維持します。test-local literal owner mappingは複数objectへ異なるownerを割り当て、global scalar、cross-object substitution、old observed authority、dependency 1への復帰を拒否します。fake Clientはactual PostgreSQL semanticsの証明ではありません。GRANT / REVOKE / inventory SQL、QueryConfig / parameter、query / operation count、deadline / cleanup、Migration / workflowの変更は0です。修正後のPostgreSQL 18.6 gateはcommit時点で`NOT RUN`です。
+- staging専用provider resource：文書上は別の承認済み工程で作成済み。今回のlocal product recoveryではprovider状態をNOT VERIFIED
+- 実staging DB：未接続。preflight、Migration、postflightはすべて実行0回
+- 実provider pooled endpoint：未実行のためtransaction pooler固有挙動はNOT TESTED
+- Production非複製：DB queryでは証明せず、provider metadata preflightで別途証明する必須gateを維持
+- 実staging owner / ACL：未検証
+- Production DB：未接続・未変更
+- Migration：履歴上の明示承認済みlocal使い捨てDBだけへ適用。GitHub Actions run `32684794700`のbroad-marker failure、run `32695896204`のexplicit runtime execution failure、run `33291908052`のgrant-inventory generic-marker failure、run `33347045917`のgrant-inventory exact-set mismatchはimmutable historyです。実staging / Production DBへのMigration適用は0回です
+- 次工程：reservation-concurrency setup observabilityのlocal implementation、validation、direct-child commit `12261d131d456405b5ca684ea66fe3b44b25a796`までは完了し、pushは未実行です。現在のgateは、この文書P2修正を含むcombined rangeの独立review A / B再確認です。両reviewのP0 / P1 / P2とblocking NOT VERIFIEDが0の場合だけ、未pushのobservability commitとdocs follow-up commitをfeature branchへnormal push exact 1回で送信し、新HEADのautomatic PostgreSQL 18.6 workflowをexact 1件監視します。reservation setup failureの場合はpublic-safe primary categoryを記録して追加fixせず停止し、full CI successの場合だけread-only remote compareへ進みます。Draft PRは作成せず、staging構築、Production、provider、Migration、deploymentは別承認まで開始しません
+
+local unit PASSまたは将来のGitHub Actions disposable fixture PASSを「実staging DB検証済み」「staging構築完了」とは扱いません。1件でもFAIL、NOT VERIFIED、timeout、結果不明があればauthenticated staging工程へ進みません。
+
+## Staging専用検索index防止基盤
+
+- server / build側Environment Variable：`ACTUSTUBE_STAGING_NOINDEX`
+- 有効条件：値が文字列`1`と完全一致する場合だけ
+- header：`X-Robots-Tag: noindex, nofollow, noarchive, nosnippet`
+- 適用範囲：全path。staging専用Vercel projectのProduction scopeだけに設定する
+- default：未定義、空文字、`0`、`false`、その他の値ではheaderを追加しない
+- Production保護：現在のProduction projectへ変数を設定せず、既存metadata、robots metadata、robots.txtを変更しない
+- 検証：設定関数の自動テストと、staging条件を有効にしたProduction buildを必須とする。実deployment後はrootと正式8routeのresponse headerを確認する
+- staging専用resourceと`ACTUSTUBE_STAGING_NOINDEX`設定：別の承認済み工程で作成・設定済み。DB接続、Migration、deploymentは未実施
+
+既存の認証済みstaging環境・完全構築指示は、このfeatureの新しい完全HEAD、`ACTUSTUBE_STAGING_NOINDEX`のscope、build時のexact値、deployment後のheader検証方法を反映して更新されるまで再利用しません。
 
 ## 承認済み期限付きセキュリティ例外
 
-現在のリリース準備feature branchでは、[GHSA-mh99-v99m-4gvg / CVE-2026-14257の正式な期限付き例外](./SECURITY_EXCEPTION_GHSA-MH99-V99M-4GVG.md)がActusTubeプロジェクトオーナーにより明示承認済みです。
+現在のProduction sourceには、[GHSA-mh99-v99m-4gvg / CVE-2026-14257の正式な期限付き例外](./SECURITY_EXCEPTION_GHSA-MH99-V99M-4GVG.md)を含む承認済みrelease candidateが統合されています。
 
 - 対象：`brace-expansion` のdevDependency lint経路にあるGHSA-mh99-v99m-4gvgだけ
 - 承認日：2026-07-26
 - 失効日：2026-08-24 23:59 JST
 - 初回週次確認期限：2026-08-02
 - Runtime `npm audit --omit=dev`：全severity 0件
-- full `npm audit`：対象GHSAによるHigh 9件のみ。対象GHSA以外は0件
+- full `npm audit`：exit code 1、High 1件、Critical 0件、total 1件。`brace-expansion`のaffected dependency node 2件が同一のGHSA-mh99-v99m-4gvgに由来し、対象GHSA以外のHigh / Criticalは0件。判定は`NOT PASS — known advisory only`
+- このHigh 1件は依存関係変更禁止のため本工程では修正せず、将来の別dependency remediationで対応します。runtime auditが全severity 0件で、今回変更が到達性を拡大しないことを条件に、本preflight独立レビューのblockerとはしません。これはProduction全体に脆弱性がないという判定ではありません
 - Production dependency / trace / bundle / route / action / user-input経路：対象packageへの到達なし
 - Preview：Node.js 24.x、Corepack、npm 11.18.0、既定install、`npm run build`を実証済み
 - ローカル回帰検証：247件成功、4件skip、React act警告0件
@@ -60,15 +124,17 @@ ActusTubeは、YouTube投稿者向けのAI分析・改善サービスです。
 
 通常のHigh / Critical 0件release gateは維持しています。今回の例外は単一GHSA、期限、週次再確認、即時解除条件、恒久対応を正式文書で拘束するもので、一般的なdevDependency脆弱性を許容しません。
 
-本feature branchはまだ`main`へ統合しておらず、Productionへ反映していません。Production DBへ接続せず、Migration 0006は未適用で、Neon、Vercel設定・環境変数、Google Cloud / OAuthも変更していません。例外文書を含む新しい完全HEADは、全ローカル検証、独立レビュー、exact Preview、Current Production不変確認の合格後にだけrelease candidateとして確定します。その次工程で、release candidateを基準にProduction release可否を別途判定します。
+release candidateの統合、Migration 0006のProduction適用、Migration後postflightは完了しています。期限付き例外のscope、期限、週次再確認、即時解除条件は引き続き正式例外文書を正本とします。本docs-only同期は例外条件や依存関係の評価を変更しません。
 
-## Production release停止とRunbook整合化
+## Migration 0006適用後のProduction状態
 
-Migration 0006を含むProduction releaseは、RunbookのNeon branch作成全面禁止およびDB関数・schema・権限変更全面禁止と、承認されたbackup・正式Migration手順が矛盾していたため、必読文書確認で安全に停止しました。停止判断後、Production release、Production DB接続、Migration command、Neon backup / snapshot、main統合、Production deploymentは開始していません。
-
-Runbookは、通常時の任意branch作成、任意DB変更、未承認Migration、既存Migration変更・再適用を引き続き禁止し、各releaseでproject ownerがrelease candidate branch、完全SHA、対象Migration、承認範囲を固定し、全release gateを満たした場合だけ発動できる狭い例外へ整合化します。backupはsnapshot優先・最大1件・作成試行最大1回、version管理済み正式Migrationはcommand起動最大1回とし、失敗または結果不明時の再実行、手動修正、自動rollback、restoreを許可しません。
-
-この文書整合化、review、commit、PreviewはProduction releaseの承認ではありません。Migration 0006はProduction未適用のままです。新しいrelease candidate確定後、対象branch、完全SHA、Migration 0006、承認範囲を固定した別のproject owner明示承認を受け、Production手順を最初から再開します。
+- Migration履歴は0000〜0006の7件です。
+- Migration 0006は正式Production branchへexact 1回適用済みで、再実行は禁止です。
+- postflightは合格し、schema、function、owner、ACL、PUBLIC権限、security mode、固定search pathは期待状態です。
+- Migration由来の想定外データ件数変化はありません。
+- Migrationリハーサル用child branchとProduction復旧用backup child branchは、変更・削除せずREADYで保持しています。
+- rollbackとrestoreは実施していません。
+- Migration対象Production branch自体に不整合はなく、Vercel Production runtimeの接続先branch不一致を修正した後はPersistence 500が解消しています。
 
 ## 実装済み機能
 
@@ -146,14 +212,15 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 
 ## 検証結果
 
-アプリコード基準 `7ef73ed` のmain統合前後に再実行した確認結果です。`7ef73ed` 以後の `f6014a1` と `e036d34` はdocs-onlyのため、アプリコードと依存関係はこの検証済み内容から変わっていません。
+現在のProduction sourceへ統合されたrelease candidateの検証結果です。期限付きセキュリティ例外の扱いは、本書の「承認済み期限付きセキュリティ例外」と正式例外文書を参照してください。
 
-- 自動テスト：185件成功、4件skip
+- 自動テスト：247件成功、4件skip
 - React act警告：0件
 - ESLint：0エラー、既存の `<img>` 警告1件
 - TypeScript：成功
 - Production build：成功
-- `npm audit`：critical / high / moderate / lowすべて0件
+- Runtime audit：全severity 0件
+- full audit：exit code 1、High advisory 1件、Critical 0件、`brace-expansion`のaffected dependency node 2件。advisoryは承認済みのGHSA-mh99-v99m-4gvgだけで、statusは`NOT PASS — known advisory only`。dependencyと`package-lock.json`は不変
 - npm 11.18.0のclean installと `npm ls --depth=0`：extraneous / invalid 0件
 - `sharp`：0.35.3のみ
 - `libvips`：package 1.3.2 / runtime 8.18.3
@@ -166,14 +233,38 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 - 秘密情報・個人情報候補：0件
 - UI幅320、375、390、768、1024、1440で横はみ出しなし
 
+Production復旧・動画あり最終スモーク：
+
+- Productionの`DATABASE_URL`はProduction scopeだけに維持し、Sensitiveを維持したまま、Migration 0006適用済みの正式Production branchの公式pooled接続へ修正済み
+- PreviewとDevelopmentの`DATABASE_URL`：各0件
+- 同一source commitの復旧Redeploy：1回。追加Redeploy、Promote、Rollbackなし
+- `/api/usage/status`と`/api/weekly-cycle`：各HTTP 200。PersistenceErrorの再発なし
+- 所有チャンネル：1件取得・自動選択成功。通常動画2本、Shorts 1本を取得
+- 分析：1回、HTTP 200。履歴0件→1件。分析時のAI同時生成・消費なし
+- AI提案：1回、HTTP 200。履歴0件→1件
+- 分析の日次利用枠：使用0→1、上限2、残り2→1
+- 分析の月次利用枠：使用0→1、上限5、残り5→4
+- AI提案の日次利用枠：使用0→1、上限1、残り1→0
+- AI提案の月次利用枠：使用0→1、上限3、残り3→2
+- 処理上限：通常動画10本、Shorts 10本
+- 改善項目：`【Production Smoke】動画あり最終確認 2026-07-27`を1件作成。planned／進行中で再取得後も永続化を確認し、編集、結果メモ、skipped、削除は未実施
+- 重複requestと重複利用枠消費：なし
+- Browser Console error / warning、Production runtime error / fatal、HTTP 5xx：すべて0件
+- 認証情報、Cookie、token、接続情報の取得・表示：なし
+
+この結果により、今回のreleaseで確認対象としたProduction主要導線は合格です。未実装または未確認の将来機能、Standard / Proの完成を示すものではありません。
+
 ## Git状態
 
-2026-07-23 02:10:39 JSTに読み取り確認した状態：
+2026-07-27 JSTに読み取り確認した状態：
 
-- `main`：`e036d34db3939a79073fcb05db9c27acda06d0e9`
-- `origin/main`：`e036d34db3939a79073fcb05db9c27acda06d0e9`
+- `main`：`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
+- `origin/main`：`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
 - `main` と `origin/main`：0 / 0で同期済み
 - 作業ツリー：clean
+
+過去の主なProduction関連commit：
+
 - `c6b403e`：週次改善サイクルのrelease candidate
 - `2f79fa7`：Google OAuth callback互換性修正
 - `509bf21`：Production認証障害に合わせた文書同期
@@ -183,129 +274,80 @@ API、認証、DB、Migration、schema、利用上限、課金仕様、AI提案�
 - `f6014a1`：正式仕様書v1.0を正本Markdownとして追加したdocs-only commit
 - `e036d34`：Project Status / Production Runbookを同期したdocs-only commit
 
-`7ef73ed` から `e036d34` の変更は、`AGENTS.md`、`docs/ACTUSTUBE_PRODUCT_SPEC.md`、`docs/ACTUSTUBE_PROJECT_STATUS.md`、`docs/PRODUCTION_RELEASE_RUNBOOK.md` の4件だけです。アプリコード、test、package、Migration、Drizzle schema、Vercel設定は変更されていません。正式仕様書v1.0はmain統合済みですが、将来設計を現在の実装済み機能として扱いません。旧状態の `main` `92f834d`、`fix/weekly-action-duplicate-conflict` 未統合、診断ログ未公開、DB資格情報の復旧待ち、`feat/ui-foundation-primary-flow` 未統合は完了済みの履歴です。
+`08ec587f7a242b40ada53a0eb69acb33ebb9253b`には、承認済みrelease candidate、Migration 0006対応コード、期限付き例外文書が含まれ、`main`へfast-forward統合済みです。本docs-only branchはこのSHAを親とし、`main`自体を変更しません。
 
 ## Vercel Production状態
 
-2026-07-23 02:10:39 JSTのProductionスナップショット：
+2026-07-27 JSTのProductionスナップショット：
 
 - Production Branch：`main`
 - Vercel Project：ActusTube
-- commit：`e036d34db3939a79073fcb05db9c27acda06d0e9`
-- deployment：`dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`
+- source commit：`08ec587f7a242b40ada53a0eb69acb33ebb9253b`
 - domain：`https://actustube.vercel.app`
 - 状態：READY / Current
-- トップページ、主要CSS、主要JavaScript：HTTP 200
-- source commit `e036d34` はProject Status / Production Runbook同期のdocs-only commitで、アプリコードは `7ef73ed` の内容から変わっていない
-- `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn` の開始時刻は2026-07-23 01:38:17 JST
-- docs-only統合・自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
+- トップページ：HTTP 200
+- Google認証：成功
+- session：成功
+- 所有チャンネル：1件取得・自動選択成功
+- 通常動画：2本取得成功
+- Shorts：1本取得成功
+- `/api/usage/status`：HTTP 200
+- `/api/weekly-cycle`：HTTP 200
+- Production `DATABASE_URL`：正式Production branchの公式pooled接続へ修正済み。Production scopeのみ、Sensitive維持
+- Preview / Development `DATABASE_URL`：各0件
+- Persistence 500復旧後のRedeploy：同一source commitで1回。追加Redeployなし
+- 分析：1回成功、HTTP 200、履歴0件→1件
+- AI提案：1回成功、HTTP 200、履歴0件→1件
+- 利用枠：分析とAI提案を各1回分だけ消費。重複消費なし
+- 改善項目：スモーク専用項目1件をplanned／進行中で保存し、再取得後の永続化を確認
+- Browser Console error / warning、Production runtime error / fatal、HTTP 5xx：すべて0件
+- rollback、restore、Promote：未実施
 - このdeployment情報は確認時点のスナップショットであり、後続docs-only commitによって識別子が進んでも永続的にCurrentであることを意味しない
 
-Production DB接続復旧に関する完了済み履歴：
+Persistence 500復旧に関する完了済み履歴：
 
-- `redirect_uri_mismatch`：解消済み
-- OAuth callbackの `missing iss`：解消済み
-- callbackは `/api/auth/callback/google` まで到達し、HTTP 302で完了
-- 安全な診断ログ：実装・検証・Production公開済み
-- 本人による単一ログイン：成功。callback直後のトップページはHTTP 200
-- 本人申告のログイン時刻周辺にGoogle callbackとHTTP 200を確認し、エラー、5xx、DB認証失敗は確認されなかった。Vercel側ログの表示時刻にはタイムゾーンまたは表示形式による差があるため、本人申告時刻との秒単位の一致は断定しない
-- `[auth][error]`、`[auth][cause]`、`[auth][details]`：0件
-- DB同期診断ログ：0件。失敗時だけ出力される実装のため正常結果と整合
-- `password authentication failed`、Neon / PostgreSQL接続エラー、`error`、`fatal`、HTTP 5xx：0件
-- 以前失敗していたGoogle OAuthアカウントのDB同期境界を正常に通過
-- Production DB接続復旧：正式完了
-- rollback：不要
+- 以前の障害は、`/api/usage/status`の`UsageStatusPersistenceError`と`/api/weekly-cycle`の`WeeklyCyclePersistenceError`によるHTTP 500
+- 根本原因は、Vercel Productionの`DATABASE_URL`がschemaの空の別Neon branchを参照し、Migration 0006適用済みProduction branchと接続先が不一致だったこと
+- Previewの`DATABASE_URL`を削除し、Productionの`DATABASE_URL`だけを正しい公式pooled接続へ修正
+- 同じsource commitを1回だけRedeploy
+- 両APIのHTTP 200、PersistenceError再発なし、正式Production branchへのruntime activityを確認
+- runtime error、fatal、HTTP 5xx：0件
+- DBの直接修正、Migration再実行、rollback、restore：なし
 
-直前のdocs-only deployment `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`（`main@f6014a1`）と、直近のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は比較用履歴として残します。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧deployment `dpl_HPGCXavawHj3yHKo9nFg99LGB6jR`、`dpl_BFQqxdLJqaFS6vVcPVfZvfVkmFGQ` は監査履歴であり、現在のCurrentまたは自動的なrollback先ではありません。復旧ではVercel Productionの `DATABASE_URL` 以外を変更せず、Production DB本体やMigration 0000〜0005を変更・再適用していません。今回限定の環境変数変更例外は終了済みです。
+復旧ではPreviewだけの`DATABASE_URL`を1件削除し、Productionの`DATABASE_URL`を1件更新しました。Developmentとその他の環境変数は変更していません。値、接続文字列、host、database名、role名、内部識別子は本書へ記録しません。これらは完了済みincidentに限定した操作であり、変更許可は終了しています。通常のVercel環境変数変更禁止を再適用しています。
 
 ## Production DB
 
-ローカルの接続設定を秘密情報を表示せず解析し、明示的なread-only transactionでEndpoint IDとDatabaseを再確認しました。
+Migration 0006適用後の正式Production branchを、秘密情報を表示しないread-only postflightで確認済みです。
 
-実Production DB：
+- Migration履歴：0000〜0006の7件
+- Migration 0006：exact 1件。再実行禁止
+- repositoryのjournal、Migration識別情報、適用順序：一致
+- 管理対象table、function、index、constraint：期待状態
+- owner、ACL、PUBLIC権限、security mode、固定`search_path`：期待状態
+- runtime roleの必要権限：正常
+- Migration由来の想定外データ件数変化：なし
+- rollback、restore：未実施
 
-- Neon Project：ActusTube
-- Project ID：`small-night-17748387`
-- Branch name：`development`
-- Branch ID：`br-blue-bonus-aza51iwc`
-- Endpoint ID：`ep-polished-cloud-az8xdsqg`
-- Database：`neondb`
-
-重要：Neon上のブランチ名は `development` ですが、Vercel Productionが実際に接続しているためProduction DBとして扱います。削除、リセット、テスト用途への流用は禁止です。
-
-2026-07-21のProduction DB状態：
-
-- Migration履歴：6件
-- 0000〜0005がjournalの順序どおり適用済み
-- Migration 0005：適用済み。再適用は禁止
-- journalの6つの `when` とDB履歴の `created_at`：すべて一致
-- Drizzleと同じSHA-256計算で、0005は現在のファイルと一致
-- 0000〜0004は現在のWindows作業ツリーのCRLFではhashが異なるが、LFへ正規化した同一SQL本文と一致。SQL内容変更ではなく改行コード差であり、Drizzleは最新の `created_at` とjournalの `when` により適用済みと判断する
-- `analysis_runs`：作成済み、0件
-- `improvement_actions`：作成済み、0件
-- `improvement_action_status`：作成済み（`planned` / `completed` / `skipped`）
-- Migration 0005のIndex・制約・関数：`schema.ts`、Migration SQL、0005 snapshotと一致
-- 2つの確定関数：`SECURITY INVOKER`、固定 `search_path`、PUBLIC実行権限なし
-- `users`：1件
-- `oauth_accounts`：1件
-- `plans`：1件
-- `user_plan_assignments`：1件
-- `user_usage_buckets`：0件
-- `usage_reservation_leases`：0件
-
-実データの内容、ユーザー情報、認証情報、接続情報の秘密部分は記載しません。
-
-管理外テーブル `playing_with_neon` が1つ存在し、40件の行があります。コード、`schema.ts`、Migration、テストから参照されておらず、ActusTube管理オブジェクトとの名前衝突もありません。Neonのサンプルテーブルとしてアプリ管理Schemaの比較対象から除外し、削除・変更・Migrationへの追加は行いません。ActusTube管理対象のSchema driftはありません。
+Persistence 500はこのDBのMigration、schema、権限によるものではありませんでした。Production runtimeの接続先を正式Production branchの公式pooled接続へ修正した後は、主要読み取りAPIと動画あり最終スモークが正常です。実データ、接続文字列、host、database名、role名、内部識別子は本書へ追加しません。
 
 ## バックアップ兼リハーサルブランチ
 
-- Name：`pre-weekly-mvp-production-backup-20260720`
-- Branch ID：`br-crimson-shadow-azkeq0kc`
-- Endpoint ID：`ep-still-bar-azv826h8`
-- Parent：`br-blue-bonus-aza51iwc`
-- Database：`neondb`
-- 状態：Ready
-- 削除せず保持中
-
-この既存ブランチはMigrationリハーサルに使用済みです。
-
-週次改善サイクルProduction公開前には、当時のProduction DBを基点に次のバックアップを作成し、Readyを確認済みです。
-
-- Name：`backup-pre-release-20260721-c6b403e`
-- Branch ID：`br-withered-darkness-azjg6fpl`
-- 状態：Ready
-
-今回の認証診断ログ追加ではDB・Migrationを変更しないため、新たなNeon branch作成やMigration実行は行いません。
-
-このブランチでは、引き継ぎ時点で次が合格済みと報告されています。
-
-- 親ブランチとのMigration履歴・データ件数一致
-- Migration 0005適用
-- 履歴5件から6件
-- 新テーブル・enum・Index・外部キー・関数作成
-- `SECURITY INVOKER`
-- 固定 `search_path`
-- PUBLIC実行権限なし
-- Googleログイン
-- YouTube分析
-- 分析履歴保存
-- AI提案保存
-- 改善項目作成・編集
-- `completed` / `skipped`
-- 結果メモ
-- 重複作成409
-- API 500なし
-- 既存データ維持
-- テストデータ削除
+- Migration 0006専用リハーサルchild branch：READYで保持中
+- Production復旧用backup child branch：READYで保持中
+- 両branchとも削除、変更、reset、restore、別用途への流用を行っていません
+- 今回のdocs-only同期ではNeon操作を行いません
 
 ## 現在残っている作業
 
-1. Runbook整合化後の新しいrelease candidateを基準に、対象branch、完全SHA、Migration 0006、承認範囲を固定した別のproject owner明示承認を受け、Production release手順を最初から再開する
-2. Production releaseが全gateに合格した場合だけ、所有者による認証済みProduction主要機能スモークを、費用と利用枠を考慮して最小回数で実施する
-3. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
-4. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
+1. staging resourceを作成せず、新しいfeature HEADを基準とした認証済みstaging環境構築・事前監査の別承認を待つ
+2. 復旧済みProductionを24〜48時間監視し、PersistenceError、runtime error、fatal、HTTP 5xx、利用枠の重複消費が再発しないことを確認する
+3. 期限付きセキュリティ例外を初回2026-08-02、その後最低週1回の期限で再確認する
+4. planned／進行中で残存するスモーク専用改善項目について、実在データを独断で変更・削除せず、project ownerがcleanup要否を判断する
+5. 料金・利用上限・原価率、利用規約・プライバシー・Google / YouTubeポリシー適合を確定する
+6. 正式仕様書で未実装または未確認とされた「期待効果」専用field、YouTube Analytics、決済、Standard / Pro等を、設計と実装を混同せず個別工程で扱う
 
-Production DB接続復旧と第1回UI改修は完了しています。通常のVercel環境変数変更禁止が適用されており、今回の文書同期ではProduction、アプリコード、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
+Migration 0006のProduction適用、postflight、Persistence 500復旧、動画あり最終スモークは完了しています。incident限定の環境変数変更許可は終了しました。今回の文書同期ではProduction、アプリコード、DB、Migration、schema、認証、API契約、利用上限、AI処理を変更しません。
 
 ## 今回の公開対象外
 
@@ -320,6 +362,22 @@ Production DB接続復旧と第1回UI改修は完了しています。通常のV
 
 ## 次の作業
 
-次工程は、承認済み期限付き例外を含むrelease candidate確定後、Production release手順を独立作成・監査し、main統合とProduction releaseの可否を別途判定することです。Productionスモークは現時点では未実施です。
+staging関連のinitial feature-branch pushからexpected-owner oracle fixまでの履歴は保持しています。expected-owner fix commit `a14ae01c2c9692f71eaf2cc3b77bb26fa45acbde`のautomatic run `33584551679`はexternal disposable PostgreSQL verifierで`RUN / FAILED`となり、reservation-concurrency setup markerをexact 1件観測しました。grant-inventory markerは再発せず、そのexact-set gateとClient closeはcontrol-flow reachability上PASSしましたが、temporary ACL cleanup terminalとPostgreSQL 18.6 workflow全体は`NOT VERIFIED`です。read-only diagnosisはdirect regressionを`RULED OUT`、newly reachable latent failureを`PROVEN`とし、underlying branchは`PROVEN 0 / UNRESOLVED 10`です。reservation-concurrency setup observabilityのlocal実装・validationと必要なdocumentation correctionは未push local chainで完了しています。現在のgateは本documentation correctionを含むcombined rangeの独立review A / Bであり、両review合格後だけnormal feature-branch pushをexact 1回実施し、そのpushによるnew HEADのautomatic PostgreSQL 18.6 CIを監視します。reservation setup failureの場合はpublic-safe diagnosticを記録して追加fixせず停止し、full workflow successの場合だけread-only remote compareへ進みます。setup query、QueryConfig、parameter、query / Client operation count、deadline、cleanup、GRANT / REVOKE、grant-inventory、Migration、workflow、production acceptance semanticsは変更しません。Draft PR、ready-for-review、merge、staging構築、Production、provider、deploymentへ進みません。
 
-この文書同期branchの作成・commit・pushはProduction操作と分離します。レビュー完了までは `main` へ統合・pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
+この文書同期branchの作成・commit・pushはProduction操作と分離します。`main`へcommit、merge、pushせず、Production deploy、Vercel設定・環境変数、Production DB、Migration、Neon、Google Cloudを変更しません。文書上の識別子と後続の実状態がdocs-only commit / deployment分だけ異なる場合は、AGENTS / Runbookの全条件を読み取り専用で確認できた場合に限り、限定例外を適用できます。
+
+## Staging database preflight hardening candidate
+
+- `ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS`を必須のserver-side process入力とし、schemaVersion 1、最大32,768 bytes、最大128 entries、各string最大128 charactersの固定contractで検証します。
+- extension name／schema／versionはdirect／pooledのbefore／afterで順序非依存のexact比較を行い、期待値不足、入力不正、catalog取得不能、inventory不一致を別checkIdでfail-closedにします。
+- direct／pooledはbeforeのread-only repeatable-read transactionを双方とも終了してから、after用のread-only repeatable-read transactionを双方で新しく開始します。GitHub Actionsのdigest固定PostgreSQL 18.6 fixtureでは第三sessionによるcommitをafterで検出し、同一snapshotを再読してdriftを見逃さないことをgateします。run `32684794700`のbroad markerは後続subphase化で解消し、run `32695896204`はexplicit runtime executionでhistorical `RUN / FAILED`でした。run `33291908052`はgrant-inventory generic marker、run `33347045917`はgrant-inventory exact-set mismatchで`RUN / FAILED`、actual root causeは`NOT VERIFIED`です。
+- public reportのexit 0は、PostgreSQL version、connection authority、database / role identity、extension inventory、migration history / catalog、user-defined object catalog、fresh before / after比較、read-only invariant、cleanup、canonical summary、overall statusの単一semantic predicateにすべて合格した場合だけ受理します。非0もexit 1 / 2＝overall / failureとも`fail`、exit 3＝両方`not_verified`のcanonical mappingだけを受理します。missing、duplicate、unknown exit、`not_verified`、exit / overall / failureの矛盾はraw reportを出さず固定exit 3へ変換します。
+- terminal reportはmemory上の単一bufferをterminal barrier後に同期write 1回だけcommitし、commit前fatalをmain結果より優先します。main AbortSignalはDB open／query scheduling／query待機／comparison／report準備／cleanup開始判断のorchestration境界へ伝播します。cleanupはmainとは別のcontrollerでdirect／pooledを同時に開始し、全体を最大5,000msに制限します。exit code 3はreport commitとlistener解除後にprocessを終了します。provider driverのnative cancellationは実provider未接続のためNOT TESTEDです。
+- network evidenceはguardを明示的に導入したNode childの拒否観測だけを示します。expected probeは専用DNS childに分離します。接続成功を観測する経路ではないため、successful guarded Node API external connectionとnative child external connectionはどちらも`NOT VERIFIED`です。
+- connection-only verifierはdatabase process、port、filesystem、terminationのauthorityを各0件に固定し、lifecycle adapterのDI seamも持ちません。接続factoryだけをproduction SQLへの境界として残し、invalid URL / identity / version / Migration maxはfactory呼出し0件で停止します。repository-owned embedded PostgreSQL command / dependencyは削除済みです。DB URL、password、host、port、database、role、raw errorはpublic resultへ含めません。
+- P3 regressionはconnection-only verifierと別moduleに置き、DBやOS utilityを所有せず、固定sourceのbenign Node childだけをabsolute `process.execPath`、`shell: false`、private IPCで起動します。mode／occurrence／capabilityは初回IPCだけで束縛し、exact message schemaとsequence、authenticated phase sequence、exit / closeのevent count・code・signal・parent monotonic timestamp、error event、exact nonzero code、exact signal、deadline時aliveを親が独立照合します。wrong / zero exit、wrong signal、deadline前正常終了、phase前failure、phase後予定外正常終了、terminal reason偽装、duplicate / malformed / replayed phaseをrejectします。resultはtop-levelとnested keyをexact allowlist化し、PID、PPID、occurrence、capabilityを出しません。
+- Windowsのlocal named pipeはcanonical `\\.\pipe\...`だけをlocal IPCとして許可し、remote UNC、slash表記、extended UNC、`options.path`のremote形式はunexpected network occurrenceとしてoriginal connect前に拒否します。POSIX local Unix domain socketの扱いは維持します。
+- preflightはconcurrency barrierではありません。承認済みの排他的maintenance window内でpreflight直後にMigrationを開始し、その間に別command、管理操作、schema / 接続先変更を挟みません。遅延、再接続、担当者変更、provider操作または予期しない活動があれば、古いPASSを流用せず新しい明示承認の下でpreflightからやり直します。同一advisory lockまたはMigration直前の同等再検証は将来候補であり、現時点では未実装です。
+- repository Migration SQL、journal、application runtime code、Production設定は変更していません。実Neon extension catalogの検証完了は主張しません。
+
+local unit testは外部fixture接続成功、PostgreSQL 18.6 native挙動、Migration、postflightを証明しません。それらのPASSはautomatic GitHub Actions workflowが成功した場合だけ判定できます。run `32695896204`、`33291908052`、`33347045917`、`33349418965`はimmutableなhistorical `RUN / FAILED`です。expected-owner oracle fix後のrun `33584551679`もreservation-concurrency setupで`RUN / FAILED`となり、TypeScript、full Vitest、full ESLintはskippedです。今回のreservation setup observability candidateはfixed internal source stageをversion marker、primary exact 1件、実際に開始されたopen-cleanupのfixed detail、既存generic phase markerの順に出力するだけです。分類不能、unbranded、malformedなinternal stateはgeneric-onlyへfail-closedにし、raw error、identity、SQL、parameter、connection metadataを出力しません。setup query / operation count / Client lifecycle / deadline / cleanup、GRANT / REVOKE / grant-inventory、Migration / workflowは変更しません。新しいautomatic PostgreSQL 18.6 CIでbranch categoryを取得する工程はcommit時点で`NOT RUN`、actual root causeは`NOT VERIFIED`です。actual staging / Production / Neon / poolerは`NOT VERIFIED`、Production Migration / deploymentは`NOT RUN`です。Next.js、npm、Vitest、Corepackその他のprocessがsensitive environment fileを読み取らなかったことも証明しません。

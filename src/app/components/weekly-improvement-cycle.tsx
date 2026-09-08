@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { SectionIntro, StatusPanel } from "@/app/components/ui-foundation";
 import type {
@@ -22,6 +22,12 @@ type Props = {
   currentAnalysisRunId: string | null;
   suggestedAction: string;
   refreshKey: number;
+  onHistoryCountChange?: (count: number | null) => void;
+  initialHistory?: WeeklyCycleHistoryResponse | null;
+  onHistoryChange?: (history: WeeklyCycleHistoryResponse) => void;
+  onHistoryRequestStart?: () => (history: WeeklyCycleHistoryResponse | null) => boolean;
+  onHistoryReadStart?: () => () => boolean;
+  historyRefreshing?: boolean;
 };
 
 const statusLabels = {
@@ -87,12 +93,18 @@ export function WeeklyImprovementCycle({
   currentAnalysisRunId,
   suggestedAction,
   refreshKey,
+  onHistoryCountChange,
+  initialHistory,
+  onHistoryChange,
+  onHistoryRequestStart,
+  onHistoryReadStart,
+  historyRefreshing = false,
 }: Props) {
   const [items, setItems] = useState<AnalysisHistoryItem[]>([]);
   const [plannedAction, setPlannedAction] =
     useState<ImprovementActionView | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [localLoading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<WeeklyCycleNotice>(null);
   const [newTitle, setNewTitle] = useState("");
@@ -100,6 +112,11 @@ export function WeeklyImprovementCycle({
   const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [resultNote, setResultNote] = useState("");
+  const initialHistoryApplied = useRef(false);
+  const initialHistoryRef = useRef(initialHistory);
+  const localHistoryGeneration = useRef(0);
+  const localHistoryCurrent = useRef<() => boolean>(() => true);
+  const loading = historyRefreshing || (localLoading && localHistoryCurrent.current());
   const hasActionForCurrentAnalysis = currentAnalysisHasAction(
     items,
     currentAnalysisRunId
@@ -111,23 +128,39 @@ export function WeeklyImprovementCycle({
     loading,
   });
 
-  const loadFirstPage = useCallback(async (): Promise<boolean> => {
+  const loadFirstPage = useCallback(async (): Promise<boolean | "superseded"> => {
+    const generation = ++localHistoryGeneration.current;
     setLoading(true);
     setNotice(null);
+    // Capture request ownership before fetch; a completion must never acquire
+    // a newer generation just because the component navigated away meanwhile.
+    const completeHistoryRequest = onHistoryRequestStart?.();
+    const sharedReadCurrent = onHistoryReadStart?.();
+    const current = () => generation === localHistoryGeneration.current && (!sharedReadCurrent || sharedReadCurrent());
+    localHistoryCurrent.current = current;
     try {
       const response = await fetch("/api/weekly-cycle?limit=10", {
         cache: "no-store",
       });
       const data: unknown = await response.json().catch(() => null);
+      if (!current()) return "superseded";
       if (!response.ok || !isHistoryResponse(data)) {
+        completeHistoryRequest?.(null);
+        onHistoryCountChange?.(null);
         setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return false;
       }
+      if (completeHistoryRequest && !completeHistoryRequest(data)) return false;
       setItems(data.items);
+      onHistoryCountChange?.(data.items.length);
       setPlannedAction(data.plannedAction);
       setNextCursor(data.nextCursor);
+      onHistoryChange?.(data);
       return true;
     } catch {
+      if (!current()) return "superseded";
+      completeHistoryRequest?.(null);
+      onHistoryCountChange?.(null);
       setNotice(
         createWeeklyCycleNotice(
           "error",
@@ -136,13 +169,37 @@ export function WeeklyImprovementCycle({
       );
       return false;
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
-  }, []);
+  }, [onHistoryChange, onHistoryCountChange, onHistoryRequestStart, onHistoryReadStart]);
 
   useEffect(() => {
+    // A save started by a previous mount can finish after this view remounts.
+    // Consume that accepted Provider snapshot without issuing another GET.
+    if (!initialHistory || initialHistory === initialHistoryRef.current) return;
+    initialHistoryRef.current = initialHistory;
+    ++localHistoryGeneration.current;
+    setItems(initialHistory.items);
+    setPlannedAction(initialHistory.plannedAction);
+    setNextCursor(initialHistory.nextCursor);
+    setLoading(false);
+  }, [initialHistory]);
+
+  useEffect(() => {
+    const seededHistory = initialHistoryRef.current;
+    if (seededHistory) {
+      if (!initialHistoryApplied.current) {
+        initialHistoryApplied.current = true;
+        setItems(seededHistory.items);
+        setPlannedAction(seededHistory.plannedAction);
+        setNextCursor(seededHistory.nextCursor);
+        setLoading(false);
+        onHistoryCountChange?.(seededHistory.items.length);
+      }
+      return;
+    }
     void loadFirstPage();
-  }, [loadFirstPage, refreshKey]);
+  }, [loadFirstPage, onHistoryCountChange, refreshKey]);
 
   useEffect(() => {
     if (!plannedAction) return;
@@ -197,6 +254,7 @@ export function WeeklyImprovementCycle({
         return;
       }
       const refreshed = await loadFirstPage();
+      if (refreshed === "superseded") return;
       if (!refreshed) {
         setNotice(
           createWeeklyCycleNotice(
@@ -240,6 +298,7 @@ export function WeeklyImprovementCycle({
         return;
       }
       const refreshed = await loadFirstPage();
+      if (refreshed === "superseded") return;
       if (!refreshed) {
         setNotice(
           createWeeklyCycleNotice(
@@ -266,6 +325,10 @@ export function WeeklyImprovementCycle({
 
   async function loadMore() {
     if (!nextCursor) return;
+    const generation = ++localHistoryGeneration.current;
+    const sharedReadCurrent = onHistoryReadStart?.();
+    const current = () => generation === localHistoryGeneration.current && (!sharedReadCurrent || sharedReadCurrent());
+    localHistoryCurrent.current = current;
     setLoading(true);
     setNotice(null);
     try {
@@ -274,6 +337,7 @@ export function WeeklyImprovementCycle({
         { cache: "no-store" }
       );
       const data: unknown = await response.json().catch(() => null);
+      if (!current()) return;
       if (!response.ok || !isHistoryResponse(data)) {
         setNotice(createWeeklyCycleNotice("error", safeMessage(response.status)));
         return;
@@ -281,11 +345,12 @@ export function WeeklyImprovementCycle({
       setItems((current) => [...current, ...data.items]);
       setNextCursor(data.nextCursor);
     } catch {
+      if (!current()) return;
       setNotice(
         createWeeklyCycleNotice("error", "履歴の続きを読み込めませんでした。")
       );
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   }
 

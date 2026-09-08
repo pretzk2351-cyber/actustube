@@ -300,10 +300,27 @@ export async function runWithUsageReservation<T>(
   reservation: UsageReservationAllowed,
   userId: string,
   operation: () => Promise<T>,
-  options?: { finalize: (result: T) => Promise<boolean> }
+  options?: {
+    finalize: (result: T) => Promise<boolean>;
+    releaseWhen?: (result: T) => boolean;
+  }
 ) {
+  let releaseAttempted = false;
+
   try {
     const result = await operation();
+
+    if (options?.releaseWhen?.(result)) {
+      releaseAttempted = true;
+      const release = await releaseUsageReservation({
+        reservationId: reservation.reservationId,
+        userId,
+      });
+      if (!release.released) {
+        throw new Error("UsageReservationReleaseFailed");
+      }
+      return result;
+    }
 
     if (options) {
       const finalized = await options.finalize(result);
@@ -330,13 +347,15 @@ export async function runWithUsageReservation<T>(
 
     return result;
   } catch (error) {
-    try {
-      await releaseUsageReservation({
-        reservationId: reservation.reservationId,
-        userId,
-      });
-    } catch (releaseError) {
-      logSafeLifecycleError("usage-reservation-release", releaseError);
+    if (!releaseAttempted) {
+      try {
+        await releaseUsageReservation({
+          reservationId: reservation.reservationId,
+          userId,
+        });
+      } catch (releaseError) {
+        logSafeLifecycleError("usage-reservation-release", releaseError);
+      }
     }
 
     throw error;
