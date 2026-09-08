@@ -34,6 +34,18 @@ import {
 } from "../scripts/verify-staging-database-postflight.mjs";
 
 const repositoryRoot = process.cwd();
+// Independent literal: neither fake database state nor expected ACL is derived
+// from the implementation manifest under test.
+const runtimeAuthAclOracle: Record<string, string[]> = {
+  analysis_runs: ["SELECT", "INSERT", "UPDATE"],
+  improvement_actions: ["SELECT", "INSERT", "UPDATE"],
+  oauth_accounts: ["SELECT", "INSERT", "UPDATE"],
+  plans: ["SELECT"],
+  usage_reservation_leases: ["SELECT", "INSERT", "DELETE"],
+  user_plan_assignments: ["SELECT", "INSERT"],
+  user_usage_buckets: ["SELECT", "INSERT", "UPDATE"],
+  users: ["SELECT", "INSERT", "UPDATE"],
+};
 const directUrl =
   "postgresql://staging_direct:dummy-password@ep-actustube-safe.example.test/staging_database?sslmode=require";
 const pooledUrl =
@@ -1074,7 +1086,8 @@ describe("ownership, ACL, RLS, and runtime privilege validation", () => {
   });
 
   it("requires a separate least-privilege runtime role and fixed search path", () => {
-    const tablePrivileges = Object.entries(RUNTIME_TABLE_PRIVILEGES).flatMap(
+    expect(RUNTIME_TABLE_PRIVILEGES).toEqual(runtimeAuthAclOracle);
+    const tablePrivileges = Object.entries(runtimeAuthAclOracle).flatMap(
       ([table_name, allowedPrivileges]) =>
         [
           "SELECT",
@@ -1157,6 +1170,24 @@ describe("ownership, ACL, RLS, and runtime privilege validation", () => {
     expect(() =>
       validateRuntimePrivileges(evidence, "owner", ["analysis_status"])
     ).not.toThrow();
+    for (const [table, privilege, allowed, code] of [
+      ["user_plan_assignments", "INSERT", false, "RUNTIME_TABLE_PRIVILEGE_MISSING"],
+      ["user_plan_assignments", "UPDATE", true, "RUNTIME_TABLE_PRIVILEGE_EXCESS"],
+      ["user_plan_assignments", "DELETE", true, "RUNTIME_TABLE_PRIVILEGE_EXCESS"],
+      ["plans", "INSERT", true, "RUNTIME_TABLE_PRIVILEGE_EXCESS"],
+    ] as const) {
+      const mutation = {
+        ...evidence,
+        runtimeTablePrivileges: tablePrivileges.map((row) =>
+          row.table_name === table && row.privilege === privilege
+            ? { ...row, allowed }
+            : row
+        ),
+      };
+      expect(() =>
+        validateRuntimePrivileges(mutation, "owner", ["analysis_status"])
+      ).toThrow(expect.objectContaining({ code }));
+    }
     for (const mutation of [
       { ...evidence, roleSecurity: [{ ...evidence.roleSecurity[0], role_oid: "owner" }] },
       { ...evidence, roleSecurity: [{ ...evidence.roleSecurity[0], rolsuper: true }] },

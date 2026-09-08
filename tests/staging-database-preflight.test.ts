@@ -40,6 +40,7 @@ import {
   runReservationConcurrencySetupObservabilityProbeForTests,
   runReservationSetupTransactionPrimaryProbeForTests,
   runReservationSetupTransactionProbeForTests,
+  runRuntimeAuthSynchronizationProbeForTests,
   runUsageBodyAclBoundaryProbeForTests,
   runUsageBodyAclOwnerOracleProbeForTests,
   validateExternalFixtureConfigurationForTests,
@@ -627,8 +628,260 @@ const externalFixturePublicSuccessOracle = Object.freeze({
   transactionRollback: true,
   postflight: true,
   postflightDriftRejected: true,
+  runtimeAuthSynchronization: true,
   verifierQueriesReadOnly: true,
   outputRedaction: true,
+});
+
+// Literal SQL/parameter oracle owned by the test, independent of the manifest
+// and of the harness constants. The fake never grants authority from a label.
+const authSyncSqlOracle = `SELECT user_id::text, account_status::text, session_version
+  FROM public.sync_google_oauth_account($1::varchar, NULL::varchar, NULL::varchar,
+  NULL::varchar, NULL::text, $2::timestamptz)`;
+const authSnapshotSqlOracle = `SELECT
+  (SELECT count(*)::integer FROM public.users) AS users,
+  (SELECT count(*)::integer FROM public.oauth_accounts) AS accounts,
+  (SELECT count(*)::integer FROM public.user_plan_assignments) AS assignments,
+  COALESCE((SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id)
+    FROM public.user_plan_assignments a JOIN public.oauth_accounts o ON o.user_id = a.user_id
+    WHERE o.provider = 'google' AND o.provider_account_id = $1::varchar), '[]'::jsonb) AS plans`;
+const authIdentitySqlOracle = "SELECT session_user AS session_role, current_user AS effective_role";
+const authSecuritySqlOracle = `SELECT r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreatedb
+  AND NOT r.rolcreaterole AND NOT r.rolreplication AND NOT r.rolbypassrls
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = r.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('public', 'drizzle') AND c.relowner = r.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_database d
+    WHERE d.datname = current_database() AND d.datdba = r.oid) AS restricted
+  FROM pg_catalog.pg_roles r WHERE r.rolname = current_user`;
+// Only line boundaries/spacing at parenthesis boundaries are normalized.
+function authSqlOracleKey(sql: string) {
+  return sql.trim().replace(/\s+/g, " ").replace(/\( /g, "(").replace(/ \)/g, ")");
+}
+
+function createRuntimeAuthFake(fault = "none") {
+  const runtimeRole = "actustube_ci_fixture_runtime";
+  const ownerRole = "actustube_ci_fixture";
+  const firstId = "00000000-0000-4000-8000-000000000081";
+  const existingId = "00000000-0000-4000-8000-000000000082";
+  type Assignment = { user_id: string; plan_code: string; status: string; source: string; starts_at: string };
+  const accounts = new Map<string, string>();
+  const assignments: Assignment[] = [];
+  let users = 0;
+  const state = {
+    insert: true, update: false, postflightCalls: 0, syncCalls: 0,
+    acl: [] as string[],
+    clients: [] as { role: string; queries: string[]; connect: number; end: number; destroy: number }[],
+  };
+  const clientFactory = ({ role }: { role: string }) => {
+    expect([runtimeRole, ownerRole]).toContain(role);
+    const clientState = { role, queries: [] as string[], connect: 0, end: 0, destroy: 0 };
+    state.clients.push(clientState);
+    return {
+      connection: { stream: { destroy() { clientState.destroy += 1; } } },
+      async connect() { clientState.connect += 1; },
+      async end() {
+        clientState.end += 1;
+        if (fault === "close") throw new Error("fixed-private-auth-error");
+      },
+      async query(sql: string, values: unknown[] = []) {
+        const key = authSqlOracleKey(sql);
+        clientState.queries.push(key);
+        if (key === authSqlOracleKey(authIdentitySqlOracle)) {
+          expect(values).toEqual([]);
+          expect(clientState.queries).toHaveLength(1);
+          if (fault === "identity-rejection" || (fault === "runtime-identity-rejection" && role === runtimeRole)) {
+            throw new Error("fixed-private-auth-error");
+          }
+          if (fault === "identity-timeout" || (fault === "runtime-identity-timeout" && role === runtimeRole)) return await new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error("fixed-private-auth-error")), 40);
+          });
+          if (fault === "runtime-identity-extra-key" && role === runtimeRole) {
+            return { rows: [{ session_role: role, effective_role: role, extra: true }] };
+          }
+          return { rows: [{ session_role: role,
+            effective_role: fault === "identity" || (fault === "runtime-identity" && role === runtimeRole)
+              ? "unexpected_fixed_role" : role }] };
+        }
+        const aclOracle = [
+          'REVOKE INSERT ON TABLE public.user_plan_assignments FROM "actustube_ci_fixture_runtime"',
+          'GRANT INSERT ON TABLE public.user_plan_assignments TO "actustube_ci_fixture_runtime"',
+          'GRANT UPDATE ON TABLE public.user_plan_assignments TO "actustube_ci_fixture_runtime"',
+          'REVOKE UPDATE ON TABLE public.user_plan_assignments FROM "actustube_ci_fixture_runtime"',
+        ];
+        const aclIndex = aclOracle.indexOf(key);
+        if (aclIndex !== -1) {
+          expect(role).toBe(ownerRole);
+          expect(values).toEqual([]);
+          state.acl.push(key);
+          if (fault === "acl-rejection") throw new Error("fixed-private-auth-error");
+          if (aclIndex < 2) state.insert = aclIndex === 1;
+          else state.update = aclIndex === 2;
+          return { rows: [] };
+        }
+        expect(role).toBe(runtimeRole);
+        if (key === authSqlOracleKey(authSecuritySqlOracle)) {
+          expect(values).toEqual([]);
+          return { rows: [{ restricted: fault !== "owner-membership" }] };
+        }
+        if (key === "BEGIN" || key === "ROLLBACK") {
+          expect(values).toEqual([]);
+          if (key === "ROLLBACK" && fault !== "residue") {
+            accounts.clear(); assignments.length = 0; users = 0;
+          }
+          return { rows: [] };
+        }
+        if (key === authSqlOracleKey(authSnapshotSqlOracle)) {
+          expect(values).toHaveLength(1);
+          expect(["runtime-auth-fixture-first", "runtime-auth-fixture-existing"]).toContain(values[0]);
+          const id = accounts.get(String(values[0]));
+          return { rows: [{ users, accounts: accounts.size, assignments: assignments.length,
+            plans: structuredClone(assignments.filter((row) => row.user_id === id)) }] };
+        }
+        if (key === authSqlOracleKey(authSyncSqlOracle)) {
+          state.syncCalls += 1;
+          expect(values).toEqual([
+            state.syncCalls <= 3 ? "runtime-auth-fixture-first" : "runtime-auth-fixture-existing",
+            ["2000-01-01T00:00:00Z", "2000-01-01T00:00:00Z", "2000-01-02T00:00:00Z", "2000-01-03T00:00:00Z"][state.syncCalls - 1],
+          ]);
+          if (fault === "sync-timeout") return await new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error("fixed-private-auth-error")), 40);
+          });
+          if (!state.insert) {
+            if (fault === "old-unexpected-success") return { rows: [] };
+            throw Object.assign(new Error(fault === "wrong-permission-object"
+              ? "permission denied for table users" : "permission denied for table user_plan_assignments"),
+            { code: fault === "wrong-sqlstate" ? "42601" : "42501" });
+          }
+          const account = String(values[0]);
+          let id = accounts.get(account);
+          if (!id) {
+            id = firstId; accounts.set(account, id); users += 1;
+            if (fault !== "missing-assignment") assignments.push({ user_id: id, plan_code: "free",
+              status: "active", source: "system", starts_at: String(values[1]) });
+          } else if (fault === "duplicate") {
+            users += 1;
+          } else if (fault === "overwrite-manual" && account === "runtime-auth-fixture-existing") {
+            assignments.find((row) => row.user_id === id)!.source = "system";
+          }
+          return { rows: [{ user_id: id, account_status: "active", session_version: 1 }] };
+        }
+        if (key === "INSERT INTO public.users DEFAULT VALUES RETURNING id::text") {
+          expect(values).toEqual([]); users += 1; return { rows: [{ id: existingId }] };
+        }
+        if (key === "INSERT INTO public.oauth_accounts (user_id, provider, provider_account_id) VALUES ($1::uuid, 'google', $2::varchar)") {
+          expect(values).toEqual([existingId, "runtime-auth-fixture-existing"]);
+          accounts.set("runtime-auth-fixture-existing", existingId); return { rows: [] };
+        }
+        if (key === "INSERT INTO public.user_plan_assignments (user_id, plan_code, source, starts_at) VALUES ($1::uuid, 'free', 'manual', '1999-01-01T00:00:00Z'::timestamptz)") {
+          expect(values).toEqual([existingId]); assignments.push({ user_id: existingId,
+            plan_code: "free", status: "active", source: "manual", starts_at: "1999-01-01T00:00:00Z" });
+          return { rows: [] };
+        }
+        throw new Error("UNEXPECTED_AUTH_FIXTURE_QUERY");
+      },
+    };
+  };
+  const postflight = async () => {
+    state.postflightCalls += 1;
+    const checkId = fault === "wrong-postflight" ? "TABLE_SET_MISMATCH"
+      : !state.insert ? "RUNTIME_TABLE_PRIVILEGE_MISSING"
+      : state.update ? "RUNTIME_TABLE_PRIVILEGE_EXCESS" : null;
+    return { report: checkId === null
+      ? { exitCode: 0, runtimePrivileges: "pass", acl: "pass" }
+      : { exitCode: 1, failure: { checkId } } };
+  };
+  return { clientFactory, postflight, state };
+}
+
+describe("formal runtime auth synchronization fixture", () => {
+  it("executes old ACL rejection, new auth and re-sync, manual assignment preservation, exact postflight and rollback", async () => {
+    const fake = createRuntimeAuthFake();
+    const result = await runRuntimeAuthSynchronizationProbeForTests({
+      clientFactory: fake.clientFactory, postflight: fake.postflight, deadlineLimits: undefined,
+    });
+    expect(result).toEqual({ completed: true, timedOut: false, activeClientCount: 0,
+      destroyedClientCount: 0, output: "" });
+    expect(fake.state.syncCalls).toBe(4);
+    expect(fake.state.postflightCalls).toBe(4);
+    expect(fake.state.insert).toBe(true);
+    expect(fake.state.update).toBe(false);
+    expect(fake.state.acl).toEqual([
+      'REVOKE INSERT ON TABLE public.user_plan_assignments FROM "actustube_ci_fixture_runtime"',
+      'GRANT INSERT ON TABLE public.user_plan_assignments TO "actustube_ci_fixture_runtime"',
+      'GRANT UPDATE ON TABLE public.user_plan_assignments TO "actustube_ci_fixture_runtime"',
+      'REVOKE UPDATE ON TABLE public.user_plan_assignments FROM "actustube_ci_fixture_runtime"',
+    ]);
+    expect(fake.state.clients).toHaveLength(6);
+    for (const client of fake.state.clients) {
+      expect(client.queries[0]).toBe(authIdentitySqlOracle);
+      expect([client.connect, client.end, client.destroy]).toEqual([1, 1, 0]);
+      if (client.role === "actustube_ci_fixture_runtime") {
+        expect(client.queries.filter((query) => query === "ROLLBACK")).toHaveLength(1);
+      }
+    }
+  });
+
+  it.each(["identity", "identity-rejection", "runtime-identity", "runtime-identity-rejection",
+    "runtime-identity-extra-key", "owner-membership", "old-unexpected-success",
+    "wrong-permission-object", "wrong-sqlstate", "missing-assignment", "duplicate",
+    "overwrite-manual", "residue", "wrong-postflight", "acl-rejection", "close"])(
+    "rejects runtime auth %s without publishing synthetic identity or errors", async (fault) => {
+      const fake = createRuntimeAuthFake(fault);
+      const result = await runRuntimeAuthSynchronizationProbeForTests({
+        clientFactory: fake.clientFactory, postflight: fake.postflight, deadlineLimits: undefined,
+      });
+      expect(result.completed).toBe(false);
+      expect(result.activeClientCount).toBe(0);
+      expect(result.output).toBe("EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_UNKNOWN\n");
+      if (["identity", "identity-rejection", "runtime-identity", "runtime-identity-rejection",
+        "runtime-identity-extra-key", "owner-membership", "wrong-postflight"].includes(fault)) {
+        expect(fake.state.syncCalls).toBe(0);
+      }
+    }
+  );
+
+  it.each(["identity-timeout", "runtime-identity-timeout", "sync-timeout"])("bounds runtime auth %s without querying a timed-out client", async (fault) => {
+    vi.useFakeTimers();
+    const unhandled: unknown[] = [];
+    const listener = (error: unknown) => unhandled.push(error);
+    process.on("unhandledRejection", listener);
+    try {
+      const fake = createRuntimeAuthFake(fault);
+      const pending = runRuntimeAuthSynchronizationProbeForTests({
+        clientFactory: fake.clientFactory, postflight: fake.postflight,
+        deadlineLimits: { totalMilliseconds: 100, queryMilliseconds: 5 },
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      const result = await pending;
+      const queries = fake.state.clients.map((client) => client.queries.length);
+      await vi.advanceTimersByTimeAsync(40);
+      expect(result.completed).toBe(false);
+      expect(result.timedOut).toBe(true);
+      expect(result.destroyedClientCount).toBe(1);
+      expect(result.activeClientCount).toBe(0);
+      expect(fake.state.clients.map((client) => client.queries.length)).toEqual(queries);
+      expect(fake.state.clients.filter((client) => client.destroy === 1).every((client) => client.end === 0)).toBe(true);
+      expect(unhandled).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      process.off("unhandledRejection", listener);
+      vi.useRealTimers();
+    }
+  });
+
+  it("awaits runtime auth on the existing external PostgreSQL CI path before reporting success", async () => {
+    const source = await readFile(resolve(repositoryRoot, "scripts/test-staging-database-preflight-postgres.mjs"), "utf8");
+    const main = sourceSection(source, "async function runConnectionOnlyHarnessWithinContext(options, context)",
+      "export async function runConnectionOnlyHarness(options = {})");
+    expect(main).toMatch(/await verifyRuntimeAuthSynchronization\(\s*context, resolvedClientFactory, configuration, identityAuthority,\s*\(\) => runPostflight\(context, resolvedClientFactory, configuration\)\s*\);/);
+    expect(main.indexOf("await verifyRuntimeAuthSynchronization(")).toBeLessThan(main.indexOf("return publicSuccessResult()"));
+    const workflow = await readFile(resolve(repositoryRoot, ".github/workflows/staging-database-preflight.yml"), "utf8");
+    expect(workflow).toContain("node scripts/test-staging-database-preflight-postgres.mjs");
+    expect(workflow).toContain("Run external disposable PostgreSQL verifier");
+    expect(externalFixtureSuccessResultForTests().runtimeAuthSynchronization).toBe(true);
+  });
 });
 
 const externalFixtureUnknownMarkerOracle = Object.freeze([
@@ -8838,6 +9091,7 @@ describe("connection-only external fixture boundary", () => {
         "runReservationConcurrencySetupObservabilityProbeForTests",
         "runReservationSetupTransactionPrimaryProbeForTests",
         "runReservationSetupTransactionProbeForTests",
+        "runRuntimeAuthSynchronizationProbeForTests",
         "runUsageBodyAclBoundaryProbeForTests",
         "runUsageBodyAclOwnerOracleProbeForTests",
         "validateExternalFixtureConfigurationForTests",
@@ -11956,6 +12210,7 @@ describe("connection-only external fixture boundary", () => {
         "outputRedaction",
         "postflight",
         "postflightDriftRejected",
+        "runtimeAuthSynchronization",
         "postgresqlMajor",
         "snapshotDriftRejected",
         "stablePreflight",

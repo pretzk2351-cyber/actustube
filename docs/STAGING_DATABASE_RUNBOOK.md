@@ -206,6 +206,33 @@ journalやSQL fileが増減した場合はfailするため、将来Migrationで�
 
 role名、owner名、grantee名は出力しません。
 
+### 認証同期に必要なruntime ACLとowner / runtime準備
+
+`sync_google_oauth_account`はMigration 0001の`SECURITY INVOKER`関数です。新規ログインでは`users`と`oauth_accounts`へINSERTし、再同期では両tableをSELECT / UPDATEします。どちらの経路も`user_plan_assignments`へのINSERTを試み、activeな既存割当があれば`ON CONFLICT ... DO NOTHING`で保持します。`RETURNING`、参照条件、競合判定には既存SELECT権限を使用し、UUID defaultは`gen_random_uuid()`なので追加sequence権限は不要です。割当tableのUPDATE / DELETEは使用しません。
+
+正式manifestのtable権限は次のexact setです。今回の変更は`user_plan_assignments`のINSERT 1権限だけです。
+
+| Table | Runtime privileges |
+| --- | --- |
+| users / oauth_accounts / user_usage_buckets / analysis_runs / improvement_actions | SELECT, INSERT, UPDATE |
+| plans | SELECT |
+| user_plan_assignments | SELECT, INSERT |
+| usage_reservation_leases | SELECT, INSERT, DELETE |
+
+このINSERT許可は関数内だけに限定されず、server-side runtimeからの直接INSERTも許可します。現行設計ではruntime credentialをserverだけが保持し、APIの認証・所有確認・利用枠制御を信頼境界とします。browserへcredentialを渡さず、runtimeのowner化、owner membership、SECURITY DEFINER化、不要UPDATE / DELETE、GRANT ALLで代用しません。直接INSERTをDB権限で全面禁止する設計へ変更する場合は、このmanifest修正とは別の設計判断が必要です。
+
+承認済みの専用stagingでは、次の順序で準備します。この記載だけでDB操作を許可するものではありません。
+
+1. providerのproject / branch / endpoint対応から実Productionとの分離を確認し、direct migration ownerとpooled non-owner runtimeを固定する。branchの表示名だけでは分類しない。両接続の安全ゲートを満たすstaging role名、別credential、制限されたrole属性とmembership 0を確認する。
+2. 空bootstrap候補、Migration履歴、既存owner / default ACLを再観測する。既存default ACLは対象owner・object kind・grantee・grant optionを評価し、存在だけで一括削除しない。必要なowner / runtime準備だけを承認範囲で実施する。想定外権限や未知objectは自動修復しない。
+3. 正式preflightを通し、Migration開始直前にidentity / 履歴 / catalogが変わっていないことを再確認する。未適用の0000〜0006だけをmigration ownerで正式runnerにより適用する。runtimeにMigration実行権限を与えない。
+4. database、public / drizzle schemaと管理objectのownerを正式owner方針へ揃え、runtimeにはschema USAGE、上表のexact table権限、正式enum USAGE、正式function EXECUTE、ledger SELECTだけを付与する。ledger INSERT、application sequence privilege、schema / database CREATE、grant optionは与えない。PUBLICのtable / function権限とdefault PUBLIC EXECUTEも正式postflight契約に合わせる。
+5. 正式postflightでowner、runtime、PUBLIC / default ACL、SECURITY INVOKER、search path、exact privilege setとread-only smokeを確認する。不足だけでなく過剰権限もFAILとする。成功するまでretryせず、結果不明時もPreview設定へ進まない。
+
+認証同期の書込み回帰検証は、実stagingではなく既存GitHub Actionsの使い捨てPostgreSQL 18.6だけで行います。Migration済み・canonical owner確認後、正式postflight PASS、旧ACL相当のINSERT除去と正式不足判定、非owner runtimeの固定objectに対する権限エラー、INSERT復元後の新規同期・同一利用者再同期・既存manual割当保持を順に確認します。runtimeは実LOGIN接続でsession / effective role、非owner、membershipなしと制限role属性を確認し、合成入力だけを使用します。合成データはtransactionのROLLBACKと件数照合で非残存を確認します。さらに不要UPDATEを一時追加して正式postflightの過剰判定を確認し、exact REVOKE後のpostflight PASSまで要求します。
+
+これらは同じabsolute deadlineとbounded owned Clientを使い、timeout後のquery、無制限cleanup、retryは追加しません。失敗時の出力は既存の固定phase markerだけで、raw error・合成利用者・SQLは公開しません。全controlをawaitした実行経路の成功結果にだけ`runtimeAuthSynchronization: true`が含まれます。test-local literal ACL / SQL oracleとfake Clientはactual PostgreSQL semanticsの証明ではありません。この修正の新headに対する外部PostgreSQL gate、実staging準備、認証済みPreview QAは、それぞれの実行結果が得られるまでNOT VERIFIEDです。
+
 ### pooled runtime read-only smoke
 
 `crypto.randomUUID()`で生成した合成UUIDだけを使用します。users、analysis history、improvement item、reservation leaseのいずれにも存在しないことを件数だけで確認し、collision時は最大3回まで別UUIDを生成します。

@@ -139,7 +139,7 @@ export const RUNTIME_TABLE_PRIVILEGES = Object.freeze({
   oauth_accounts: ["SELECT", "INSERT", "UPDATE"],
   plans: ["SELECT"],
   usage_reservation_leases: ["SELECT", "INSERT", "DELETE"],
-  user_plan_assignments: ["SELECT"],
+  user_plan_assignments: ["SELECT", "INSERT"],
   user_usage_buckets: ["SELECT", "INSERT", "UPDATE"],
   users: ["SELECT", "INSERT", "UPDATE"],
 });

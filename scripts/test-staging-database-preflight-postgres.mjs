@@ -6033,9 +6033,9 @@ async function configureRuntimeAcl(client, configuration) {
       public.analysis_runs,
       public.improvement_actions
       TO ${quoteIdentifier(RUNTIME_ROLE)};
-    GRANT SELECT ON TABLE
-      public.plans,
-      public.user_plan_assignments
+    GRANT SELECT ON TABLE public.plans
+      TO ${quoteIdentifier(RUNTIME_ROLE)};
+    GRANT SELECT, INSERT ON TABLE public.user_plan_assignments
       TO ${quoteIdentifier(RUNTIME_ROLE)};
     GRANT SELECT, INSERT, DELETE ON TABLE
       public.usage_reservation_leases
@@ -7268,6 +7268,233 @@ async function runPostflight(context, clientFactory, configuration) {
   return { report, statements };
 }
 
+const RUNTIME_AUTH_SYNC_SQL = `
+  SELECT user_id::text, account_status::text, session_version
+  FROM public.sync_google_oauth_account(
+    $1::varchar, NULL::varchar, NULL::varchar, NULL::varchar,
+    NULL::text, $2::timestamptz
+  )
+`;
+const RUNTIME_AUTH_SNAPSHOT_SQL = `
+  SELECT
+    (SELECT count(*)::integer FROM public.users) AS users,
+    (SELECT count(*)::integer FROM public.oauth_accounts) AS accounts,
+    (SELECT count(*)::integer FROM public.user_plan_assignments) AS assignments,
+    COALESCE((SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id)
+      FROM public.user_plan_assignments a
+      JOIN public.oauth_accounts o ON o.user_id = a.user_id
+      WHERE o.provider = 'google' AND o.provider_account_id = $1::varchar),
+      '[]'::jsonb) AS plans
+`;
+
+async function runtimeAuthSnapshot(client, providerAccount) {
+  const row = singleExactRow(
+    await client.query(RUNTIME_AUTH_SNAPSHOT_SQL, [providerAccount]),
+    ["users", "accounts", "assignments", "plans"],
+    "EXTERNAL_FIXTURE_RUNTIME_AUTH_SNAPSHOT_INVALID"
+  );
+  requireHarness(
+    [row.users, row.accounts, row.assignments].every(
+      (value) => Number.isSafeInteger(value) && value >= 0
+    ) && Array.isArray(row.plans),
+    "EXTERNAL_FIXTURE_RUNTIME_AUTH_SNAPSHOT_INVALID"
+  );
+  return row;
+}
+
+async function assertAuthRuntimeIdentity(client) {
+  const row = singleExactRow(
+    await client.query(`SELECT
+       session_user AS session_role,
+       current_user AS effective_role`),
+    ["session_role", "effective_role"],
+    "EXTERNAL_FIXTURE_RUNTIME_AUTH_IDENTITY_INVALID"
+  );
+  requireHarness(
+    row.session_role === RUNTIME_ROLE && row.effective_role === RUNTIME_ROLE,
+    "EXTERNAL_FIXTURE_RUNTIME_AUTH_IDENTITY_INVALID"
+  );
+  const security = singleExactRow(
+    await client.query(`
+      SELECT r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreatedb
+        AND NOT r.rolcreaterole AND NOT r.rolreplication AND NOT r.rolbypassrls
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m
+          WHERE m.member = r.oid)
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname IN ('public', 'drizzle') AND c.relowner = r.oid)
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_database d
+          WHERE d.datname = current_database() AND d.datdba = r.oid)
+        AS restricted
+      FROM pg_catalog.pg_roles r WHERE r.rolname = current_user
+    `),
+    ["restricted"],
+    "EXTERNAL_FIXTURE_RUNTIME_AUTH_ROLE_INVALID"
+  );
+  requireHarness(security.restricted === true, "EXTERNAL_FIXTURE_RUNTIME_AUTH_ROLE_INVALID");
+}
+
+async function verifyAuthRuntimeExecution(context, client, oldAcl) {
+  await assertAuthRuntimeIdentity(client);
+  const providerAccount = "runtime-auth-fixture-first";
+  const before = await runtimeAuthSnapshot(client, providerAccount);
+  requireHarness(before.plans.length === 0, "EXTERNAL_FIXTURE_RUNTIME_AUTH_COLLISION");
+  await client.query("BEGIN");
+  let primaryFailure = null;
+  try {
+    if (oldAcl) {
+      let rejected = false;
+      try {
+        await client.query(RUNTIME_AUTH_SYNC_SQL, [providerAccount, "2000-01-01T00:00:00Z"]);
+      } catch (error) {
+        // SQLSTATE plus the exact fixed object, not a generic permission error.
+        rejected = error?.code === "42501" &&
+          error?.message === "permission denied for table user_plan_assignments";
+        if (isHarnessTimeout(error)) throw error;
+      }
+      requireHarness(rejected, "EXTERNAL_FIXTURE_RUNTIME_AUTH_OLD_ACL_NOT_REJECTED");
+    } else {
+      const first = singleExactRow(
+        await client.query(RUNTIME_AUTH_SYNC_SQL, [providerAccount, "2000-01-01T00:00:00Z"]),
+        ["user_id", "account_status", "session_version"],
+        "EXTERNAL_FIXTURE_RUNTIME_AUTH_SYNC_INVALID"
+      );
+      requireHarness(
+        typeof first.user_id === "string" &&
+          /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(first.user_id) &&
+          first.account_status === "active" && first.session_version === 1,
+        "EXTERNAL_FIXTURE_RUNTIME_AUTH_SYNC_INVALID"
+      );
+      const created = await runtimeAuthSnapshot(client, providerAccount);
+      requireHarness(
+        created.users === before.users + 1 && created.accounts === before.accounts + 1 &&
+          created.assignments === before.assignments + 1 && created.plans.length === 1 &&
+          created.plans[0].user_id === first.user_id && created.plans[0].plan_code === "free" &&
+          created.plans[0].status === "active" && created.plans[0].source === "system",
+        "EXTERNAL_FIXTURE_RUNTIME_AUTH_ASSIGNMENT_INVALID"
+      );
+      const repeated = singleExactRow(
+        await client.query(RUNTIME_AUTH_SYNC_SQL, [providerAccount, "2000-01-02T00:00:00Z"]),
+        ["user_id", "account_status", "session_version"],
+        "EXTERNAL_FIXTURE_RUNTIME_AUTH_RESYNC_INVALID"
+      );
+      requireHarness(
+        JSON.stringify(repeated) === JSON.stringify(first) &&
+          JSON.stringify(await runtimeAuthSnapshot(client, providerAccount)) === JSON.stringify(created),
+        "EXTERNAL_FIXTURE_RUNTIME_AUTH_RESYNC_INVALID"
+      );
+      // A distinct pre-existing manual assignment must not become a new system
+      // assignment. These fixed INSERTs also exercise the documented table grant.
+      const existing = "runtime-auth-fixture-existing";
+      const seeded = singleExactRow(
+        await client.query("INSERT INTO public.users DEFAULT VALUES RETURNING id::text"),
+        ["id"], "EXTERNAL_FIXTURE_RUNTIME_AUTH_SEED_INVALID"
+      );
+      await client.query(
+        "INSERT INTO public.oauth_accounts (user_id, provider, provider_account_id) VALUES ($1::uuid, 'google', $2::varchar)",
+        [seeded.id, existing]
+      );
+      await client.query(
+        "INSERT INTO public.user_plan_assignments (user_id, plan_code, source, starts_at) VALUES ($1::uuid, 'free', 'manual', '1999-01-01T00:00:00Z'::timestamptz)",
+        [seeded.id]
+      );
+      const manual = await runtimeAuthSnapshot(client, existing);
+      requireHarness(manual.plans.length === 1 && manual.plans[0].source === "manual",
+        "EXTERNAL_FIXTURE_RUNTIME_AUTH_SEED_INVALID");
+      const synchronized = singleExactRow(
+        await client.query(RUNTIME_AUTH_SYNC_SQL, [existing, "2000-01-03T00:00:00Z"]),
+        ["user_id", "account_status", "session_version"],
+        "EXTERNAL_FIXTURE_RUNTIME_AUTH_RESYNC_INVALID"
+      );
+      requireHarness(synchronized.user_id === seeded.id &&
+        synchronized.account_status === "active" && synchronized.session_version === 1 &&
+        JSON.stringify(await runtimeAuthSnapshot(client, existing)) === JSON.stringify(manual),
+      "EXTERNAL_FIXTURE_RUNTIME_AUTH_RESYNC_INVALID");
+    }
+  } catch (error) {
+    primaryFailure = error;
+  }
+  // Use only this still-usable Client and the original absolute deadline. Closing
+  // a destroyed connection rolls back server-side; do not query after timeout.
+  if (!context.timedOut) {
+    try { await client.query("ROLLBACK"); }
+    catch (error) { if (primaryFailure === null) primaryFailure = error; }
+  }
+  if (primaryFailure !== null) throw primaryFailure;
+  requireHarness(
+    JSON.stringify(await runtimeAuthSnapshot(client, providerAccount)) === JSON.stringify(before),
+    "EXTERNAL_FIXTURE_RUNTIME_AUTH_RESIDUE"
+  );
+}
+
+async function verifyRuntimeAuthSynchronization(
+  context, clientFactory, configuration, identityAuthority, postflightOperation
+) {
+  const expectedOwner = requireOriginalObservedSessionIdentity(
+    identityAuthority, identityAuthority.observedSessionIdentity
+  );
+  const mutateAcl = (sql) => withClient(context, clientFactory,
+    fixtureCredentials(configuration), async (client) => {
+      await observeSessionIdentity(client, expectedOwner, "EXTERNAL_FIXTURE_RUNTIME_AUTH_OWNER_INVALID");
+      await client.query(sql);
+    });
+  const runtimeExecution = (oldAcl) => withClient(context, clientFactory,
+    fixtureCredentials(configuration, { role: RUNTIME_ROLE, password: RUNTIME_PASSWORD }),
+    (client) => verifyAuthRuntimeExecution(context, client, oldAcl));
+  const requirePostflight = async (checkId) => {
+    const { report } = await postflightOperation();
+    requireHarness(checkId === null
+      ? report.exitCode === 0 && report.runtimePrivileges === "pass" && report.acl === "pass"
+      : report.exitCode === 1 && report.failure?.checkId === checkId,
+    "EXTERNAL_FIXTURE_RUNTIME_AUTH_POSTFLIGHT_INVALID");
+  };
+  let restoreSql = null;
+  let primaryFailure = null;
+  try {
+    await requirePostflight(null);
+    restoreSql = `GRANT INSERT ON TABLE public.user_plan_assignments TO ${quoteIdentifier(RUNTIME_ROLE)}`;
+    await mutateAcl(`REVOKE INSERT ON TABLE public.user_plan_assignments FROM ${quoteIdentifier(RUNTIME_ROLE)}`);
+    await requirePostflight("RUNTIME_TABLE_PRIVILEGE_MISSING");
+    await runtimeExecution(true);
+    const restoreInsert = restoreSql;
+    restoreSql = null;
+    await mutateAcl(restoreInsert);
+    await runtimeExecution(false);
+    restoreSql = `REVOKE UPDATE ON TABLE public.user_plan_assignments FROM ${quoteIdentifier(RUNTIME_ROLE)}`;
+    await mutateAcl(`GRANT UPDATE ON TABLE public.user_plan_assignments TO ${quoteIdentifier(RUNTIME_ROLE)}`);
+    await requirePostflight("RUNTIME_TABLE_PRIVILEGE_EXCESS");
+  } catch (error) {
+    primaryFailure = error;
+  }
+  if (restoreSql !== null && !context.timedOut) {
+    try { await mutateAcl(restoreSql); }
+    catch (error) { if (primaryFailure === null) primaryFailure = error; }
+  }
+  if (primaryFailure !== null) throw primaryFailure;
+  await requirePostflight(null);
+  return true;
+}
+
+export async function runRuntimeAuthSynchronizationProbeForTests(options) {
+  requireHarness(exactOwnKeys(options, ["clientFactory", "postflight", "deadlineLimits"]) &&
+    typeof options.clientFactory === "function" && typeof options.postflight === "function",
+  "EXTERNAL_FIXTURE_RUNTIME_AUTH_PROBE_INVALID");
+  const context = createDeadlineContext(options.deadlineLimits);
+  const observed = Object.freeze({ sessionRole: "actustube_ci_fixture" });
+  let completed = false;
+  let failure = null;
+  try {
+    completed = await verifyRuntimeAuthSynchronization(context, options.clientFactory,
+      Object.freeze({ host: "127.0.0.1", port: 5432, database: "actustube_ci_fixture",
+        role: "actustube_ci_fixture", password: "fixed_test_only_password" }),
+      createObservedSessionIdentityAuthority(observed), options.postflight);
+  } catch (error) { failure = error; }
+  return Object.freeze({ completed, timedOut: context.timedOut,
+    activeClientCount: context.activeClients.size,
+    destroyedClientCount: [...context.ownedClients].filter((client) => client.destroyed).length,
+    output: failure === null ? "" : externalFixtureFailureOutput(failure) });
+}
+
 function publicSuccessResult() {
   return Object.freeze({
     success: true,
@@ -7286,6 +7513,7 @@ function publicSuccessResult() {
     transactionRollback: true,
     postflight: true,
     postflightDriftRejected: true,
+    runtimeAuthSynchronization: true,
     verifierQueriesReadOnly: true,
     outputRedaction: true,
   });
@@ -8477,6 +8705,12 @@ async function runConnectionOnlyHarnessWithinContext(options, context) {
       resolvedClientFactory,
       fixtureCredentials(configuration),
       (client) => client.query("DROP TABLE public.external_fixture_postflight_drift")
+    );
+    // Required, awaited production path; a fake probe or static catalog PASS is
+    // not a substitute for the non-owner runtime's actual function calls.
+    await verifyRuntimeAuthSynchronization(
+      context, resolvedClientFactory, configuration, identityAuthority,
+      () => runPostflight(context, resolvedClientFactory, configuration)
     );
   });
 
