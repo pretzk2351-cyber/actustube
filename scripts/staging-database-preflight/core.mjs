@@ -384,6 +384,42 @@ extension_candidate_signature(object_signature) AS (
 `;
 
 const SQL = Object.freeze({
+  // No role/schema/object filtering: unknown or unresolvable ACLs remain visible.
+  providerInitialAcl: `
+    SELECT
+      (SELECT count(*)::integer FROM pg_catalog.pg_default_acl) AS catalog_count,
+      COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'signature', 'other:' || 'pg_default_acl'::pg_catalog.regclass::oid::text || ':' || d.oid::text || ':0',
+        'creator', creator.rolname, 'global', d.defaclnamespace = 0,
+        'schema', namespace.nspname, 'kind', d.defaclobjtype::text,
+        'aclNull', d.defaclacl IS NULL, 'aclItems', cardinality(d.defaclacl),
+        'entries', COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+          'grantor', grantor.rolname,
+          'recipient', CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE recipient.rolname END,
+          'privilege', acl.privilege_type, 'grantOption', acl.is_grantable
+        )) FROM pg_catalog.aclexplode(d.defaclacl) AS acl
+        LEFT JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = acl.grantor
+        LEFT JOIN pg_catalog.pg_roles AS recipient ON recipient.oid = acl.grantee), '[]'::jsonb)
+      )) FROM pg_catalog.pg_default_acl AS d
+      LEFT JOIN pg_catalog.pg_roles AS creator ON creator.oid = d.defaclrole
+      LEFT JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = d.defaclnamespace), '[]'::jsonb) AS acls,
+      COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'name', r.rolname, 'login', r.rolcanlogin, 'inherit', r.rolinherit,
+        'superuser', r.rolsuper, 'createDb', r.rolcreatedb, 'createRole', r.rolcreaterole,
+        'replication', r.rolreplication, 'bypassRls', r.rolbypassrls, 'connectionLimit', r.rolconnlimit
+      )) FROM pg_catalog.pg_roles AS r
+      WHERE r.rolname IN ('cloud_admin', 'neon_superuser', 'neondb_owner')), '[]'::jsonb) AS roles,
+      COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'role', granted.rolname, 'member', member_role.rolname,
+        'grantorIsBootstrap', m.grantor = 10 AND grantor.rolsuper,
+        'admin', m.admin_option, 'inherit', m.inherit_option, 'set', m.set_option
+      )) FROM pg_catalog.pg_auth_members AS m
+      LEFT JOIN pg_catalog.pg_roles AS granted ON granted.oid = m.roleid
+      LEFT JOIN pg_catalog.pg_roles AS member_role ON member_role.oid = m.member
+      LEFT JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = m.grantor
+      WHERE m.roleid IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname IN ('cloud_admin', 'neon_superuser', 'neondb_owner'))
+         OR m.member IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname IN ('cloud_admin', 'neon_superuser', 'neondb_owner'))), '[]'::jsonb) AS memberships
+  `,
   serverVersion: `
     SELECT pg_catalog.current_setting('server_version_num', true)
       AS server_version_num
@@ -1357,7 +1393,7 @@ const SQL = Object.freeze({
 async function collectPreflightEvidence(
   connection,
   onQuery,
-  { signal } = {}
+  { signal, providerProfile = null } = {}
 ) {
   throwIfPreflightAborted(signal);
   const serverVersionRow = (
@@ -1426,6 +1462,12 @@ async function collectPreflightEvidence(
     throw notVerified("USER_OBJECT_CATALOG_UNAVAILABLE");
   }
 
+  let providerInitialAcl;
+  if (providerProfile !== null) {
+    const result = await runQuery(connection, SQL.providerInitialAcl, [], onQuery, { signal });
+    providerInitialAcl = normalizeProviderInitialAcl(result.rows);
+  }
+
   return {
     serverVersion,
     identity,
@@ -1438,7 +1480,137 @@ async function collectPreflightEvidence(
     migrationHistory,
     migrationExact,
     userDefinedObjects,
+    ...(providerProfile === null ? {} : { providerInitialAcl }),
   };
+}
+
+const PROVIDER_INITIAL_ACL_PROFILE = "neon-pg18-initial-default-acl-v1";
+
+function parseProviderInitialAclProfile(environment) {
+  const profile = environment.ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE;
+  if (profile === undefined) return null;
+  requireCondition(profile === PROVIDER_INITIAL_ACL_PROFILE, "PROVIDER_INITIAL_ACL_PROFILE_INVALID");
+  return profile;
+}
+
+function exactProviderKeys(value, keys) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Reflect.ownKeys(value).length !== keys.length ||
+      !keys.every((key) => Object.hasOwn(value, key))) {
+    throw notVerified("PROVIDER_INITIAL_ACL_INVENTORY_INVALID");
+  }
+}
+
+function canonicalProviderRecords(rows, keys) {
+  if (!Array.isArray(rows) || rows.length > 128) {
+    throw notVerified("PROVIDER_INITIAL_ACL_INVENTORY_INVALID");
+  }
+  const records = rows.map((row) => {
+    exactProviderKeys(row, keys);
+    return Object.fromEntries(keys.map((key) => [key, row[key]]));
+  }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  if (new Set(records.map((row) => JSON.stringify(row))).size !== records.length) {
+    throw notVerified("PROVIDER_INITIAL_ACL_INVENTORY_INVALID");
+  }
+  return records;
+}
+
+const PROVIDER_ROLE_KEYS = Object.freeze([
+  "name", "login", "inherit", "superuser", "createDb", "createRole", "replication", "bypassRls", "connectionLimit",
+]);
+const PROVIDER_MEMBERSHIP_KEYS = Object.freeze(["role", "member", "grantorIsBootstrap", "admin", "inherit", "set"]);
+const PROVIDER_ACL_ENTRY_KEYS = Object.freeze(["grantor", "recipient", "privilege", "grantOption"]);
+const PROVIDER_ACL_KEYS = Object.freeze(["signature", "creator", "global", "schema", "kind", "aclNull", "aclItems", "entries"]);
+
+function normalizeProviderInitialAcl(rows) {
+  if (!Array.isArray(rows) || rows.length !== 1) {
+    throw notVerified("PROVIDER_INITIAL_ACL_INVENTORY_INVALID");
+  }
+  const row = rows[0];
+  exactProviderKeys(row, ["catalog_count", "acls", "roles", "memberships"]);
+  if (!Number.isSafeInteger(row.catalog_count) || row.catalog_count < 0 ||
+      !Array.isArray(row.acls) || row.catalog_count !== row.acls.length || row.acls.length > 128) {
+    throw notVerified("PROVIDER_INITIAL_ACL_INVENTORY_INVALID");
+  }
+  const acls = row.acls.map((acl) => {
+    exactProviderKeys(acl, PROVIDER_ACL_KEYS);
+    if (typeof acl.signature !== "string" || !/^other:[1-9][0-9]*:[1-9][0-9]*:0$/u.test(acl.signature)) {
+      throw notVerified("PROVIDER_INITIAL_ACL_INVENTORY_INVALID");
+    }
+    return { ...Object.fromEntries(PROVIDER_ACL_KEYS.map((key) => [key, acl[key]])),
+      entries: canonicalProviderRecords(acl.entries, PROVIDER_ACL_ENTRY_KEYS) };
+  }).sort((left, right) => left.signature.localeCompare(right.signature));
+  if (new Set(acls.map((acl) => acl.signature)).size !== acls.length) {
+    throw notVerified("PROVIDER_INITIAL_ACL_INVENTORY_INVALID");
+  }
+  return {
+    catalog_count: row.catalog_count, acls,
+    roles: canonicalProviderRecords(row.roles, PROVIDER_ROLE_KEYS),
+    memberships: canonicalProviderRecords(row.memberships, PROVIDER_MEMBERSHIP_KEYS),
+  };
+}
+
+function validateProviderInitialAcl(inventory) {
+  // Reviewed v1 contract, not derived from the query, connection role, or OIDs.
+  const roles = [
+    { name: "cloud_admin", login: true, inherit: true, superuser: true, createDb: true, createRole: true, replication: true, bypassRls: true, connectionLimit: -1 },
+    { name: "neon_superuser", login: false, inherit: true, superuser: false, createDb: true, createRole: true, replication: true, bypassRls: true, connectionLimit: -1 },
+    { name: "neondb_owner", login: true, inherit: true, superuser: false, createDb: true, createRole: true, replication: true, bypassRls: true, connectionLimit: -1 },
+  ];
+  const memberships = [
+    // PostgreSQL 18's native BOOTSTRAP_SUPERUSERID (pg_authid.dat), not a
+    // staging-assigned OID or caller-supplied role. Its initdb name can differ
+    // in a standalone fixture. This does not normalize ACL grantor identities.
+    { role: "neon_superuser", member: "neon_service", grantorIsBootstrap: true, admin: false, inherit: true, set: true },
+    { role: "neon_superuser", member: "neondb_owner", grantorIsBootstrap: true, admin: false, inherit: true, set: true },
+    ...["pg_create_subscription", "pg_maintain", "pg_monitor", "pg_read_all_data", "pg_signal_autovacuum_worker", "pg_signal_backend", "pg_write_all_data"].map((role) => ({
+      role, member: "neon_superuser", grantorIsBootstrap: true, admin: true, inherit: true,
+      set: role !== "pg_maintain" && role !== "pg_signal_autovacuum_worker",
+    })),
+  ];
+  requireCondition(
+    JSON.stringify(inventory.roles) === JSON.stringify(canonicalProviderRecords(roles, PROVIDER_ROLE_KEYS)) &&
+    JSON.stringify(inventory.memberships) === JSON.stringify(canonicalProviderRecords(memberships, PROVIDER_MEMBERSHIP_KEYS)),
+    "PROVIDER_INITIAL_ACL_ROLE_MISMATCH"
+  );
+  requireCondition(inventory.catalog_count === 2, "PROVIDER_INITIAL_ACL_MISMATCH");
+  const expectedPrivileges = {
+    r: ["DELETE", "INSERT", "MAINTAIN", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"],
+    S: ["SELECT", "UPDATE", "USAGE"],
+  };
+  const kinds = new Set();
+  for (const acl of inventory.acls) {
+    requireCondition(acl.creator === "cloud_admin" && acl.global === false &&
+      acl.schema === "public" && Object.hasOwn(expectedPrivileges, acl.kind) &&
+      !kinds.has(acl.kind) && acl.aclNull === false && acl.aclItems === 1,
+    "PROVIDER_INITIAL_ACL_MISMATCH");
+    kinds.add(acl.kind);
+    const expected = expectedPrivileges[acl.kind].map((privilege) => ({
+      grantor: "cloud_admin", recipient: "neon_superuser", privilege, grantOption: true,
+    }));
+    requireCondition(JSON.stringify(acl.entries) === JSON.stringify(canonicalProviderRecords(expected, PROVIDER_ACL_ENTRY_KEYS)),
+      "PROVIDER_INITIAL_ACL_MISMATCH");
+  }
+  return new Set(inventory.acls.map((acl) => acl.signature));
+}
+
+function classifyProviderInitialObjects(summary, inventory) {
+  const providerSignatures = validateProviderInitialAcl(inventory);
+  requireCondition([...providerSignatures].every((signature) => summary.signature.includes(signature)),
+    "PROVIDER_INITIAL_ACL_COVERAGE_MISMATCH");
+  // Reclassify the exact catalog identities, never subtract an assumed count.
+  const signature = summary.signature.filter((entry) => !providerSignatures.has(entry));
+  const counts = Object.fromEntries(USER_OBJECT_COUNT_FIELDS.map(([key]) => [key, 0]));
+  const kindKeys = { schema: "schemas", relation: "relations", routine: "routines", type: "types", trigger: "triggers", rule: "rules", policy: "policies", constraint: "constraints", other: "other" };
+  for (const entry of summary.signature) {
+    if (!Object.hasOwn(kindKeys, entry.split(":")[0])) throw notVerified("PROVIDER_INITIAL_ACL_COVERAGE_MISMATCH");
+  }
+  for (const entry of signature) counts[kindKeys[entry.split(":")[0]]] += 1;
+  for (const [key] of USER_OBJECT_COUNT_FIELDS) {
+    const rawCount = summary.signature.filter((entry) => kindKeys[entry.split(":")[0]] === key).length;
+    requireCondition(rawCount === summary.counts[key], "PROVIDER_INITIAL_ACL_COVERAGE_MISMATCH");
+  }
+  return { ...summary, total: signature.length, counts, signature };
 }
 
 function validateDatabaseIdentity(evidence) {
@@ -2261,6 +2433,7 @@ function comparableEvidence(evidence) {
     migrationExact: evidence.migrationExact,
     userDefinedObjects: evidence.userDefinedObjects,
     extensionInventory: evidence.extensionInventory,
+    ...(evidence.providerInitialAcl ? { providerInitialAcl: evidence.providerInitialAcl } : {}),
   });
 }
 
@@ -2290,7 +2463,7 @@ function unverifiedUserObjectCounts() {
   };
 }
 
-export function createPreflightBaseReport() {
+export function createPreflightBaseReport(providerProfile = null) {
   return {
     environment: "staging",
     postgresqlVersion: {
@@ -2339,6 +2512,16 @@ export function createPreflightBaseReport() {
     secretRedaction: "pass",
     overallStatus: "not_verified",
     exitCode: 3,
+    ...(providerProfile === null ? {} : {
+      providerInitialAcl: {
+        profile: providerProfile,
+        status: "not_verified",
+        snapshots: Object.fromEntries(["direct", "pooled", "directAfter", "pooledAfter"].map((key) => [key, {
+          catalogRows: "not_verified", aclEntries: "not_verified",
+          classifiedObjects: "not_verified", rejectedObjects: "not_verified",
+        }])),
+      },
+    }),
   };
 }
 
@@ -2377,6 +2560,21 @@ export async function verifyStagingDatabasePreflight({
     });
     report.connectionAuthority = "match";
     throwIfPreflightAborted(signal);
+    const providerProfile = parseProviderInitialAclProfile(environment);
+    if (providerProfile !== null) {
+      Object.assign(report, { providerInitialAcl: createPreflightBaseReport(providerProfile).providerInitialAcl });
+    }
+    const classifyObjects = (summary, evidence, key) => {
+      if (providerProfile === null) return summary;
+      const classified = classifyProviderInitialObjects(summary, evidence.providerInitialAcl);
+      report.providerInitialAcl.snapshots[key] = {
+        catalogRows: evidence.providerInitialAcl.catalog_count,
+        aclEntries: evidence.providerInitialAcl.acls.reduce((count, acl) => count + acl.entries.length, 0),
+        classifiedObjects: evidence.providerInitialAcl.acls.length,
+        rejectedObjects: classified.total,
+      };
+      return classified;
+    };
     const expectedExtensions = parseExpectedStagingExtensions(environment);
     report.expectedIdentity = "match";
     throwIfPreflightAborted(signal);
@@ -2403,12 +2601,12 @@ export async function verifyStagingDatabasePreflight({
     const directBefore = await collectPreflightEvidence(
       directConnection,
       onQuery,
-      { signal }
+      { signal, providerProfile }
     );
     const pooledBefore = await collectPreflightEvidence(
       pooledConnection,
       onQuery,
-      { signal }
+      { signal, providerProfile }
     );
     throwIfPreflightAborted(signal);
     requireExtensionInventoryMatch(expectedExtensions, [
@@ -2449,12 +2647,12 @@ export async function verifyStagingDatabasePreflight({
     const directState = validateInitialDatabaseState(
       specification,
       directBefore,
-      directUserObjects
+      classifyObjects(directUserObjects, directBefore, "direct")
     );
     validateInitialDatabaseState(
       specification,
       pooledBefore,
-      pooledUserObjects
+      classifyObjects(pooledUserObjects, pooledBefore, "pooled")
     );
     requireCondition(
       comparableEvidence(directBefore) === comparableEvidence(pooledBefore),
@@ -2485,12 +2683,12 @@ export async function verifyStagingDatabasePreflight({
     const directAfter = await collectPreflightEvidence(
       directConnection,
       onQuery,
-      { signal }
+      { signal, providerProfile }
     );
     const pooledAfter = await collectPreflightEvidence(
       pooledConnection,
       onQuery,
-      { signal }
+      { signal, providerProfile }
     );
     throwIfPreflightAborted(signal);
     requireExtensionInventoryMatch(expectedExtensions, [
@@ -2532,6 +2730,8 @@ export async function verifyStagingDatabasePreflight({
     report.userDefinedObjects.pooledAfter = publicUserObjectCounts(
       pooledAfterUserObjects
     );
+    classifyObjects(directAfterUserObjects, directAfter, "directAfter");
+    classifyObjects(pooledAfterUserObjects, pooledAfter, "pooledAfter");
     report.migrationSequenceState.directAfter = publicMigrationSequenceState(
       directAfter
     );
@@ -2545,6 +2745,7 @@ export async function verifyStagingDatabasePreflight({
     );
     report.migrationCatalog = "pass";
     report.beforeAfterComparison = "match";
+    if (providerProfile !== null) report.providerInitialAcl.status = "match";
 
     Object.assign(report, directState, {
       readOnlyInvariant: "pass",

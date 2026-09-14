@@ -10,6 +10,36 @@
 
 ## 正式commandと実装path
 
+### 限定provider初期default ACL profile（2026-09-14追加）
+
+`ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE=neon-pg18-initial-default-acl-v1`を明示した正式preflightだけに適用します。未指定は従来のstrict判定を維持し、default ACLを残存objectとして拒否します。未知profileや、profile指定時の不足・追加・不完全取得はfail-closedです。launcherでinventoryを加工したり、件数を固定で減算してはいけません。
+
+このprofileの根拠は、正規Neon管理画面で確認した既存専用staging project `actustube-auth-staging-20260730`のresource・role対応、2026-09-14のread-only catalog観測、[Neon role管理仕様](https://neon.com/docs/manage/roles)、[PostgreSQL 18 default ACL仕様](https://www.postgresql.org/docs/18/catalog-pg-default-acl.html)です。専用projectのbranch表示名は`production`ですが、別projectの実Productionとは異なります。名前やACL件数だけをprovider由来の証拠にせず、歴史上のDDL実行者をcatalogから証明したとも扱いません。profileはNeon全projectを自動認定する仕組みではなく、別経路でresource対応を確認した対象に対する固定契約です。
+
+固定ACL契約は次の2 catalog rows / 2 ACL array items / 11 expanded entriesです。
+
+| Creator / ACL grantor | Recipient | Scope | Kind | Privileges | Grant option |
+|---|---|---|---|---|---|
+| `cloud_admin` | `neon_superuser` | schema `public`、非global | table `r` | DELETE, INSERT, MAINTAIN, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE | 各entry true |
+| `cloud_admin` | `neon_superuser` | schema `public`、非global | sequence `S` | SELECT, UPDATE, USAGE | 各entry true |
+
+NULL、空ACL、owner-self entry、PUBLIC、未知recipient、global、別schema、他kind、不足・追加privilege、grant option差異を許容しません。配列・entry・role・membershipの順序だけを正規化します。OIDは同じsnapshot内でraw object inventoryとのexact coverageを照合する内部値であり、環境固有OIDをprofileへ固定したり公開したりしません。元の`userDefinedObjects`件数を保持し、`providerInitialAcl.snapshots`でcatalogRows / aclEntries / classifiedObjects / rejectedObjectsを分離します。正常時は各snapshotが2 / 11 / 2 / 0であり、table/function/typeや未知ledger等の拒否は従来どおりです。direct/pooledとbefore/afterの4観測を比較します。
+
+role属性は`cloud_admin`がLOGIN・SUPERUSER、`neon_superuser`がNOLOGIN・NOSUPERUSER、`neondb_owner`がLOGIN・NOSUPERUSERです。3者のINHERIT / CREATEDB / CREATEROLE / REPLICATION / BYPASSRLSはtrue、connection limitは-1に固定します。管理対象3roleをmemberまたはgranted roleとするmembershipは9行に固定し、`neon_superuser`から`neon_service` / `neondb_owner`への2行はADMIN false・INHERIT true・SET trueです。`pg_create_subscription` / `pg_maintain` / `pg_monitor` / `pg_read_all_data` / `pg_signal_autovacuum_worker` / `pg_signal_backend` / `pg_write_all_data`から`neon_superuser`への7行はADMIN / INHERIT true、SETは`pg_maintain`と`pg_signal_autovacuum_worker`だけfalseです。
+
+membership grantorはPostgreSQLのnative bootstrap superuserであることを検証します。[PostgreSQL 18.6の定義](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_authid.dat)にある`BOOTSTRAP_SUPERUSERID`とSUPERUSER属性による判定であり、任意role名やcaller設定から期待値を生成しません。専用Neonでこのroleが`cloud_admin`に対応することはread-onlyで確認済みです。standalone PostgreSQLではinitdb時の名前が異なりますが、[membership GRANTの記録規則](https://www.postgresql.org/docs/18/sql-grant.html)は同じです。このnative membership判定を、default ACLのcreator / grantorの名前比較には適用しません。
+
+#### owner / runtimeとMigrationの順序
+
+1. resource・接続identity・固定profile・schema / Migration履歴を正式preflightで確認します。この時点でアプリowner用のdefault ACL等を先に追加しません。
+2. 別途承認された準備手順でprovider creatorと異なるアプリownerを使用し、各mutation Clientのsession / effective identityを確認します。runtimeはSQLで最小権限roleとして準備し、owner / provider管理role / その他roleのmembershipを付けません。
+3. 実際のMigration session / effective creatorを確認して、変更していないcanonical Migrationを未適用分だけ実行します。default ACLは実効creatorのものだけが適用され、membership元のdefault ACLは継承されません。providerの2行は削除・変更せず保持します。
+4. アプリownerのfunction PUBLIC EXECUTE抑止と既存runtime manifestを適用し、object owner・実ACL・runtimeの禁止属性 / membershipを正式postflightで検査します。`user_plan_assignments`のSELECT / INSERTと非owner認証同期の既存契約は変更しません。postflightのowner別default ACL判定はprovider creatorと分離されているため、coreの例外追加は不要です。
+
+fixtureは既存のGitHub Actions PostgreSQL 18.6 service containerだけを対象に、固定provider相当role / ACL作成、正式entrypointでstrict拒否とprofile許可、既存Migration / owner canonicalization / postflight / 非owner認証同期、provider ACL維持確認を順にawaitします。正常公開結果には`providerDefaultAclBootstrap: true`と既存の`runtimeAuthSynchronization: true`を含みます。総deadlineとClient ownership / cleanupは既存枠のままです。provider相当role / ACLはcontainerの通常終了で破棄し、実stagingへfixture setupや否定ケースを向けません。
+
+この追加経路のlocal real PostgreSQLはNOT RUN、新head CI / real PostgreSQLはCI_PENDINGです。fake testや同一SQL文字列の検査はactual PostgreSQL semanticsやNeon管理情報の真正性の証明ではありません。新headの必要Push / PR CIが全成功するまで実staging書込みへ進みません。実stagingの正式preflight / Migration / postflight、設定適用後Preview QA、actual Productionは未検証です。repository-owned PostgreSQL lifecycle authorityは0です。
+
 - preflight package command：`npm run db:preflight:staging`
 - preflight entry script：`scripts/verify-staging-database-preflight.mjs`
 - preflight validation：`scripts/staging-database-preflight/`

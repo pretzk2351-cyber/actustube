@@ -17,6 +17,7 @@ import {
 } from "./staging-database-postflight/core.mjs";
 import { assertReadOnlySql } from "./staging-database-postflight/safety.mjs";
 import { executeStagingDatabasePostflight } from "./verify-staging-database-postflight.mjs";
+import { executeStagingDatabasePreflight } from "./verify-staging-database-preflight.mjs";
 
 const { Client } = pgPackage;
 const modulePath = fileURLToPath(import.meta.url);
@@ -3444,6 +3445,101 @@ function preflightEnvironment(configuration, extensions) {
     ACTUSTUBE_EXPECTED_STAGING_IDENTITY: "local-postflight-fixture",
     ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS: extensions,
   };
+}
+
+// Independent fixture oracle: literal SQL/privileges, not a production allowlist.
+const PROVIDER_BOOTSTRAP_FIXTURE_SQL = Object.freeze([
+  "CREATE ROLE cloud_admin LOGIN SUPERUSER INHERIT CREATEDB CREATEROLE REPLICATION BYPASSRLS",
+  "CREATE ROLE neon_superuser NOLOGIN NOSUPERUSER INHERIT CREATEDB CREATEROLE REPLICATION BYPASSRLS",
+  "CREATE ROLE neondb_owner LOGIN NOSUPERUSER INHERIT CREATEDB CREATEROLE REPLICATION BYPASSRLS",
+  "CREATE ROLE neon_service NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
+  "SET LOCAL ROLE cloud_admin",
+  "GRANT neon_superuser TO neon_service, neondb_owner WITH ADMIN FALSE, INHERIT TRUE, SET TRUE",
+  "GRANT pg_create_subscription, pg_monitor, pg_read_all_data, pg_signal_backend, pg_write_all_data TO neon_superuser WITH ADMIN TRUE, INHERIT TRUE, SET TRUE",
+  "GRANT pg_maintain, pg_signal_autovacuum_worker TO neon_superuser WITH ADMIN TRUE, INHERIT TRUE, SET FALSE",
+  "ALTER DEFAULT PRIVILEGES FOR ROLE cloud_admin IN SCHEMA public GRANT DELETE, INSERT, MAINTAIN, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE ON TABLES TO neon_superuser WITH GRANT OPTION",
+  "ALTER DEFAULT PRIVILEGES FOR ROLE cloud_admin IN SCHEMA public GRANT SELECT, UPDATE, USAGE ON SEQUENCES TO neon_superuser WITH GRANT OPTION",
+]);
+
+const PROVIDER_PRESERVATION_SQL = `
+  SELECT d.defaclobjtype::text AS kind, creator.rolname AS creator,
+    n.nspname AS schema, d.defaclnamespace = 0 AS global,
+    cardinality(d.defaclacl) AS acl_items, grantor.rolname AS grantor,
+    CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE recipient.rolname END AS recipient,
+    a.privilege_type AS privilege, a.is_grantable AS grant_option
+  FROM pg_catalog.pg_default_acl AS d
+  LEFT JOIN pg_catalog.pg_roles AS creator ON creator.oid = d.defaclrole
+  LEFT JOIN pg_catalog.pg_namespace AS n ON n.oid = d.defaclnamespace
+  LEFT JOIN LATERAL pg_catalog.aclexplode(d.defaclacl) AS a ON true
+  LEFT JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = a.grantor
+  LEFT JOIN pg_catalog.pg_roles AS recipient ON recipient.oid = a.grantee
+  WHERE d.defaclrole = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'cloud_admin')
+     OR a.grantor = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'cloud_admin')
+     OR a.grantee = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'neon_superuser')
+  ORDER BY d.defaclobjtype::text COLLATE "C", a.privilege_type COLLATE "C"
+`;
+
+async function verifyProviderBootstrapPreserved(client) {
+  const result = await client.query(PROVIDER_PRESERVATION_SQL);
+  const keys = ["kind", "creator", "schema", "global", "acl_items", "grantor", "recipient", "privilege", "grant_option"];
+  const expected = [
+    ["S", "SELECT"], ["S", "UPDATE"], ["S", "USAGE"],
+    ["r", "DELETE"], ["r", "INSERT"], ["r", "MAINTAIN"], ["r", "REFERENCES"],
+    ["r", "SELECT"], ["r", "TRIGGER"], ["r", "TRUNCATE"], ["r", "UPDATE"],
+  ].map(([kind, privilege]) => ({
+    kind, creator: "cloud_admin", schema: "public", global: false, acl_items: 1,
+    grantor: "cloud_admin", recipient: "neon_superuser", privilege, grant_option: true,
+  }));
+  requireHarness(Array.isArray(result.rows) && result.rows.length === expected.length &&
+    result.rows.every((row, index) => exactOwnKeys(row, keys) && keys.every((key) => row[key] === expected[index][key])),
+  "EXTERNAL_FIXTURE_PROVIDER_BOOTSTRAP_PRESERVATION_FAILED");
+  return true;
+}
+
+async function verifyProviderBootstrapThroughEntrypoint(context, clientFactory, configuration, extensions) {
+  await runPreMutationSessionIdentityBoundary({
+    context, clientFactory, credentials: fixtureCredentials(configuration),
+    expectedSessionRole: configuration.role,
+    async operation(client, observedIdentity, authority) {
+      requireOriginalObservedSessionIdentity(authority, observedIdentity);
+      requireHarness(!["cloud_admin", "neon_superuser", "neondb_owner", "neon_service"].includes(observedIdentity.sessionRole),
+        "EXTERNAL_FIXTURE_PROVIDER_BOOTSTRAP_IDENTITY_INVALID");
+      await client.query("BEGIN");
+      // Any failure is fatal to the disposable fixture; no DDL retry or broad cleanup.
+      for (const statement of PROVIDER_BOOTSTRAP_FIXTURE_SQL) await client.query(statement);
+      await client.query("COMMIT");
+      await verifyProviderBootstrapPreserved(client);
+    },
+  });
+  const run = async (profile) => {
+    const output = [];
+    const statements = [];
+    const report = await runBoundedPhase(context, "phase", context.limits.phaseMilliseconds, () =>
+      executeStagingDatabasePreflight({
+        environment: { ...preflightEnvironment(configuration, extensions),
+          ...(profile === null ? {} : { ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: profile }) },
+        repositoryRoot, allowLoopback: true,
+        adapter: createAdapter(context, clientFactory, () => fixtureCredentials(configuration)),
+        onQuery(statement) { assertReadOnlySql(statement); statements.push(statement); },
+        stdout(text) { output.push(text); },
+      })
+    );
+    requireHarness(output.length > 0, "EXTERNAL_FIXTURE_PROVIDER_BOOTSTRAP_OUTPUT_MISSING");
+    return { report, statements };
+  };
+  const strict = await run(null);
+  requireHarness(strict.report.exitCode === 1 && strict.report.failure?.checkId === "USER_DEFINED_OBJECT_PRESENT",
+    "EXTERNAL_FIXTURE_PROVIDER_BOOTSTRAP_STRICT_CONTROL_FAILED");
+  const profiled = await run("neon-pg18-initial-default-acl-v1");
+  requireHarness(profiled.report.exitCode === 0 && profiled.report.overallStatus === "pass" &&
+    profiled.report.providerInitialAcl?.status === "match" &&
+    ["direct", "pooled", "directAfter", "pooledAfter"].every((key) => {
+      const counts = profiled.report.providerInitialAcl?.snapshots[key];
+      return profiled.report.userDefinedObjects[key].total === 2 && counts?.catalogRows === 2 &&
+        counts?.aclEntries === 11 && counts?.classifiedObjects === 2 && counts?.rejectedObjects === 0;
+    }) && profiled.statements.filter((statement) => sameSql(statement, PREFLIGHT_SQL_FOR_TESTS.providerInitialAcl)).length === 4,
+  "EXTERNAL_FIXTURE_PROVIDER_BOOTSTRAP_PREFLIGHT_FAILED");
+  return true;
 }
 
 async function runStablePreflight(
@@ -7514,6 +7610,7 @@ function publicSuccessResult() {
     postflight: true,
     postflightDriftRejected: true,
     runtimeAuthSynchronization: true,
+    providerDefaultAclBootstrap: true,
     verifierQueriesReadOnly: true,
     outputRedaction: true,
   });
@@ -8635,13 +8732,14 @@ async function runConnectionOnlyHarnessWithinContext(options, context) {
     );
   });
 
-  await runExtensionClassificationPhase(context, () =>
-    verifyExtensionClassificationMatrix(
+  const providerBootstrapVerified = await runExtensionClassificationPhase(context, async () => {
+    await verifyExtensionClassificationMatrix(
       context,
       resolvedClientFactory,
       configuration
-    )
-  );
+    );
+    return await verifyProviderBootstrapThroughEntrypoint(context, resolvedClientFactory, configuration, extensions);
+  });
   const identityAuthority = await applyMigrationsAndRuntimeAcl(
     context,
     resolvedClientFactory,
@@ -8712,6 +8810,9 @@ async function runConnectionOnlyHarnessWithinContext(options, context) {
       context, resolvedClientFactory, configuration, identityAuthority,
       () => runPostflight(context, resolvedClientFactory, configuration)
     );
+    requireHarness(providerBootstrapVerified === true &&
+      await withClient(context, resolvedClientFactory, fixtureCredentials(configuration), verifyProviderBootstrapPreserved),
+    "EXTERNAL_FIXTURE_PROVIDER_BOOTSTRAP_PRESERVATION_FAILED");
   });
 
   return publicSuccessResult();

@@ -56,6 +56,7 @@ import {
   executeStagingDatabasePreflight,
   formatHumanSummary,
   runPreflightCli,
+  projectPublicPreflightReport,
 } from "../scripts/verify-staging-database-preflight.mjs";
 
 const repositoryRoot = process.cwd();
@@ -629,6 +630,7 @@ const externalFixturePublicSuccessOracle = Object.freeze({
   postflight: true,
   postflightDriftRejected: true,
   runtimeAuthSynchronization: true,
+  providerDefaultAclBootstrap: true,
   verifierQueriesReadOnly: true,
   outputRedaction: true,
 });
@@ -1394,10 +1396,11 @@ function createConnection(
   let migrationColumnExactReads = 0;
   let migrationExactReads = 0;
   let extensionInventoryReads = 0;
+  let providerInventoryReads = 0;
   let cleanupHandle: ReturnType<typeof setInterval> | undefined;
   const query = vi.fn((statement: string) => {
     if (options.hangAt && sameSql(statement, (PREFLIGHT_SQL_FOR_TESTS as any)[options.hangAt])) {
-      return new Promise(() => undefined);
+      return new Promise<{ rows: unknown[] }>(() => undefined);
     }
     if (
       sameSql(statement, POSTFLIGHT_SQL_FOR_TESTS.begin) ||
@@ -1472,6 +1475,13 @@ function createConnection(
         ],
       });
     }
+    if (sameSql(statement, PREFLIGHT_SQL_FOR_TESTS.providerInitialAcl)) {
+      providerInventoryReads += 1;
+      if (state.providerQueryRejects) return Promise.reject(new Error(fakeSecret));
+      return Promise.resolve({ rows: state.providerInventoryForRead
+        ? state.providerInventoryForRead(providerInventoryReads)
+        : [state.providerInventory] });
+    }
     throw new Error(`Unexpected fixture query: ${statement.slice(0, 32)}`);
   });
   const connection = {
@@ -1535,6 +1545,230 @@ async function runPreflight(adapter: any, environment = validEnvironment()) {
     adapter,
   }) as Promise<any>;
 }
+
+function providerBootstrapInventoryFixture() {
+  // Test-local literals. Neither the production contract nor its query result
+  // constructs this expected catalog/role graph.
+  return {
+    catalog_count: 2,
+    acls: [
+      { signature: "other:826:91001:0", creator: "cloud_admin", global: false, schema: "public", kind: "r", aclNull: false, aclItems: 1,
+        entries: ["DELETE", "INSERT", "MAINTAIN", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"].map((privilege) => ({ grantor: "cloud_admin", recipient: "neon_superuser", privilege, grantOption: true })) },
+      { signature: "other:826:91002:0", creator: "cloud_admin", global: false, schema: "public", kind: "S", aclNull: false, aclItems: 1,
+        entries: ["SELECT", "UPDATE", "USAGE"].map((privilege) => ({ grantor: "cloud_admin", recipient: "neon_superuser", privilege, grantOption: true })) },
+    ],
+    roles: [
+      { name: "cloud_admin", login: true, inherit: true, superuser: true, createDb: true, createRole: true, replication: true, bypassRls: true, connectionLimit: -1 },
+      { name: "neon_superuser", login: false, inherit: true, superuser: false, createDb: true, createRole: true, replication: true, bypassRls: true, connectionLimit: -1 },
+      { name: "neondb_owner", login: true, inherit: true, superuser: false, createDb: true, createRole: true, replication: true, bypassRls: true, connectionLimit: -1 },
+    ],
+    memberships: [
+      { role: "neon_superuser", member: "neon_service", grantorIsBootstrap: true, admin: false, inherit: true, set: true },
+      { role: "neon_superuser", member: "neondb_owner", grantorIsBootstrap: true, admin: false, inherit: true, set: true },
+      { role: "pg_create_subscription", member: "neon_superuser", grantorIsBootstrap: true, admin: true, inherit: true, set: true },
+      { role: "pg_maintain", member: "neon_superuser", grantorIsBootstrap: true, admin: true, inherit: true, set: false },
+      { role: "pg_monitor", member: "neon_superuser", grantorIsBootstrap: true, admin: true, inherit: true, set: true },
+      { role: "pg_read_all_data", member: "neon_superuser", grantorIsBootstrap: true, admin: true, inherit: true, set: true },
+      { role: "pg_signal_autovacuum_worker", member: "neon_superuser", grantorIsBootstrap: true, admin: true, inherit: true, set: false },
+      { role: "pg_signal_backend", member: "neon_superuser", grantorIsBootstrap: true, admin: true, inherit: true, set: true },
+      { role: "pg_write_all_data", member: "neon_superuser", grantorIsBootstrap: true, admin: true, inherit: true, set: true },
+    ],
+  };
+}
+
+function providerBootstrapState() {
+  const state = residualState("other_count", { signature: "826:91001:0" });
+  const second = residualState("other_count", { signature: "826:91002:0" });
+  state.userDefinedObjects.total_count = 2;
+  state.userDefinedObjects.other_count = 2;
+  for (const key of ["object_signature", "extension_classification_evidence", "extension_candidate_signature", "extension_residual_signature"]) {
+    state.userDefinedObjects[key].push(...second.userDefinedObjects[key]);
+  }
+  state.providerInventory = providerBootstrapInventoryFixture();
+  return state;
+}
+
+function providerBootstrapEnvironment() {
+  return { ...validEnvironment(), ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: "neon-pg18-initial-default-acl-v1" };
+}
+
+describe("provider initial ACL bootstrap profile", () => {
+  it("keeps the legacy strict rejection and explicitly passes the formal entrypoint with raw and classified counts", async () => {
+    const state = providerBootstrapState();
+    const strictAdapter = createAdapter({ directState: state });
+    const strict = await runPreflight(strictAdapter);
+    expect(strict.failure?.checkId).toBe("USER_DEFINED_OBJECT_PRESENT");
+    expect(strict.userDefinedObjects.direct.other).toBe(2);
+    expect(strictAdapter.directConnection.query.mock.calls.some(([sql]) => sameSql(sql, PREFLIGHT_SQL_FOR_TESTS.providerInitialAcl))).toBe(false);
+    const adapter = createAdapter({ directState: state });
+    const stdout = vi.fn();
+    const report = await executeStagingDatabasePreflight({
+      environment: providerBootstrapEnvironment(), repositoryRoot, adapter, stdout,
+    });
+    expect(report.exitCode).toBe(0);
+    expect(report.providerInitialAcl).toEqual({
+      profile: "neon-pg18-initial-default-acl-v1", status: "match",
+      snapshots: Object.fromEntries(["direct", "pooled", "directAfter", "pooledAfter"].map((key) => [key, {
+        catalogRows: 2, aclEntries: 11, classifiedObjects: 2, rejectedObjects: 0,
+      }])),
+    });
+    for (const counts of Object.values(report.userDefinedObjects)) expect(counts).toMatchObject({ total: 2, other: 2, relations: 0 });
+    for (const connection of [adapter.directConnection, adapter.pooledConnection]) {
+      expect(connection.query.mock.calls.filter(([sql]) => sameSql(sql, PREFLIGHT_SQL_FOR_TESTS.providerInitialAcl))).toHaveLength(2);
+      expect(connection.close).toHaveBeenCalledTimes(1);
+    }
+    const serialized = JSON.stringify(stdout.mock.calls);
+    for (const forbidden of [fakeSecret, "cloud_admin", "neon_superuser", "neondb_owner", "91001", "91002", "grantor", "recipient"]) expect(serialized).not.toContain(forbidden);
+  });
+
+  it("normalizes ACL, privilege, role and membership order without changing the authority contract", async () => {
+    const state = providerBootstrapState();
+    state.providerInventoryForRead = (read: number) => {
+      const inventory = providerBootstrapInventoryFixture();
+      if (read === 2) {
+        inventory.acls.reverse().forEach((row) => row.entries.reverse());
+        inventory.roles.reverse(); inventory.memberships.reverse();
+      }
+      return [inventory];
+    };
+    expect((await runPreflight(createAdapter({ directState: state }), providerBootstrapEnvironment())).exitCode).toBe(0);
+  });
+
+  const negativeCases: { name: string; mutate: (row: ReturnType<typeof providerBootstrapInventoryFixture>) => void }[] = [
+    { name: "wrong creator", mutate: (row) => { row.acls[0].creator = "other_owner"; } },
+    { name: "wrong ACL grantor", mutate: (row) => { row.acls[0].entries[0].grantor = "neondb_owner"; } },
+    { name: "wrong recipient", mutate: (row) => { row.acls[0].entries[0].recipient = "third_recipient"; } },
+    { name: "PUBLIC recipient", mutate: (row) => { row.acls[0].entries[0].recipient = "PUBLIC"; } },
+    { name: "similar recipient name", mutate: (row) => { row.acls[0].entries[0].recipient = "neon_superuser_copy"; } },
+    { name: "wrong schema", mutate: (row) => { row.acls[0].schema = "other_schema"; } },
+    { name: "global ACL", mutate: (row) => { row.acls[0].global = true; Object.assign(row.acls[0], { schema: null }); } },
+    { name: "unresolvable schema", mutate: (row) => { Object.assign(row.acls[0], { schema: null }); } },
+    { name: "wrong object kind", mutate: (row) => { row.acls[0].kind = "f"; } },
+    { name: "missing privilege", mutate: (row) => { row.acls[0].entries.pop(); } },
+    { name: "wrong privilege", mutate: (row) => { row.acls[0].entries[0].privilege = "EXECUTE"; } },
+    { name: "extra privilege", mutate: (row) => { row.acls[1].entries.push({ ...row.acls[1].entries[0], privilege: "CREATE" }); } },
+    { name: "duplicate privilege", mutate: (row) => { row.acls[0].entries.push({ ...row.acls[0].entries[0] }); } },
+    { name: "missing grant option", mutate: (row) => { row.acls[0].entries[0].grantOption = false; } },
+    { name: "string grant option", mutate: (row) => { Object.assign(row.acls[0].entries[0], { grantOption: "true" }); } },
+    { name: "implicit owner entry", mutate: (row) => { row.acls[0].aclItems = 2; row.acls[0].entries.push({ ...row.acls[0].entries[0], recipient: "cloud_admin" }); } },
+    { name: "NULL ACL", mutate: (row) => { row.acls[0].aclNull = true; Object.assign(row.acls[0], { aclItems: null }); row.acls[0].entries = []; } },
+    { name: "empty ACL", mutate: (row) => { row.acls[0].aclItems = 0; row.acls[0].entries = []; } },
+    { name: "missing row", mutate: (row) => { row.acls.pop(); row.catalog_count = 1; } },
+    { name: "empty profile inventory", mutate: (row) => { row.acls = []; row.catalog_count = 0; } },
+    { name: "extra row", mutate: (row) => { row.acls.push({ ...row.acls[0], signature: "other:826:91003:0" }); row.catalog_count = 3; } },
+    { name: "duplicate catalog identity", mutate: (row) => { row.acls[1].signature = row.acls[0].signature; } },
+    { name: "wrong signature coverage", mutate: (row) => { row.acls[1].signature = "other:826:91003:0"; } },
+    { name: "truncated catalog", mutate: (row) => { row.catalog_count = 3; } },
+    { name: "missing key", mutate: (row) => { Reflect.deleteProperty(row.acls[0], "creator"); } },
+    { name: "extra key", mutate: (row) => { Object.assign(row.acls[0], { unsafe: true }); } },
+    { name: "missing role", mutate: (row) => { row.roles.pop(); } },
+    { name: "wrong role attribute", mutate: (row) => { row.roles[1].superuser = true; } },
+    { name: "extra role", mutate: (row) => { row.roles.push({ ...row.roles[0], name: "unknown_role" }); } },
+    { name: "missing membership", mutate: (row) => { row.memberships.pop(); } },
+    { name: "wrong membership option", mutate: (row) => { row.memberships[3].set = true; } },
+    { name: "wrong membership grantor", mutate: (row) => { row.memberships[0].grantorIsBootstrap = false; } },
+    { name: "extra membership", mutate: (row) => { row.memberships.push({ ...row.memberships[0], member: "third_recipient" }); } },
+  ];
+  it.each(negativeCases)("rejects $name without leaking internal inventory", async ({ mutate }) => {
+    const state = providerBootstrapState();
+    const before = JSON.stringify(state.providerInventory);
+    mutate(state.providerInventory);
+    expect(JSON.stringify(state.providerInventory)).not.toBe(before);
+    const adapter = createAdapter({ directState: state });
+    const stdout = vi.fn();
+    const result = await executeStagingDatabasePreflight({ environment: providerBootstrapEnvironment(), repositoryRoot, adapter, stdout });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.failure?.checkId).toMatch(/^PROVIDER_INITIAL_ACL_/u);
+    expect(adapter.directConnection.close).toHaveBeenCalledTimes(1);
+    expect(adapter.pooledConnection.close).toHaveBeenCalledTimes(1);
+    const serialized = JSON.stringify([result, stdout.mock.calls]);
+    for (const forbidden of [fakeSecret, "cloud_admin", "neon_superuser", "neondb_owner", "third_recipient", "91001", "91002"]) expect(serialized).not.toContain(forbidden);
+  });
+
+  it.each([undefined, null, [], [null], [{ catalog_count: 0 }]])("rejects incomplete provider query result %#", async (rows) => {
+    const state = providerBootstrapState();
+    state.providerInventoryForRead = () => rows;
+    const result = await runPreflight(createAdapter({ directState: state }), providerBootstrapEnvironment());
+    expect(result.exitCode).toBe(3);
+    expect(result.failure.checkId).toBe("PROVIDER_INITIAL_ACL_INVENTORY_INVALID");
+  });
+
+  it("rejects query failure without an empty-inventory fallback", async () => {
+    const state = providerBootstrapState(); state.providerQueryRejects = true;
+    const result = await runPreflight(createAdapter({ directState: state }), providerBootstrapEnvironment());
+    expect(result.exitCode).toBe(3);
+    expect(JSON.stringify(result)).not.toContain(fakeSecret);
+  });
+
+  it("rejects unknown profile before any connection instead of falling back to strict", async () => {
+    const adapter = createAdapter();
+    const result = await runPreflight(adapter, { ...validEnvironment(), ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: "unknown_profile" });
+    expect(result.failure.checkId).toBe("PROVIDER_INITIAL_ACL_PROFILE_INVALID");
+    expect(adapter.connect).not.toHaveBeenCalled();
+  });
+
+  it("does not allow an unknown application object alongside an exact provider inventory", async () => {
+    const state = providerBootstrapState();
+    const extra = residualState("routine_count", { signature: "1255:91003:0" });
+    state.userDefinedObjects.total_count = 3; state.userDefinedObjects.routine_count = 1;
+    for (const key of ["object_signature", "extension_classification_evidence", "extension_candidate_signature", "extension_residual_signature"]) state.userDefinedObjects[key].push(...extra.userDefinedObjects[key]);
+    const result = await runPreflight(createAdapter({ directState: state }), providerBootstrapEnvironment());
+    expect(result.failure.checkId).toBe("USER_DEFINED_OBJECT_PRESENT");
+    expect(result.userDefinedObjects.direct.total).toBe(3);
+    expect(result.providerInitialAcl.snapshots.direct.rejectedObjects).toBe(1);
+  });
+
+  it("rejects changed ACL after the snapshot transaction boundary", async () => {
+    const state = providerBootstrapState();
+    state.providerInventoryForRead = (read: number) => {
+      const inventory = providerBootstrapInventoryFixture();
+      if (read === 2) inventory.acls[0].entries[0].grantOption = false;
+      return [inventory];
+    };
+    const result = await runPreflight(createAdapter({ directState: state }), providerBootstrapEnvironment());
+    expect(result.exitCode).toBe(1);
+    expect(result.providerInitialAcl.status).not.toBe("match");
+  });
+
+  it("fails closed on forged public provider counts or extra internal keys", async () => {
+    const report = await runPreflight(createAdapter({ directState: providerBootstrapState() }), providerBootstrapEnvironment());
+    expect(report.exitCode).toBe(0);
+    for (const mutate of [
+      (value: typeof report) => { value.providerInitialAcl.snapshots.direct.catalogRows = 1; },
+      (value: typeof report) => { value.providerInitialAcl.snapshots.direct.aclEntries = 10; },
+      (value: typeof report) => { value.providerInitialAcl.snapshots.direct.rejectedObjects = 1; },
+      (value: typeof report) => { value.providerInitialAcl.grantor = "cloud_admin"; },
+      (value: typeof report) => { value.userDefinedObjects.direct.relations = 1; },
+    ]) {
+      const forged = structuredClone(report); mutate(forged);
+      expect(() => projectPublicPreflightReport(forged)).toThrow();
+    }
+  });
+
+  it("keeps all ACL catalogs visible and independently binds native membership grantors", () => {
+    const sql = PREFLIGHT_SQL_FOR_TESTS.providerInitialAcl;
+    assertReadOnlySql(sql);
+    expect(sql).toContain("FROM pg_catalog.pg_default_acl AS d");
+    expect(sql).toContain("LEFT JOIN pg_catalog.pg_roles AS creator");
+    expect(sql).toContain("pg_catalog.aclexplode(d.defaclacl)");
+    expect(sql).toContain("acl.grantee = 0 THEN 'PUBLIC'");
+    expect(sql).toContain("m.grantor = 10 AND grantor.rolsuper");
+    expect(sql).not.toMatch(/\bWHERE\s+d\.|\bLIMIT\s|\bOFFSET\s/iu);
+    expect(PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects).toContain("FROM pg_catalog.pg_default_acl AS object_entry");
+  });
+
+  it("requires real provider bootstrap through the formal entrypoint and preservation after runtime authentication", async () => {
+    const source = await readFile(resolve(repositoryRoot, "scripts/test-staging-database-preflight-postgres.mjs"), "utf8");
+    expect(source).toContain('import { executeStagingDatabasePreflight } from "./verify-staging-database-preflight.mjs"');
+    expect(source).toContain("verifyProviderBootstrapThroughEntrypoint(context, resolvedClientFactory, configuration, extensions)");
+    expect(source).toContain("await client.query(statement)");
+    expect(source).toContain('const strict = await run(null)');
+    expect(source).toContain('const profiled = await run("neon-pg18-initial-default-acl-v1")');
+    expect(source).toContain("providerBootstrapVerified === true");
+    expect(source.indexOf("verifyProviderBootstrapThroughEntrypoint(context, resolvedClientFactory")).toBeLessThan(source.indexOf("const identityAuthority = await applyMigrationsAndRuntimeAcl("));
+    expect(source.lastIndexOf("verifyProviderBootstrapPreserved)")).toBeGreaterThan(source.lastIndexOf("await verifyRuntimeAuthSynchronization("));
+  });
+});
 
 function createSanitizedNodeChildEnvironment(): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { NODE_ENV: "test" };
@@ -12211,6 +12445,7 @@ describe("connection-only external fixture boundary", () => {
         "postflight",
         "postflightDriftRejected",
         "runtimeAuthSynchronization",
+        "providerDefaultAclBootstrap",
         "postgresqlMajor",
         "snapshotDriftRejected",
         "stablePreflight",

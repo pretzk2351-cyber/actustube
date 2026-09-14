@@ -67,6 +67,11 @@ const USER_OBJECT_COUNT_KEYS = Object.freeze([
   "other",
 ]);
 const PUBLIC_CHECK_IDS = new Set([
+  "PROVIDER_INITIAL_ACL_PROFILE_INVALID",
+  "PROVIDER_INITIAL_ACL_INVENTORY_INVALID",
+  "PROVIDER_INITIAL_ACL_ROLE_MISMATCH",
+  "PROVIDER_INITIAL_ACL_MISMATCH",
+  "PROVIDER_INITIAL_ACL_COVERAGE_MISMATCH",
   "APPLICATION_SEQUENCE_MISMATCH",
   "CATALOG_VALUE_INVALID",
   "CHECK_CONSTRAINT_MISMATCH",
@@ -352,9 +357,14 @@ function assertCanonicalPreflightOutcome(report) {
     report.applicationTables === 0,
     report.applicationFunctions === 0,
     report.applicationData === 0,
-    Object.values(report.userDefinedObjects).every((counts) =>
-      Object.values(counts).every((count) => count === 0)
-    ),
+    Object.entries(report.userDefinedObjects).every(([key, counts]) => {
+      if (!report.providerInitialAcl) return Object.values(counts).every((count) => count === 0);
+      const classified = report.providerInitialAcl.snapshots[key];
+      return report.providerInitialAcl.status === "match" &&
+        classified.catalogRows === 2 && classified.aclEntries === 11 &&
+        classified.classifiedObjects === 2 && classified.rejectedObjects === 0 &&
+        Object.entries(counts).every(([countKey, value]) => value === (["total", "other"].includes(countKey) ? 2 : 0));
+    }),
     Object.values(report.migrationSequenceState).every(
       (status) => status === expectedSequenceState
     ),
@@ -372,10 +382,27 @@ function assertCanonicalPreflightOutcome(report) {
 export function projectPublicPreflightReport(report) {
   const hasFailure =
     isPlainRecord(report) && Object.hasOwn(report, "failure");
+  const hasProviderProfile = isPlainRecord(report) && Object.hasOwn(report, "providerInitialAcl");
   assertExactKeys(
     report,
-    hasFailure ? [...PUBLIC_REPORT_KEYS, "failure"] : PUBLIC_REPORT_KEYS
+    [...PUBLIC_REPORT_KEYS, ...(hasFailure ? ["failure"] : []), ...(hasProviderProfile ? ["providerInitialAcl"] : [])]
   );
+
+  let providerInitialAcl;
+  if (hasProviderProfile) {
+    assertExactKeys(report.providerInitialAcl, ["profile", "status", "snapshots"]);
+    assertExactKeys(report.providerInitialAcl.snapshots, VERSION_KEYS);
+    providerInitialAcl = {
+      profile: publicEnum(report.providerInitialAcl.profile, ["neon-pg18-initial-default-acl-v1"]),
+      status: publicEnum(report.providerInitialAcl.status, ["match", "not_verified"]),
+      snapshots: Object.fromEntries(VERSION_KEYS.map((key) => {
+        const counts = report.providerInitialAcl.snapshots[key];
+        const keys = ["catalogRows", "aclEntries", "classifiedObjects", "rejectedObjects"];
+        assertExactKeys(counts, keys);
+        return [key, Object.fromEntries(keys.map((name) => [name, publicCount(counts[name])]))];
+      })),
+    };
+  }
 
   assertExactKeys(report.postgresqlVersion, VERSION_KEYS);
   const postgresqlVersion = Object.fromEntries(
@@ -496,6 +523,7 @@ export function projectPublicPreflightReport(report) {
     applicationFunctions: publicCount(report.applicationFunctions),
     applicationData: publicCount(report.applicationData),
     userDefinedObjects,
+    ...(hasProviderProfile ? { providerInitialAcl } : {}),
     migrationSequenceState,
     partialSchema: publicEnum(report.partialSchema, ["none", "not_verified"]),
     readOnlyInvariant: publicEnum(report.readOnlyInvariant, [
@@ -664,6 +692,23 @@ function emitPreflightReport({ report, stdout, formatSummary }) {
   }
 }
 
+/**
+ * The formal entrypoint accepts the same read-only adapter boundary as core;
+ * it does not require a driver-specific QueryArrayResult or synthetic fields.
+ * @param {{
+ *   environment?: NodeJS.ProcessEnv,
+ *   repositoryRoot?: string,
+ *   adapter?: {connect: (kind: string, url: string, options?: {signal?: AbortSignal}) => Promise<{
+ *     query: (statement: string, parameters?: unknown[]) => Promise<{rows: unknown[]}>,
+ *     close: () => Promise<void>
+ *   }>},
+ *   allowLoopback?: boolean,
+ *   onQuery?: (statement: string) => void,
+ *   signal?: AbortSignal,
+ *   stdout?: (text: string) => void | Promise<void>,
+ *   formatSummary?: (report: ReturnType<typeof createPreflightBaseReport>) => string,
+ * }} [options]
+ */
 export async function executeStagingDatabasePreflight({
   environment = process.env,
   repositoryRoot = process.cwd(),
