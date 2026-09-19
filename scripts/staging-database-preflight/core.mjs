@@ -384,6 +384,80 @@ extension_candidate_signature(object_signature) AS (
 `;
 
 const SQL = Object.freeze({
+  preparedOwner: `
+    WITH owner_role AS (
+      SELECT * FROM pg_catalog.pg_roles WHERE rolname = $1
+    ), current_db AS (
+      SELECT * FROM pg_catalog.pg_database WHERE datname = current_database()
+    ), database_acls AS (
+      SELECT d.oid, d.datdba, a.*
+      FROM pg_catalog.pg_database d
+      CROSS JOIN LATERAL pg_catalog.aclexplode(d.datacl) a
+      CROSS JOIN owner_role r
+      WHERE a.grantee = r.oid OR a.grantor = r.oid
+    ), other_acl_entries AS (
+      SELECT acl.* FROM (
+        SELECT nspacl AS acl FROM pg_catalog.pg_namespace
+        UNION ALL SELECT relacl FROM pg_catalog.pg_class
+        UNION ALL SELECT attacl FROM pg_catalog.pg_attribute
+        UNION ALL SELECT proacl FROM pg_catalog.pg_proc
+        UNION ALL SELECT typacl FROM pg_catalog.pg_type
+        UNION ALL SELECT defaclacl FROM pg_catalog.pg_default_acl
+        UNION ALL SELECT lomacl FROM pg_catalog.pg_largeobject_metadata
+        UNION ALL SELECT lanacl FROM pg_catalog.pg_language
+        UNION ALL SELECT fdwacl FROM pg_catalog.pg_foreign_data_wrapper
+        UNION ALL SELECT srvacl FROM pg_catalog.pg_foreign_server
+        UNION ALL SELECT spcacl FROM pg_catalog.pg_tablespace
+        UNION ALL SELECT paracl FROM pg_catalog.pg_parameter_acl
+        UNION ALL SELECT initprivs FROM pg_catalog.pg_init_privs
+      ) inventory CROSS JOIN LATERAL pg_catalog.aclexplode(inventory.acl) acl
+      CROSS JOIN owner_role r WHERE acl.grantee = r.oid OR acl.grantor = r.oid
+    )
+    SELECT session_user::text AS session_role, current_user::text AS effective_role,
+      current_database()::text AS database_name,
+      (SELECT rolname FROM pg_catalog.pg_roles WHERE oid = (SELECT datdba FROM current_db)) AS database_owner,
+      (SELECT pg_catalog.jsonb_build_object(
+        'oid', r.oid::text, 'name', r.rolname, 'login', r.rolcanlogin,
+        'inherit', r.rolinherit, 'superuser', r.rolsuper, 'createDb', r.rolcreatedb,
+        'createRole', r.rolcreaterole, 'replication', r.rolreplication,
+        'bypassRls', r.rolbypassrls, 'connectionLimit', r.rolconnlimit,
+        'validUntilNull', r.rolvaliduntil IS NULL,
+        'connect', pg_catalog.has_database_privilege(r.oid, (SELECT oid FROM current_db), 'CONNECT'),
+        'create', pg_catalog.has_database_privilege(r.oid, (SELECT oid FROM current_db), 'CREATE'),
+        'publicCreate', pg_catalog.has_schema_privilege(r.oid, 'public', 'CREATE')
+      ) FROM owner_role r) AS owner,
+      (SELECT count(*)::integer FROM pg_catalog.pg_db_role_setting
+        WHERE setrole = (SELECT oid FROM owner_role)) AS settings_count,
+      (SELECT count(*)::integer FROM other_acl_entries) AS other_acl_count,
+      COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'name', rolname, 'nativeBootstrap', oid = 10 AND rolsuper
+      ) ORDER BY rolname COLLATE "C") FROM pg_catalog.pg_roles
+        WHERE oid >= 16384 OR oid = 10), '[]'::jsonb) AS roles,
+      COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'role', granted.rolname, 'member', member_role.rolname,
+        'grantorIsBootstrap', m.grantor = 10 AND grantor.rolsuper,
+        'admin', m.admin_option, 'inherit', m.inherit_option, 'set', m.set_option
+      )) FROM pg_catalog.pg_auth_members m
+        LEFT JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid
+        LEFT JOIN pg_catalog.pg_roles member_role ON member_role.oid = m.member
+        LEFT JOIN pg_catalog.pg_roles grantor ON grantor.oid = m.grantor
+        WHERE m.roleid = (SELECT oid FROM owner_role)
+           OR m.member = (SELECT oid FROM owner_role)), '[]'::jsonb) AS memberships,
+      COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'currentDatabase', a.oid = (SELECT oid FROM current_db),
+        'granteeIsOwner', a.grantee = (SELECT oid FROM owner_role),
+        'grantorIsManager', a.grantor = a.datdba AND a.grantor =
+          (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'neondb_owner'),
+        'privilege', a.privilege_type, 'grantOption', a.is_grantable
+      )) FROM database_acls a), '[]'::jsonb) AS database_acls,
+      COALESCE((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+        'signature', d.dbid::text || ':' || d.classid::text || ':' || d.objid::text || ':' || d.objsubid::text || ':' || d.deptype::text,
+        'connectAcl', d.dbid = 0 AND d.classid = 'pg_catalog.pg_database'::pg_catalog.regclass
+          AND d.objid = (SELECT oid FROM current_db) AND d.objsubid = 0 AND d.deptype = 'a'
+      )) FROM pg_catalog.pg_shdepend d
+        WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+          AND d.refobjid = (SELECT oid FROM owner_role)), '[]'::jsonb) AS dependencies
+  `,
   // No role/schema/object filtering: unknown or unresolvable ACLs remain visible.
   providerInitialAcl: `
     SELECT
@@ -1393,7 +1467,7 @@ const SQL = Object.freeze({
 async function collectPreflightEvidence(
   connection,
   onQuery,
-  { signal, providerProfile = null } = {}
+  { signal, providerProfile = null, preparedOwner = null } = {}
 ) {
   throwIfPreflightAborted(signal);
   const serverVersionRow = (
@@ -1467,6 +1541,11 @@ async function collectPreflightEvidence(
     const result = await runQuery(connection, SQL.providerInitialAcl, [], onQuery, { signal });
     providerInitialAcl = normalizeProviderInitialAcl(result.rows);
   }
+  let preparedOwnerEvidence;
+  if (preparedOwner !== null) {
+    const result = await runQuery(connection, SQL.preparedOwner, [preparedOwner.name], onQuery, { signal });
+    preparedOwnerEvidence = validatePreparedOwner(result.rows, preparedOwner);
+  }
 
   return {
     serverVersion,
@@ -1481,16 +1560,87 @@ async function collectPreflightEvidence(
     migrationExact,
     userDefinedObjects,
     ...(providerProfile === null ? {} : { providerInitialAcl }),
+    ...(preparedOwner === null ? {} : { preparedOwner: preparedOwnerEvidence }),
   };
 }
 
 const PROVIDER_INITIAL_ACL_PROFILE = "neon-pg18-initial-default-acl-v1";
+const PREPARED_OWNER_PROFILE = "neon-pg18-prepared-app-owner-v1";
 
 function parseProviderInitialAclProfile(environment) {
   const profile = environment.ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE;
   if (profile === undefined) return null;
-  requireCondition(profile === PROVIDER_INITIAL_ACL_PROFILE, "PROVIDER_INITIAL_ACL_PROFILE_INVALID");
+  requireCondition(profile === PROVIDER_INITIAL_ACL_PROFILE || profile === PREPARED_OWNER_PROFILE, "PROVIDER_INITIAL_ACL_PROFILE_INVALID");
   return profile;
+}
+
+function parsePreparedOwner(environment, safety, profile) {
+  const name = environment.ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER;
+  // An opt-in profile must not change the legacy strict/v1 acceptance range.
+  if (profile !== PREPARED_OWNER_PROFILE) return null;
+  requireCondition(typeof name === "string" && /^[a-z][a-z0-9_]{0,62}$/u.test(name) &&
+    /(?:^|_)staging(?:_|$)/u.test(name), "PREPARED_OWNER_INPUT_INVALID");
+  requireCondition(safety.directRole === name && safety.pooledRole === name,
+    "PREPARED_OWNER_IDENTITY_MISMATCH");
+  return Object.freeze({ name, database: safety.directAuthority.database });
+}
+
+function preparedOwnerMembership(name) {
+  return { role: name, member: "neondb_owner", grantorIsBootstrap: true,
+    admin: true, inherit: false, set: false };
+}
+
+function validatePreparedOwner(rows, expected) {
+  const reject = () => { throw notVerified("PREPARED_OWNER_INVENTORY_INVALID"); };
+  if (!Array.isArray(rows) || rows.length !== 1) reject();
+  const row = rows[0];
+  exactProviderKeys(row, ["session_role", "effective_role", "database_name", "database_owner",
+    "owner", "settings_count", "other_acl_count", "roles", "memberships", "database_acls", "dependencies"]);
+  requireCondition(row.session_role === expected.name && row.effective_role === expected.name &&
+    row.database_name === expected.database, "PREPARED_OWNER_IDENTITY_MISMATCH");
+  requireCondition(row.database_owner === "neondb_owner", "PREPARED_OWNER_AUTHORITY_MISMATCH");
+  const ownerKeys = ["oid", ...PROVIDER_ROLE_KEYS, "validUntilNull", "connect", "create", "publicCreate"];
+  exactProviderKeys(row.owner, ownerKeys);
+  if (typeof row.owner.oid !== "string" || !/^[1-9][0-9]*$/u.test(row.owner.oid) ||
+      Number(row.owner.oid) < 16384 || Number(row.owner.oid) > 4294967295) reject();
+  const ownerContract = { name: expected.name, login: true, inherit: false, superuser: false,
+    createDb: false, createRole: false, replication: false, bypassRls: false, connectionLimit: -1,
+    validUntilNull: true, connect: true, create: false, publicCreate: false };
+  requireCondition(Object.entries(ownerContract).every(([key, value]) => row.owner[key] === value) &&
+    row.settings_count === 0 && row.other_acl_count === 0, "PREPARED_OWNER_AUTHORITY_MISMATCH");
+  const roles = canonicalProviderRecords(row.roles, ["name", "nativeBootstrap"]);
+  const requiredNames = new Set(["cloud_admin", "neon_superuser", "neondb_owner", "neon_service", expected.name]);
+  const seenNames = new Set();
+  let nativeCount = 0;
+  for (const role of roles) {
+    if (typeof role.name !== "string" || typeof role.nativeBootstrap !== "boolean" || seenNames.has(role.name)) reject();
+    seenNames.add(role.name);
+    if (role.nativeBootstrap) {
+      nativeCount += 1;
+      requireCondition(![expected.name, "neondb_owner", "neon_superuser", "neon_service"].includes(role.name),
+        "PREPARED_OWNER_AUTHORITY_MISMATCH");
+    } else requireCondition(requiredNames.has(role.name), "PREPARED_OWNER_AUTHORITY_MISMATCH");
+  }
+  requireCondition(nativeCount === 1 && [...requiredNames].every((name) => seenNames.has(name)),
+    "PREPARED_OWNER_AUTHORITY_MISMATCH");
+  const memberships = canonicalProviderRecords(row.memberships, PROVIDER_MEMBERSHIP_KEYS);
+  requireCondition(JSON.stringify(memberships) === JSON.stringify(
+    canonicalProviderRecords([preparedOwnerMembership(expected.name)], PROVIDER_MEMBERSHIP_KEYS)),
+  "PREPARED_OWNER_AUTHORITY_MISMATCH");
+  const acls = canonicalProviderRecords(row.database_acls,
+    ["currentDatabase", "granteeIsOwner", "grantorIsManager", "privilege", "grantOption"]);
+  requireCondition(acls.length <= 1 && acls.every((acl) => acl.currentDatabase === true &&
+    acl.granteeIsOwner === true && acl.grantorIsManager === true && acl.privilege === "CONNECT" &&
+    acl.grantOption === false), "PREPARED_OWNER_AUTHORITY_MISMATCH");
+  // All shared role dependencies are inspected across ALL databases/catalogs.
+  // Only the independently verified current-database CONNECT ACL is allowed.
+  // This rejects ownership, other ACLs (including grantor-side), init ACLs,
+  // policies, unknown catalogs and unresolved dependencies without hiding rows.
+  const dependencies = canonicalProviderRecords(row.dependencies, ["signature", "connectAcl"]);
+  requireCondition(dependencies.length === acls.length && dependencies.every((dependency) =>
+    dependency.connectAcl === true && typeof dependency.signature === "string" &&
+    /^0:[1-9][0-9]*:[1-9][0-9]*:0:a$/u.test(dependency.signature)), "PREPARED_OWNER_AUTHORITY_MISMATCH");
+  return { ...row, roles, memberships, database_acls: acls, dependencies };
 }
 
 function exactProviderKeys(value, keys) {
@@ -1550,7 +1700,7 @@ function normalizeProviderInitialAcl(rows) {
   };
 }
 
-function validateProviderInitialAcl(inventory) {
+function validateProviderInitialAcl(inventory, preparedOwner = null) {
   // Reviewed v1 contract, not derived from the query, connection role, or OIDs.
   const roles = [
     { name: "cloud_admin", login: true, inherit: true, superuser: true, createDb: true, createRole: true, replication: true, bypassRls: true, connectionLimit: -1 },
@@ -1568,6 +1718,7 @@ function validateProviderInitialAcl(inventory) {
       set: role !== "pg_maintain" && role !== "pg_signal_autovacuum_worker",
     })),
   ];
+  if (preparedOwner !== null) memberships.push(preparedOwnerMembership(preparedOwner.name));
   requireCondition(
     JSON.stringify(inventory.roles) === JSON.stringify(canonicalProviderRecords(roles, PROVIDER_ROLE_KEYS)) &&
     JSON.stringify(inventory.memberships) === JSON.stringify(canonicalProviderRecords(memberships, PROVIDER_MEMBERSHIP_KEYS)),
@@ -1594,8 +1745,8 @@ function validateProviderInitialAcl(inventory) {
   return new Set(inventory.acls.map((acl) => acl.signature));
 }
 
-function classifyProviderInitialObjects(summary, inventory) {
-  const providerSignatures = validateProviderInitialAcl(inventory);
+function classifyProviderInitialObjects(summary, inventory, preparedOwner = null) {
+  const providerSignatures = validateProviderInitialAcl(inventory, preparedOwner);
   requireCondition([...providerSignatures].every((signature) => summary.signature.includes(signature)),
     "PROVIDER_INITIAL_ACL_COVERAGE_MISMATCH");
   // Reclassify the exact catalog identities, never subtract an assumed count.
@@ -2434,6 +2585,7 @@ function comparableEvidence(evidence) {
     userDefinedObjects: evidence.userDefinedObjects,
     extensionInventory: evidence.extensionInventory,
     ...(evidence.providerInitialAcl ? { providerInitialAcl: evidence.providerInitialAcl } : {}),
+    ...(evidence.preparedOwner ? { preparedOwner: evidence.preparedOwner } : {}),
   });
 }
 
@@ -2561,12 +2713,13 @@ export async function verifyStagingDatabasePreflight({
     report.connectionAuthority = "match";
     throwIfPreflightAborted(signal);
     const providerProfile = parseProviderInitialAclProfile(environment);
+    const preparedOwner = parsePreparedOwner(environment, safety, providerProfile);
     if (providerProfile !== null) {
       Object.assign(report, { providerInitialAcl: createPreflightBaseReport(providerProfile).providerInitialAcl });
     }
     const classifyObjects = (summary, evidence, key) => {
       if (providerProfile === null) return summary;
-      const classified = classifyProviderInitialObjects(summary, evidence.providerInitialAcl);
+      const classified = classifyProviderInitialObjects(summary, evidence.providerInitialAcl, preparedOwner);
       report.providerInitialAcl.snapshots[key] = {
         catalogRows: evidence.providerInitialAcl.catalog_count,
         aclEntries: evidence.providerInitialAcl.acls.reduce((count, acl) => count + acl.entries.length, 0),
@@ -2601,12 +2754,12 @@ export async function verifyStagingDatabasePreflight({
     const directBefore = await collectPreflightEvidence(
       directConnection,
       onQuery,
-      { signal, providerProfile }
+      { signal, providerProfile, preparedOwner }
     );
     const pooledBefore = await collectPreflightEvidence(
       pooledConnection,
       onQuery,
-      { signal, providerProfile }
+      { signal, providerProfile, preparedOwner }
     );
     throwIfPreflightAborted(signal);
     requireExtensionInventoryMatch(expectedExtensions, [
@@ -2683,12 +2836,12 @@ export async function verifyStagingDatabasePreflight({
     const directAfter = await collectPreflightEvidence(
       directConnection,
       onQuery,
-      { signal, providerProfile }
+      { signal, providerProfile, preparedOwner }
     );
     const pooledAfter = await collectPreflightEvidence(
       pooledConnection,
       onQuery,
-      { signal, providerProfile }
+      { signal, providerProfile, preparedOwner }
     );
     throwIfPreflightAborted(signal);
     requireExtensionInventoryMatch(expectedExtensions, [

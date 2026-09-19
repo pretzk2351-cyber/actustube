@@ -1,6 +1,19 @@
 # ActusTube Project Status
 
-最終更新日：2026-09-03
+最終更新日：2026-09-19
+
+## 現在のprepared-owner候補と検証境界
+
+本節を今回の到達点とし、下記の旧Round / reservation observability / Production記録は各確認時点の履歴として保持します。基準headは`6f549ebf0b13727ac4978b32aa898fd1be069b66`、main / PR baseは`08ec587f7a242b40ada53a0eb69acb33ebb9253b`、PR #2はOPEN / Draftです。旧headのPush CI `34843269366`とPR CI `34843273939`はsuccessですが、今回の候補の証拠には流用しません。
+
+- 新profile `neon-pg18-prepared-app-owner-v1`を明示選択し、独立入力`ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER`とdirect / pooledの実LOGINを一致させます。strictと`neon-pg18-initial-default-acl-v1`の受理範囲は変更しません。
+- providerの固定3role属性・9 membership・2 default ACL catalog rows / 11 privilegesを維持し、新ownerへのnative bootstrap由来の自動ADMINをexact 1行追加した契約だけを認めます。ownerはLOGIN / NOINHERIT、SUPERUSER / CREATEDB / CREATEROLE / REPLICATION / BYPASSRLSなし、connection limit -1、期限・role設定なしです。直接ACLは必要な現在DB CONNECTだけ、実効DB / public schema CREATEなしとします。
+- ownerのmembership両方向、ACL grantee / grantor両方向、全DBの共有依存、未知の追加roleを検査します。session / effective / database identityとbefore / afterを4観測で比較し、runtime先行作成や一時SET行残存は拒否します。ADMIN管理能力は残るため、SET FALSEを管理者からのセキュリティ隔離とは説明しません。
+- disposable verifierは既存ケースの成功後に、自分が作成した固定object / roleだけをRESTRICT付きのtransactionで再初期化する別ケースを追加します。provider ACLを保持し、非superuser管理者の実LOGIN / CREATE ROLE → 正式preflight → 一時SET-only / DB移管 / 自己付与SET解除 → owner実LOGINでcanonical Migration → 管理者によるruntime作成 → ownerによる既存ACL manifest → 正式postflight → 認証同期までawaitします。DB作成、CASCADE、実stagingの再初期化、PostgreSQL process lifecycleは追加しません。
+- `preparedOwnerBootstrap: true`は上記追加経路全体の成功を表す固定flagです。既存`providerDefaultAclBootstrap`と`runtimeAuthSynchronization`を保持します。fake Clientはactual PostgreSQL semanticsの証明ではありません。
+- commit前のこの記録では、新head Push / PR CIとPostgreSQL 18.6追加経路はNOT RUN、実stagingのowner準備 / 正式preflight / Migration / postflight / 設定適用後Preview QAはNOT VERIFIEDです。Production操作はNOT RUNです。コード検証・独立A/Bレビュー・新head必要CIの成功と実管理権限 / 秘密入力条件が揃うまでDB書込みへ進みません。
+
+次工程は本候補のlocal validation・独立レビュー、承認済みfeature commit / Preview限定pushと新head CIです。条件成立後のstaging順序、非公開入力、上限と停止条件は[準備済みowner手順](./STAGING_DATABASE_RUNBOOK.md#準備済みowner専用profileと準備順序2026-09-19)を使用します。履歴中の「次工程」「未push chain」はその当時の状態であり、現在の実行指示ではありません。
 
 > Production節は2026-07-27 JSTの確認に基づく履歴スナップショットです。expected-owner oracle fix commit `a14ae01c2c9692f71eaf2cc3b77bb26fa45acbde`に対するautomatic push run `33584551679`はPostgreSQL 18.6 external fixtureで`RUN / FAILED`、failed stepはexternal disposable PostgreSQL verifierでした。TypeScript、full Vitest、full ESLintはskippedです。grant-inventory markerは再発せず、grant-inventory exact-set gateとそのClient closeはcontrol-flow reachability上PASSしましたが、workflow全体のPASSではありません。observed markerは`EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_MIGRATION_RESERVATION_CONCURRENCY_SETUP`です。read-only diagnosisではexpected-owner fixのdirect regressionは`RULED OUT`、reservation setupは`NEWLY REACHABLE LATENT FAILURE`で、underlying root-cause branchは`PROVEN 0 / UNRESOLVED 10`です。identity candidate 3件はすべてGitHub runner preamble由来で、application identity output 0、application sensitive output 0です。temporary ACL cleanupは開始経路まで確認しましたがterminal resultは`NOT VERIFIED`です。今回のcandidateはreservation setupのfixed branch categoryをpublic-safeに出すobservabilityだけを追加し、setup query、QueryConfig、parameter、operation count、Client lifecycle、deadline、cleanup、GRANT / REVOKE、grant-inventory、Migration、workflow、success / failure判定を変更しません。新しいautomatic CIはcommit時点で`NOT RUN`、PostgreSQL 18.6 workflow全体は`NOT VERIFIED PASS`、actual staging / Production / Neon / poolerは`NOT VERIFIED`、Production Migration / deploymentは`NOT RUN`です。
 

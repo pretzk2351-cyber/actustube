@@ -136,6 +136,28 @@ function abortAwareMain() {
 }
 
 describe("staging database preflight entrypoint terminal report gate", () => {
+  it("publishes the prepared-owner profile without accepting internal identities", async () => {
+    const processFixture = createProcessFixture(); const output: string[] = [];
+    const report = await runCli({ mainFunction: async () => ({ ...successReport(),
+      providerInitialAcl: { profile: "neon-pg18-prepared-app-owner-v1", status: "match",
+        snapshots: Object.fromEntries(["direct", "pooled", "directAfter", "pooledAfter"].map((key) => [key,
+          { catalogRows: 2, aclEntries: 11, classifiedObjects: 2, rejectedObjects: 0 }])) },
+      userDefinedObjects: Object.fromEntries(["direct", "pooled", "directAfter", "pooledAfter"].map((key) => [key,
+        { ...successReport().userDefinedObjects.direct, total: 2, other: 2 }])) }),
+    processObject: processFixture, stdout: (buffer: string) => output.push(buffer) });
+    expect(report.exitCode).toBe(0); expect(report.providerInitialAcl.profile).toBe("neon-pg18-prepared-app-owner-v1");
+    expectOneReportPair(output); expectNoFatalListeners(processFixture);
+    expect(output.join("")).not.toContain("sessionRole"); expect(output.join("")).not.toContain("grantor");
+  });
+
+  it.each(["PREPARED_OWNER_INPUT_INVALID", "PREPARED_OWNER_IDENTITY_MISMATCH", "PREPARED_OWNER_AUTHORITY_MISMATCH"])("keeps prepared-owner rejection public-safe: %s", async (checkId) => {
+    const processFixture = createProcessFixture(); const output: string[] = [];
+    const report = await runCli({ mainFunction: async () => canonicalFailureReport(1, checkId, "fail"),
+      processObject: processFixture, stdout: (buffer: string) => output.push(buffer) });
+    expect(report.exitCode).toBe(1); expect(report.failure.checkId).toBe(checkId);
+    expectOneReportPair(output); expectNoFatalListeners(processFixture);
+  });
+
   it("commits a normal report as one synchronous buffer", async () => {
     const processFixture = createProcessFixture();
     const output: string[] = [];

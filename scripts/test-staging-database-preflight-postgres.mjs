@@ -6096,8 +6096,9 @@ async function runTemporaryUsageBodyAclWindow({
   return verificationResult;
 }
 
-async function configureRuntimeAcl(client, configuration) {
+async function configureRuntimeAcl(client, configuration, preparedOwner = false) {
   await client.query(`
+    ${preparedOwner ? "" : `
     REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM
       ${quoteIdentifier(USAGE_FIXTURE_ROLES.explicitRuntime)},
       ${quoteIdentifier(USAGE_FIXTURE_ROLES.runtimeGroup)},
@@ -6111,11 +6112,12 @@ async function configureRuntimeAcl(client, configuration) {
     CREATE ROLE ${quoteIdentifier(RUNTIME_ROLE)}
       LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
       PASSWORD '${RUNTIME_PASSWORD}';
+    `}
     REVOKE CREATE ON SCHEMA public FROM PUBLIC;
     REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
     REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;
-    ALTER ROLE ${quoteIdentifier(RUNTIME_ROLE)}
-      SET search_path = public, pg_temp;
+    ${preparedOwner ? "" : `ALTER ROLE ${quoteIdentifier(RUNTIME_ROLE)}
+      SET search_path = public, pg_temp;`}
     GRANT CONNECT ON DATABASE ${quoteIdentifier(configuration.database)}
       TO ${quoteIdentifier(RUNTIME_ROLE)};
     GRANT USAGE ON SCHEMA public, drizzle
@@ -7571,6 +7573,229 @@ async function verifyRuntimeAuthSynchronization(
   return true;
 }
 
+// Fixed, synthetic credentials belong only to the already-validated loopback
+// service fixture. This module is not a staging bootstrap launcher.
+const PREPARED_FIXTURE_OWNER = "actustube_staging_prepared_owner";
+const PREPARED_FIXTURE_PASSWORD = "fixed_prepared_owner_fixture_password";
+const PREPARED_MANAGER_PASSWORD = "fixed_prepared_manager_fixture_password";
+const PREPARED_MEMBERSHIP_SQL = `
+  SELECT granted.rolname AS role, member_role.rolname AS member,
+    m.grantor = 10 AND grantor.rolsuper AS native_grantor,
+    grantor.rolname = 'neondb_owner' AS manager_grantor,
+    m.admin_option AS admin, m.inherit_option AS inherit, m.set_option AS set
+  FROM pg_catalog.pg_auth_members m
+  LEFT JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid
+  LEFT JOIN pg_catalog.pg_roles member_role ON member_role.oid = m.member
+  LEFT JOIN pg_catalog.pg_roles grantor ON grantor.oid = m.grantor
+  WHERE m.roleid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)
+     OR m.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)
+`;
+
+async function assertPreparedAutomaticMembership(client, role = PREPARED_FIXTURE_OWNER, temporary = false) {
+  const result = await client.query(PREPARED_MEMBERSHIP_SQL, [role]);
+  const expected = [{ role, member: "neondb_owner", native_grantor: true, manager_grantor: false,
+    admin: true, inherit: false, set: false }];
+  if (temporary) expected.push({ role, member: "neondb_owner", native_grantor: false, manager_grantor: true,
+    admin: false, inherit: false, set: true });
+  requireHarness(Array.isArray(result.rows) && result.rows.length === expected.length &&
+    expected.every((entry) => result.rows.filter((row) => exactOwnKeys(row, Object.keys(entry)) &&
+      Object.entries(entry).every(([key, value]) => row[key] === value)).length === 1),
+  "EXTERNAL_FIXTURE_PREPARED_MEMBERSHIP_INVALID");
+}
+
+async function withPreparedTransaction(context, client, operation) {
+  await client.query("BEGIN");
+  let commitStarted = false;
+  try {
+    const result = await operation();
+    commitStarted = true;
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    // A sent COMMIT can have an unknown outcome. Never re-send it, nor query a
+    // timed-out Client. The owned proxy enforces the same absolute deadline.
+    if (!commitStarted && !context.timedOut) {
+      try { await client.query("ROLLBACK"); } catch { /* Preserve primary failure. */ }
+    }
+    throw error;
+  }
+}
+
+async function preparedManagerIdentity(client, expectedDatabase, expectedOwner) {
+  await observeSessionIdentity(client, "neondb_owner", "EXTERNAL_FIXTURE_PREPARED_MANAGER_IDENTITY_INVALID");
+  const result = await client.query(`
+    SELECT current_database()::text AS database, owner.rolname AS owner,
+      r.rolcanlogin AS login, r.rolsuper AS superuser, r.rolcreatedb AS create_db,
+      r.rolcreaterole AS create_role, current_setting('createrole_self_grant') AS self_grant
+    FROM pg_catalog.pg_roles r CROSS JOIN pg_catalog.pg_database d
+    JOIN pg_catalog.pg_roles owner ON owner.oid = d.datdba
+    WHERE r.rolname = session_user AND d.datname = current_database()
+  `);
+  const expected = { database: expectedDatabase, owner: expectedOwner, login: true,
+    superuser: false, create_db: true, create_role: true, self_grant: "" };
+  requireHarness(result.rows.length === 1 && exactOwnKeys(result.rows[0], Object.keys(expected)) &&
+    Object.entries(expected).every(([key, value]) => result.rows[0][key] === value),
+  "EXTERNAL_FIXTURE_PREPARED_MANAGER_AUTHORITY_INVALID");
+}
+
+async function createPreparedOwnerWithManager(context, client, database) {
+  // The GUC is observed on the very connection that executes CREATE ROLE.
+  // Never SET it or fabricate the automatic native grant with a GRANT command.
+  await preparedManagerIdentity(client, database, "neondb_owner");
+  await withPreparedTransaction(context, client, async () => {
+    await client.query(`CREATE ROLE ${quoteIdentifier(PREPARED_FIXTURE_OWNER)}
+      LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+      CONNECTION LIMIT -1 PASSWORD '${PREPARED_FIXTURE_PASSWORD}'`);
+    await assertPreparedAutomaticMembership(client);
+  });
+}
+
+async function reinitializeOwnedDisposableFixture(context, clientFactory, configuration, specification) {
+  // This is a second, bounded case in the SAME disposable service DB, after
+  // the complete original case passed. No DB creation, CASCADE, down-migration
+  // launcher, catalog-generated cleanup, or staging target is accepted.
+  const before = await runPostflight(context, clientFactory, configuration);
+  requireHarness(before.report.exitCode === 0, "EXTERNAL_FIXTURE_PREPARED_RESET_PRECONDITION_FAILED");
+  await runPreMutationSessionIdentityBoundary({
+    context, clientFactory, credentials: fixtureCredentials(configuration), expectedSessionRole: configuration.role,
+    async operation(client) {
+      await assertFixtureIdentity(client, configuration);
+      await assertMigrationLedger(client, EXPECTED_MIGRATION_COUNT);
+      await assertPostCanonicalOwnershipSnapshot(client, buildRepositoryOwnershipContract(specification, configuration.role));
+      await verifyProviderBootstrapPreserved(client);
+      await withPreparedTransaction(context, client, async () => {
+      // Fixed names are only objects/roles created by this run. RESTRICT is
+      // deliberate: an unknown dependent object aborts instead of being removed.
+      for (const entry of CANONICAL_FUNCTION_CONTRACT) {
+        await client.query(`DROP FUNCTION public.${quoteIdentifier(entry.name)}(${entry.alterIdentity}) RESTRICT`);
+      }
+      for (const table of ["improvement_actions", "analysis_runs", "oauth_accounts", "user_plan_assignments",
+        "user_usage_buckets", "usage_reservation_leases", "users", "plans"]) {
+        await client.query(`DROP TABLE public.${quoteIdentifier(table)} RESTRICT`);
+      }
+      for (const type of ["user_status", "plan_assignment_status", "plan_assignment_source", "usage_metric", "usage_period_kind", "improvement_action_status"]) {
+        await client.query(`DROP TYPE public.${quoteIdentifier(type)} RESTRICT`);
+      }
+      await client.query('DROP TABLE "drizzle"."__drizzle_migrations" RESTRICT');
+      await client.query('DROP SCHEMA "drizzle" RESTRICT');
+      await client.query(`REVOKE CONNECT ON DATABASE ${quoteIdentifier(configuration.database)} FROM ${quoteIdentifier(RUNTIME_ROLE)}`);
+      await client.query(`REVOKE USAGE ON SCHEMA public FROM ${quoteIdentifier(RUNTIME_ROLE)}`);
+      for (const role of [...Object.values(USAGE_FIXTURE_ROLES), ...Object.values(USAGE_MIGRATION_BOUNDARY_ROLES), RUNTIME_ROLE]) {
+        await client.query(`DROP ROLE ${quoteIdentifier(role)}`);
+      }
+      await client.query("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO PUBLIC");
+      await client.query(`ALTER ROLE neondb_owner PASSWORD '${PREPARED_MANAGER_PASSWORD}'`);
+      await client.query(`ALTER DATABASE ${quoteIdentifier(configuration.database)} OWNER TO neondb_owner`);
+      await client.query("ALTER SCHEMA public OWNER TO pg_database_owner");
+      await verifyProviderBootstrapPreserved(client);
+      });
+    },
+  });
+}
+
+async function transferPreparedOwnerWithManager(context, client, database) {
+  await preparedManagerIdentity(client, database, "neondb_owner");
+  await assertPreparedAutomaticMembership(client);
+  await withPreparedTransaction(context, client, async () => {
+    await client.query(`GRANT ${quoteIdentifier(PREPARED_FIXTURE_OWNER)} TO neondb_owner
+      WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY neondb_owner`);
+    await assertPreparedAutomaticMembership(client, PREPARED_FIXTURE_OWNER, true);
+    await client.query(`ALTER DATABASE ${quoteIdentifier(database)} OWNER TO ${quoteIdentifier(PREPARED_FIXTURE_OWNER)}`);
+    await client.query(`REVOKE ${quoteIdentifier(PREPARED_FIXTURE_OWNER)} FROM neondb_owner GRANTED BY neondb_owner`);
+    await assertPreparedAutomaticMembership(client);
+  });
+}
+
+async function verifyPreparedOwnerThroughEntrypoint(context, clientFactory, configuration, specification, extensions) {
+  await reinitializeOwnedDisposableFixture(context, clientFactory, configuration, specification);
+  const managerCredentials = fixtureCredentials(configuration, { role: "neondb_owner", password: PREPARED_MANAGER_PASSWORD });
+  await withClient(context, clientFactory, managerCredentials,
+    (client) => createPreparedOwnerWithManager(context, client, configuration.database));
+  const ownerUrl = new URL(configuration.rawUrl);
+  ownerUrl.username = PREPARED_FIXTURE_OWNER; ownerUrl.password = PREPARED_FIXTURE_PASSWORD;
+  const ownerConfiguration = Object.freeze({ ...configuration, role: PREPARED_FIXTURE_OWNER,
+    password: PREPARED_FIXTURE_PASSWORD, rawUrl: ownerUrl.href });
+  const ownerCredentials = fixtureCredentials(ownerConfiguration);
+  const runFormalPreflight = async (profile) => {
+    const output = [];
+    const report = await runBoundedPhase(context, "phase", context.limits.phaseMilliseconds, () =>
+      executeStagingDatabasePreflight({
+        environment: { ...preflightEnvironment(ownerConfiguration, extensions),
+          ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: profile,
+          ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER: PREPARED_FIXTURE_OWNER },
+        repositoryRoot, allowLoopback: true,
+        adapter: createAdapter(context, clientFactory, () => ownerCredentials),
+        onQuery: assertReadOnlySql, stdout(line) { output.push(line); },
+      }));
+    requireHarness(output.length > 0 && [PREPARED_FIXTURE_OWNER, PREPARED_FIXTURE_PASSWORD,
+      PREPARED_MANAGER_PASSWORD, ownerUrl.href, configuration.password, configuration.database, "neondb_owner"]
+      .every((part) => !output.join("\n").includes(part)), "EXTERNAL_FIXTURE_OUTPUT_REDACTION_FAILED");
+    return report;
+  };
+  const legacy = await runFormalPreflight("neon-pg18-initial-default-acl-v1");
+  requireHarness(legacy.exitCode === 1 && legacy.failure?.checkId === "PROVIDER_INITIAL_ACL_ROLE_MISMATCH",
+    "EXTERNAL_FIXTURE_PREPARED_LEGACY_CONTROL_FAILED");
+  const prepared = await runFormalPreflight("neon-pg18-prepared-app-owner-v1");
+  requireHarness(prepared.exitCode === 0 && prepared.overallStatus === "pass" &&
+    prepared.initialState === "pristine" && prepared.beforeAfterComparison === "match" &&
+    prepared.providerInitialAcl?.status === "match", "EXTERNAL_FIXTURE_PREPARED_PREFLIGHT_FAILED");
+
+  await withClient(context, clientFactory, managerCredentials,
+    (client) => transferPreparedOwnerWithManager(context, client, configuration.database));
+  const { identityAuthority } = await runPreMutationSessionIdentityBoundary({
+    context, clientFactory, credentials: ownerCredentials, expectedSessionRole: PREPARED_FIXTURE_OWNER,
+    async operation(client) {
+      const result = await client.query(`SELECT r.rolsuper AS superuser, r.rolcreaterole AS create_role,
+        d.datdba = r.oid AS owns_database, n.nspowner = 'pg_database_owner'::regrole AS native_schema_owner
+        FROM pg_catalog.pg_roles r CROSS JOIN pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_namespace n
+        WHERE r.rolname = session_user AND d.datname = current_database() AND n.nspname = 'public'`);
+      requireHarness(result.rows.length === 1 && exactOwnKeys(result.rows[0], ["superuser", "create_role", "owns_database", "native_schema_owner"]) &&
+        result.rows[0].superuser === false && result.rows[0].create_role === false &&
+        result.rows[0].owns_database === true && result.rows[0].native_schema_owner === true,
+      "EXTERNAL_FIXTURE_PREPARED_OWNER_AUTHORITY_INVALID");
+      await client.query("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+      await applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT);
+      await assertMigrationLedger(client, EXPECTED_MIGRATION_COUNT);
+    },
+  });
+  await withClient(context, clientFactory, managerCredentials, async (client) => {
+    await preparedManagerIdentity(client, configuration.database, PREPARED_FIXTURE_OWNER);
+    await assertPreparedAutomaticMembership(client);
+    await withPreparedTransaction(context, client, async () => {
+      await client.query(`CREATE ROLE ${quoteIdentifier(RUNTIME_ROLE)}
+        LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${RUNTIME_PASSWORD}'`);
+      await client.query(`ALTER ROLE ${quoteIdentifier(RUNTIME_ROLE)} SET search_path = public, pg_temp`);
+      await assertPreparedAutomaticMembership(client, RUNTIME_ROLE);
+    });
+  });
+  await withClient(context, clientFactory, ownerCredentials, async (client) => {
+    await observeSessionIdentity(client, requireOriginalObservedSessionIdentity(identityAuthority, identityAuthority.observedSessionIdentity),
+      "EXTERNAL_FIXTURE_PREPARED_OWNER_IDENTITY_INVALID");
+    await configureRuntimeAcl(client, ownerConfiguration, true);
+    await verifyProviderBootstrapPreserved(client);
+  });
+  const postflight = () => runPostflight(context, clientFactory, ownerConfiguration);
+  const final = await postflight();
+  requireHarness(final.report.exitCode === 0, "EXTERNAL_FIXTURE_PREPARED_POSTFLIGHT_FAILED");
+  await verifyRuntimeAuthSynchronization(context, clientFactory, ownerConfiguration, identityAuthority, postflight);
+  return true;
+}
+
+export async function runPreparedOwnerCreationProbeForTests({ client, deadlineLimits, scenario = "creation" }) {
+  requireHarness(["creation", "transfer"].includes(scenario), "EXTERNAL_FIXTURE_PREPARED_PROBE_INVALID");
+  const context = createDeadlineContext(deadlineLimits);
+  let completed = false;
+  let failure = null;
+  try {
+    await withClient(context, () => client, {}, (ownedClient) => scenario === "creation"
+      ? createPreparedOwnerWithManager(context, ownedClient, "actustube_ci_fixture")
+      : transferPreparedOwnerWithManager(context, ownedClient, "actustube_ci_fixture"));
+    completed = true;
+  } catch (error) { failure = error; }
+  return Object.freeze({ completed, timedOut: context.timedOut, activeClientCount: context.activeClients.size,
+    output: failure === null ? "" : externalFixtureFailureOutput(failure) });
+}
+
 export async function runRuntimeAuthSynchronizationProbeForTests(options) {
   requireHarness(exactOwnKeys(options, ["clientFactory", "postflight", "deadlineLimits"]) &&
     typeof options.clientFactory === "function" && typeof options.postflight === "function",
@@ -7611,6 +7836,7 @@ function publicSuccessResult() {
     postflightDriftRejected: true,
     runtimeAuthSynchronization: true,
     providerDefaultAclBootstrap: true,
+    preparedOwnerBootstrap: true,
     verifierQueriesReadOnly: true,
     outputRedaction: true,
   });
@@ -8813,6 +9039,8 @@ async function runConnectionOnlyHarnessWithinContext(options, context) {
     requireHarness(providerBootstrapVerified === true &&
       await withClient(context, resolvedClientFactory, fixtureCredentials(configuration), verifyProviderBootstrapPreserved),
     "EXTERNAL_FIXTURE_PROVIDER_BOOTSTRAP_PRESERVATION_FAILED");
+    requireHarness(await verifyPreparedOwnerThroughEntrypoint(context, resolvedClientFactory, configuration, specification, extensions) === true,
+      "EXTERNAL_FIXTURE_PREPARED_BOOTSTRAP_FAILED");
   });
 
   return publicSuccessResult();

@@ -36,6 +36,7 @@ import {
   runHarnessTransactionBoundaryProbeForTests,
   runMigrationOwnerBoundaryProbeForTests,
   runOwnershipCanonicalizationProbeForTests,
+  runPreparedOwnerCreationProbeForTests,
   runReservationConcurrencySetupDiagnosticOutputProbeForTests,
   runReservationConcurrencySetupObservabilityProbeForTests,
   runReservationSetupTransactionPrimaryProbeForTests,
@@ -631,6 +632,7 @@ const externalFixturePublicSuccessOracle = Object.freeze({
   postflightDriftRejected: true,
   runtimeAuthSynchronization: true,
   providerDefaultAclBootstrap: true,
+  preparedOwnerBootstrap: true,
   verifierQueriesReadOnly: true,
   outputRedaction: true,
 });
@@ -1397,8 +1399,10 @@ function createConnection(
   let migrationExactReads = 0;
   let extensionInventoryReads = 0;
   let providerInventoryReads = 0;
+  let preparedOwnerReads = 0;
   let cleanupHandle: ReturnType<typeof setInterval> | undefined;
-  const query = vi.fn((statement: string) => {
+  const query = vi.fn((statement: string, parameters: unknown[] = []) => {
+    void parameters;
     if (options.hangAt && sameSql(statement, (PREFLIGHT_SQL_FOR_TESTS as any)[options.hangAt])) {
       return new Promise<{ rows: unknown[] }>(() => undefined);
     }
@@ -1481,6 +1485,12 @@ function createConnection(
       return Promise.resolve({ rows: state.providerInventoryForRead
         ? state.providerInventoryForRead(providerInventoryReads)
         : [state.providerInventory] });
+    }
+    if (sameSql(statement, PREFLIGHT_SQL_FOR_TESTS.preparedOwner)) {
+      preparedOwnerReads += 1;
+      if (state.preparedQueryRejects) return Promise.reject(new Error(fakeSecret));
+      return Promise.resolve({ rows: state.preparedOwnerForRead
+        ? state.preparedOwnerForRead(preparedOwnerReads) : [state.preparedOwner] });
     }
     throw new Error(`Unexpected fixture query: ${statement.slice(0, 32)}`);
   });
@@ -1591,6 +1601,383 @@ function providerBootstrapState() {
 function providerBootstrapEnvironment() {
   return { ...validEnvironment(), ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: "neon-pg18-initial-default-acl-v1" };
 }
+
+const preparedOwnerName = "actustube_staging_prepared_owner";
+function preparedOwnerInventoryFixture() {
+  return {
+    session_role: preparedOwnerName, effective_role: preparedOwnerName,
+    database_name: "staging_database", database_owner: "neondb_owner",
+    owner: { oid: "92000", name: preparedOwnerName, login: true, inherit: false,
+      superuser: false, createDb: false, createRole: false, replication: false,
+      bypassRls: false, connectionLimit: -1, validUntilNull: true, connect: true, create: false, publicCreate: false },
+    settings_count: 0, other_acl_count: 0,
+    roles: [
+      { name: "cloud_admin", nativeBootstrap: true },
+      { name: "neon_superuser", nativeBootstrap: false },
+      { name: "neondb_owner", nativeBootstrap: false },
+      { name: "neon_service", nativeBootstrap: false },
+      { name: preparedOwnerName, nativeBootstrap: false },
+    ],
+    memberships: [{ role: preparedOwnerName, member: "neondb_owner", grantorIsBootstrap: true,
+      admin: true, inherit: false, set: false }],
+    database_acls: [{ currentDatabase: true, granteeIsOwner: true, grantorIsManager: true,
+      privilege: "CONNECT", grantOption: false }],
+    dependencies: [{ signature: "0:1262:16384:0:a", connectAcl: true }],
+  };
+}
+
+function preparedOwnerState() {
+  const state = providerBootstrapState();
+  state.preparedOwner = preparedOwnerInventoryFixture();
+  state.providerInventory.memberships.push({ role: preparedOwnerName, member: "neondb_owner",
+    grantorIsBootstrap: true, admin: true, inherit: false, set: false });
+  return state;
+}
+
+function preparedOwnerEnvironment() {
+  const direct = new URL(directUrl); direct.username = preparedOwnerName;
+  const pooled = new URL(pooledUrl); pooled.username = preparedOwnerName;
+  return { ...validEnvironment(), DIRECT_DATABASE_URL: direct.href, DATABASE_URL: pooled.href,
+    ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: "neon-pg18-prepared-app-owner-v1",
+    ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER: preparedOwnerName };
+}
+
+function preparedOwnerAdapter(state = preparedOwnerState(), pooledState = state) {
+  return createAdapter({ directState: state, pooledState,
+    directOptions: { roleName: preparedOwnerName }, pooledOptions: { roleName: preparedOwnerName } });
+}
+
+describe("prepared staging owner profile", () => {
+  it("accepts only the independent owner and native automatic ADMIN edge through the formal entrypoint", async () => {
+    const adapter = preparedOwnerAdapter(); const stdout = vi.fn();
+    const result = await executeStagingDatabasePreflight({ environment: preparedOwnerEnvironment(),
+      repositoryRoot, adapter, stdout });
+    expect(result.exitCode).toBe(0);
+    expect(result.providerInitialAcl).toMatchObject({ profile: "neon-pg18-prepared-app-owner-v1", status: "match" });
+    for (const connection of [adapter.directConnection, adapter.pooledConnection]) {
+      const queries = connection.query.mock.calls.filter(([sql]) => sameSql(sql, PREFLIGHT_SQL_FOR_TESTS.preparedOwner));
+      expect(queries).toHaveLength(2);
+      for (const [, parameters] of queries) expect(parameters).toEqual([preparedOwnerName]);
+      expect(connection.close).toHaveBeenCalledTimes(1);
+    }
+    for (const forbidden of [preparedOwnerName, fakeSecret, "neondb_owner", "cloud_admin", "92000", "1262", "session_role", "dependencies"])
+      expect(JSON.stringify(stdout.mock.calls)).not.toContain(forbidden);
+  });
+
+  it("does not widen existing v1 for the automatic ADMIN edge", async () => {
+    const result = await runPreflight(preparedOwnerAdapter(), {
+      ...preparedOwnerEnvironment(), ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: "neon-pg18-initial-default-acl-v1" });
+    expect(result.failure?.checkId).toBe("PROVIDER_INITIAL_ACL_ROLE_MISMATCH");
+  });
+
+  it("keeps strict and v1 unaffected by an unused new input key", async () => {
+    expect((await runPreflight(createAdapter(), { ...validEnvironment(),
+      ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER: "unused" })).exitCode).toBe(0);
+    expect((await runPreflight(createAdapter({ directState: providerBootstrapState() }), {
+      ...providerBootstrapEnvironment(), ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER: "unused" })).exitCode).toBe(0);
+  });
+
+  it.each(["public-connect", "native-initdb-name", "catalog-order"])("accepts the explicitly bounded variant %s", async (variant) => {
+    const state = preparedOwnerState();
+    if (variant === "public-connect") { state.preparedOwner.database_acls = []; state.preparedOwner.dependencies = []; }
+    if (variant === "native-initdb-name") {
+      state.preparedOwner.roles[0].nativeBootstrap = false;
+      state.preparedOwner.roles.push({ name: "fixture_initdb_owner", nativeBootstrap: true });
+    }
+    if (variant === "catalog-order") state.preparedOwnerForRead = (read: number) => {
+      const row = preparedOwnerInventoryFixture(); if (read === 2) row.roles.reverse(); return [row];
+    };
+    expect((await runPreflight(preparedOwnerAdapter(state), preparedOwnerEnvironment())).exitCode).toBe(0);
+  });
+
+  const mutations: { name: string; change: (row: ReturnType<typeof preparedOwnerInventoryFixture>) => void }[] = [
+    { name: "wrong session", change: (r) => { r.session_role = "third_role"; } },
+    { name: "wrong effective", change: (r) => { r.effective_role = "third_role"; } },
+    { name: "wrong database", change: (r) => { r.database_name = "another_database"; } },
+    { name: "early owner transfer", change: (r) => { r.database_owner = preparedOwnerName; } },
+    { name: "no LOGIN", change: (r) => { r.owner.login = false; } },
+    { name: "INHERIT", change: (r) => { r.owner.inherit = true; } },
+    ...["superuser", "createDb", "createRole", "replication", "bypassRls", "create", "publicCreate"].map((key) => ({
+      name: `excess ${key}`, change: (r: ReturnType<typeof preparedOwnerInventoryFixture>) => { Reflect.set(r.owner, key, true); } })),
+    { name: "connection limit", change: (r) => { r.owner.connectionLimit = 1; } },
+    { name: "expiration", change: (r) => { r.owner.validUntilNull = false; } },
+    { name: "native OID as new owner", change: (r) => { r.owner.oid = "10"; } },
+    { name: "no CONNECT", change: (r) => { r.owner.connect = false; } },
+    { name: "role settings in any database", change: (r) => { r.settings_count = 1; } },
+    { name: "other ACL", change: (r) => { r.other_acl_count = 1; } },
+    { name: "runtime created first", change: (r) => { r.roles.push({ name: "early_runtime", nativeBootstrap: false }); } },
+    { name: "arbitrary superuser not native", change: (r) => { r.roles[0].nativeBootstrap = false; } },
+    { name: "second native identity", change: (r) => { r.roles[1].nativeBootstrap = true; } },
+    { name: "owner as native", change: (r) => { r.roles[4].nativeBootstrap = true; } },
+    { name: "missing provider role", change: (r) => { r.roles.pop(); } },
+    { name: "duplicate role", change: (r) => { r.roles.push({ ...r.roles[0] }); } },
+    { name: "missing auto ADMIN", change: (r) => { r.memberships = []; } },
+    { name: "duplicate auto ADMIN", change: (r) => { r.memberships.push({ ...r.memberships[0] }); } },
+    { name: "wrong grantor", change: (r) => { r.memberships[0].grantorIsBootstrap = false; } },
+    { name: "wrong member", change: (r) => { r.memberships[0].member = "third_role"; } },
+    { name: "wrong direction", change: (r) => { r.memberships[0].member = preparedOwnerName; r.memberships[0].role = "neondb_owner"; } },
+    { name: "extra owner outgoing edge", change: (r) => { r.memberships.push({ ...r.memberships[0], role: "third_role", member: preparedOwnerName }); } },
+    { name: "no ADMIN", change: (r) => { r.memberships[0].admin = false; } },
+    { name: "temporary SET", change: (r) => { r.memberships[0].set = true; } },
+    { name: "inherited edge", change: (r) => { r.memberships[0].inherit = true; } },
+    { name: "other database CONNECT", change: (r) => { r.database_acls[0].currentDatabase = false; } },
+    { name: "owner as ACL grantor", change: (r) => { r.database_acls[0].granteeIsOwner = false; } },
+    { name: "other ACL grantor", change: (r) => { r.database_acls[0].grantorIsManager = false; } },
+    { name: "CREATE ACL", change: (r) => { r.database_acls[0].privilege = "CREATE"; } },
+    { name: "grant option", change: (r) => { r.database_acls[0].grantOption = true; } },
+    { name: "duplicate CONNECT ACL", change: (r) => { r.database_acls.push({ ...r.database_acls[0] }); } },
+    { name: "missing dependency", change: (r) => { r.dependencies = []; } },
+    { name: "uncovered dependency", change: (r) => { r.dependencies[0].connectAcl = false; } },
+    { name: "column dependency", change: (r) => { r.dependencies[0].signature = "0:1262:16384:1:a"; } },
+    { name: "other database dependency", change: (r) => { r.dependencies[0].signature = "16385:1262:16384:0:a"; } },
+    { name: "ownership dependency", change: (r) => { r.dependencies[0].signature = "0:1262:16384:0:o"; } },
+    { name: "duplicate dependency", change: (r) => { r.dependencies.push({ ...r.dependencies[0] }); } },
+    { name: "extra dependency", change: (r) => { r.dependencies.push({ signature: "0:1262:16385:0:a", connectAcl: true }); } },
+    { name: "missing key", change: (r) => { Reflect.deleteProperty(r.owner, "inherit"); } },
+    { name: "extra key", change: (r) => { Reflect.set(r, "secret", fakeSecret); } },
+    { name: "null", change: (r) => { Reflect.set(r, "owner", null); } },
+    { name: "wrong type", change: (r) => { Reflect.set(r.owner, "login", "true"); } },
+  ];
+  it.each(mutations)("rejects prepared owner $name without exposing internal identity", async ({ change }) => {
+    const state = preparedOwnerState(); const before = JSON.stringify(state.preparedOwner);
+    change(state.preparedOwner); expect(JSON.stringify(state.preparedOwner)).not.toBe(before);
+    const stdout = vi.fn(); const adapter = preparedOwnerAdapter(state);
+    const result = await executeStagingDatabasePreflight({ environment: preparedOwnerEnvironment(), repositoryRoot, adapter, stdout });
+    expect(result.exitCode).not.toBe(0);
+    for (const forbidden of [preparedOwnerName, fakeSecret, "neondb_owner", "92000", "third_role"])
+      expect(JSON.stringify(stdout.mock.calls)).not.toContain(forbidden);
+    expect(adapter.directConnection.close).toHaveBeenCalledTimes(1);
+    expect(adapter.pooledConnection.close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([[], [preparedOwnerInventoryFixture(), preparedOwnerInventoryFixture()], null])("rejects incomplete or duplicate prepared inventory %#", async (rows) => {
+    const state = preparedOwnerState(); state.preparedOwnerForRead = () => rows;
+    expect((await runPreflight(preparedOwnerAdapter(state), preparedOwnerEnvironment())).exitCode).not.toBe(0);
+  });
+
+  it.each(["direct", "pooled"])("rejects prepared role OID drift on %s after snapshot", async (kind) => {
+    const direct = preparedOwnerState(); const pooled = preparedOwnerState();
+    const changed = kind === "direct" ? direct : pooled;
+    changed.preparedOwnerForRead = (read: number) => {
+      const row = preparedOwnerInventoryFixture(); if (read === 2) row.owner.oid = "92001"; return [row];
+    };
+    const result = await runPreflight(preparedOwnerAdapter(direct, pooled), preparedOwnerEnvironment());
+    expect(result.failure?.checkId).toBe("READ_ONLY_INVARIANT_MISMATCH");
+  });
+
+  it("rejects prepared query failure with safe output and closes both clients", async () => {
+    const state = preparedOwnerState(); state.preparedQueryRejects = true;
+    const adapter = preparedOwnerAdapter(state); const stdout = vi.fn();
+    const result = await executeStagingDatabasePreflight({ environment: preparedOwnerEnvironment(), repositoryRoot, adapter, stdout });
+    expect(result.exitCode).not.toBe(0); expect(JSON.stringify(stdout.mock.calls)).not.toContain(fakeSecret);
+    expect(adapter.directConnection.close).toHaveBeenCalledTimes(1); expect(adapter.pooledConnection.close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, "", "application_owner", "staging_bad-role", "staging_owner;secret", "a".repeat(64)])("rejects unsafe or missing independent prepared owner before connecting %#", async (name) => {
+    const adapter = preparedOwnerAdapter();
+    const result = await runPreflight(adapter, { ...preparedOwnerEnvironment(), ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER: name });
+    expect(result.failure?.checkId).toBe("PREPARED_OWNER_INPUT_INVALID"); expect(adapter.connect).not.toHaveBeenCalled();
+  });
+
+  it.each(["DIRECT_DATABASE_URL", "DATABASE_URL"])("rejects different actual URL role before connecting %s", async (key) => {
+    const environment = preparedOwnerEnvironment(); const url = new URL(environment[key]); url.username = "other_staging_owner";
+    const adapter = preparedOwnerAdapter();
+    const result = await runPreflight(adapter, { ...environment, [key]: url.href });
+    expect(result.failure?.checkId).toBe("PREPARED_OWNER_IDENTITY_MISMATCH"); expect(adapter.connect).not.toHaveBeenCalled();
+  });
+
+  it("keeps SQL catalog coverage independent of the test's fake rows", () => {
+    const sql = PREFLIGHT_SQL_FOR_TESTS.preparedOwner;
+    assertReadOnlySql(sql);
+    for (const catalog of ["pg_database", "pg_namespace", "pg_class", "pg_attribute", "pg_proc", "pg_type", "pg_default_acl", "pg_largeobject_metadata", "pg_language", "pg_foreign_data_wrapper", "pg_foreign_server", "pg_tablespace", "pg_parameter_acl", "pg_init_privs"])
+      expect(sql).toContain(`pg_catalog.${catalog}`);
+    expect(sql).toContain("a.grantee = r.oid OR a.grantor = r.oid");
+    expect(sql).toContain("acl.grantee = r.oid OR acl.grantor = r.oid");
+    expect(sql).toContain("m.roleid = (SELECT oid FROM owner_role)");
+    expect(sql).toContain("OR m.member = (SELECT oid FROM owner_role)");
+    expect(sql).toContain("m.grantor = 10 AND grantor.rolsuper");
+    expect(sql).toContain("FROM pg_catalog.pg_shdepend d");
+    expect(sql).toContain("d.objsubid = 0 AND d.deptype = 'a'");
+    expect(sql).toContain("d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass");
+    expect(sql).toContain("WHERE oid >= 16384 OR oid = 10");
+    expect(sql).toContain("FROM pg_catalog.pg_db_role_setting");
+  });
+});
+
+describe("prepared owner real-login orchestration boundary", () => {
+  const managerOracle = `SELECT current_database()::text AS database, owner.rolname AS owner,
+    r.rolcanlogin AS login, r.rolsuper AS superuser, r.rolcreatedb AS create_db,
+    r.rolcreaterole AS create_role, current_setting('createrole_self_grant') AS self_grant
+    FROM pg_catalog.pg_roles r CROSS JOIN pg_catalog.pg_database d
+    JOIN pg_catalog.pg_roles owner ON owner.oid = d.datdba
+    WHERE r.rolname = session_user AND d.datname = current_database()`;
+  const createOracle = `CREATE ROLE "actustube_staging_prepared_owner"
+    LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+    CONNECTION LIMIT -1 PASSWORD 'fixed_prepared_owner_fixture_password'`;
+  const membershipOracle = `SELECT granted.rolname AS role, member_role.rolname AS member,
+    m.grantor = 10 AND grantor.rolsuper AS native_grantor,
+    grantor.rolname = 'neondb_owner' AS manager_grantor,
+    m.admin_option AS admin, m.inherit_option AS inherit, m.set_option AS set
+    FROM pg_catalog.pg_auth_members m
+    LEFT JOIN pg_catalog.pg_roles granted ON granted.oid = m.roleid
+    LEFT JOIN pg_catalog.pg_roles member_role ON member_role.oid = m.member
+    LEFT JOIN pg_catalog.pg_roles grantor ON grantor.oid = m.grantor
+    WHERE m.roleid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)
+    OR m.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)`;
+  const grantOracle = 'GRANT "actustube_staging_prepared_owner" TO neondb_owner WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY neondb_owner';
+  const transferOracle = 'ALTER DATABASE "actustube_ci_fixture" OWNER TO "actustube_staging_prepared_owner"';
+  const revokeOracle = 'REVOKE "actustube_staging_prepared_owner" FROM neondb_owner GRANTED BY neondb_owner';
+  function fixture(fault = "none", transfer = false) {
+    const log: string[] = []; let created = transfer; let temporary = false;
+    const state = { connect: 0, end: 0, destroy: 0, mutations: 0 };
+    const client = {
+      connection: { stream: { destroy() { state.destroy += 1; } } },
+      async connect() { state.connect += 1; }, async end() { state.end += 1; },
+      async query(sql: string, values: unknown[] = []) {
+        const key = authSqlOracleKey(sql); log.push(key);
+        if (key === authSqlOracleKey(authIdentitySqlOracle)) {
+          expect(log).toHaveLength(1); expect(values).toEqual([]);
+          if (fault === "identity-rejection") throw new Error(fakeSecret);
+          if (fault === "identity-timeout") return await new Promise<never>(() => {});
+          return { rows: [{ session_role: "neondb_owner", effective_role: fault === "identity" ? "other" : "neondb_owner" }] };
+        }
+        if (key === authSqlOracleKey(managerOracle)) {
+          expect(values).toEqual([]);
+          return { rows: [{ database: "actustube_ci_fixture", owner: fault === "database-owner" ? "other" : "neondb_owner",
+            login: true, superuser: fault === "superuser", create_db: fault !== "no-createdb", create_role: fault !== "no-createrole",
+            self_grant: fault === "self-grant" ? "set" : "" }] };
+        }
+        if (key === authSqlOracleKey(createOracle)) {
+          expect(values).toEqual([]); expect(log.at(-2)).toBe("BEGIN");
+          state.mutations += 1;
+          if (fault === "create-reject" || fault === "rollback-reject") throw new Error(fakeSecret);
+          created = true; return { rows: [] };
+        }
+        if (key === authSqlOracleKey(membershipOracle)) {
+          expect(values).toEqual(["actustube_staging_prepared_owner"]); expect(created).toBe(true);
+          return { rows: [{ role: "actustube_staging_prepared_owner", member: "neondb_owner", native_grantor: fault !== "wrong-grantor", manager_grantor: false,
+            admin: true, inherit: false, set: fault === "extra-set" }, ...(temporary ? [{ role: "actustube_staging_prepared_owner", member: "neondb_owner",
+            native_grantor: false, manager_grantor: fault !== "wrong-temporary-grantor", admin: fault === "extra-temporary-admin", inherit: false, set: true }] : [])] };
+        }
+        if (transfer && [grantOracle, transferOracle, revokeOracle].includes(key)) {
+          expect(values).toEqual([]); state.mutations += 1;
+          if (key === grantOracle) temporary = true;
+          if (key === revokeOracle) {
+            if (fault === "revoke-reject") throw new Error(fakeSecret);
+            if (fault === "revoke-timeout") return await new Promise<never>(() => {});
+            if (fault !== "revoke-residue") temporary = false;
+          }
+          return { rows: [] };
+        }
+        if (["BEGIN", "COMMIT", "ROLLBACK"].includes(key)) {
+          expect(values).toEqual([]);
+          if ((key === "COMMIT" && fault === "commit-reject") || (key === "ROLLBACK" && fault === "rollback-reject")) throw new Error(fakeSecret);
+          return { rows: [] };
+        }
+        throw new Error("fixed-unrecognized-prepared-query");
+      },
+    };
+    return { client, state, log };
+  }
+  it("uses the real production manager boundary in exact identity GUC CREATE observation COMMIT order", async () => {
+    const f = fixture();
+    const result = await runPreparedOwnerCreationProbeForTests({ client: f.client, deadlineLimits: undefined });
+    expect(result).toEqual({ completed: true, timedOut: false, activeClientCount: 0, output: "" });
+    expect(f.log).toEqual([authIdentitySqlOracle, managerOracle, "BEGIN", createOracle, membershipOracle, "COMMIT"].map(authSqlOracleKey));
+    expect(f.state).toEqual({ connect: 1, end: 1, destroy: 0, mutations: 1 });
+  });
+  it.each(["identity", "identity-rejection", "database-owner", "superuser", "no-createdb", "no-createrole", "self-grant"])("rejects %s before any prepared-owner mutation", async (fault) => {
+    const f = fixture(fault);
+    const result = await runPreparedOwnerCreationProbeForTests({ client: f.client, deadlineLimits: undefined });
+    expect(result.completed).toBe(false); expect(result.activeClientCount).toBe(0);
+    expect(f.state.mutations).toBe(0); expect(f.log).not.toContain("BEGIN"); expect(f.state.end).toBe(1);
+    expect(result.output).not.toContain(fakeSecret); expect(result.output).not.toContain("neondb_owner");
+  });
+  it.each(["wrong-grantor", "extra-set"])("does not COMMIT an unexpected automatic edge %s", async (fault) => {
+    const f = fixture(fault);
+    const result = await runPreparedOwnerCreationProbeForTests({ client: f.client, deadlineLimits: undefined });
+    expect(result.completed).toBe(false); expect(f.state.mutations).toBe(1);
+    expect(f.log).not.toContain("COMMIT"); expect(f.log.at(-1)).toBe("ROLLBACK");
+    expect(f.state.end).toBe(1); expect(result.activeClientCount).toBe(0);
+  });
+  it.each(["create-reject", "rollback-reject", "commit-reject"])("fails closed with bounded transaction handling: %s", async (fault) => {
+    const f = fixture(fault);
+    const result = await runPreparedOwnerCreationProbeForTests({ client: f.client, deadlineLimits: undefined });
+    expect(result.completed).toBe(false); expect(result.activeClientCount).toBe(0); expect(f.state.end).toBe(1);
+    expect(f.log.filter((sql) => sql === "COMMIT")).toHaveLength(fault === "commit-reject" ? 1 : 0);
+    expect(f.log.filter((sql) => sql === "ROLLBACK")).toHaveLength(fault === "commit-reject" ? 0 : 1);
+    expect(result.output).not.toContain(fakeSecret);
+  });
+  it("transfers only after exact temporary membership and removes only its own grantor row", async () => {
+    const f = fixture("none", true);
+    const result = await runPreparedOwnerCreationProbeForTests({ client: f.client, deadlineLimits: undefined, scenario: "transfer" });
+    expect(result.completed).toBe(true); expect(f.state).toEqual({ connect: 1, end: 1, destroy: 0, mutations: 3 });
+    expect(f.log).toEqual([authIdentitySqlOracle, managerOracle, membershipOracle, "BEGIN", grantOracle,
+      membershipOracle, transferOracle, revokeOracle, membershipOracle, "COMMIT"].map(authSqlOracleKey));
+  });
+  it.each(["wrong-temporary-grantor", "extra-temporary-admin", "revoke-reject", "revoke-residue", "commit-reject"])("blocks later migration runtime and postflight when transfer has %s", async (fault) => {
+    const f = fixture(fault, true);
+    const result = await runPreparedOwnerCreationProbeForTests({ client: f.client, deadlineLimits: undefined, scenario: "transfer" });
+    expect(result.completed).toBe(false); expect(result.activeClientCount).toBe(0); expect(f.state.end).toBe(1);
+    if (fault === "wrong-temporary-grantor" || fault === "extra-temporary-admin") expect(f.log).not.toContain(transferOracle);
+    expect(f.log.filter((sql) => sql === "COMMIT")).toHaveLength(fault === "commit-reject" ? 1 : 0);
+    expect(f.log.filter((sql) => sql === "ROLLBACK")).toHaveLength(fault === "commit-reject" ? 0 : 1);
+    expect(f.log.some((sql) => sql.includes("CREATE ROLE") || sql.includes("CREATE TABLE"))).toBe(false);
+    expect(result.output).not.toContain(fakeSecret); expect(result.output).not.toContain("neondb_owner");
+  });
+  it("does not rollback retry or query after transfer timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture("revoke-timeout", true);
+      const running = runPreparedOwnerCreationProbeForTests({ client: f.client, scenario: "transfer", deadlineLimits: { totalMilliseconds: 1000, queryMilliseconds: 10 } });
+      await vi.advanceTimersByTimeAsync(11);
+      const result = await running;
+      expect(result.completed).toBe(false); expect(result.timedOut).toBe(true);
+      expect(f.log.at(-1)).toBe(revokeOracle); expect(f.log).not.toContain("ROLLBACK"); expect(f.log).not.toContain("COMMIT");
+      expect(f.state.end).toBe(0); expect(f.state.destroy).toBe(1); expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it("bounds initial identity timeout without CREATE or normal close and leaves no timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture("identity-timeout");
+      const running = runPreparedOwnerCreationProbeForTests({ client: f.client, deadlineLimits: { totalMilliseconds: 1000, queryMilliseconds: 10 } });
+      await vi.advanceTimersByTimeAsync(11);
+      const result = await running;
+      expect(result.completed).toBe(false); expect(result.timedOut).toBe(true); expect(result.activeClientCount).toBe(0);
+      expect(f.state).toEqual({ connect: 1, end: 0, destroy: 1, mutations: 0 }); expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it("awaits the separate complete prepared path before the new public success flag", async () => {
+    const source = await readFile(resolve(repositoryRoot, "scripts/test-staging-database-preflight-postgres.mjs"), "utf8");
+    const start = source.indexOf("async function verifyPreparedOwnerThroughEntrypoint");
+    const end = source.indexOf("export async function runPreparedOwnerCreationProbeForTests", start);
+    const path = source.slice(start, end);
+    const ordered = ["await reinitializeOwnedDisposableFixture", "createPreparedOwnerWithManager(context, client", "const legacy = await runFormalPreflight",
+      'const prepared = await runFormalPreflight("neon-pg18-prepared-app-owner-v1")',
+      "transferPreparedOwnerWithManager(context, client", "const { identityAuthority } = await runPreMutationSessionIdentityBoundary",
+      "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE", "await applyMigrationCount", "await assertMigrationLedger", "CREATE ROLE", "await configureRuntimeAcl",
+      "const final = await postflight()", "await verifyRuntimeAuthSynchronization", "return true"];
+    let previous = -1;
+    for (const token of ordered) { const index = path.indexOf(token, previous + 1); expect(index, token).toBeGreaterThan(previous); previous = index; }
+    const production = source.slice(source.indexOf("async function runConnectionOnlyHarnessWithinContext"), source.indexOf("export async function runConnectionOnlyHarness(options"));
+    expect(production).toContain("requireHarness(await verifyPreparedOwnerThroughEntrypoint(");
+    expect(production.indexOf("await verifyPreparedOwnerThroughEntrypoint")).toBeLessThan(production.indexOf("return publicSuccessResult()"));
+    expect(externalFixtureSuccessResultForTests().preparedOwnerBootstrap).toBe(true);
+    expect(path).not.toContain("SET ROLE"); expect(path).not.toContain("createDeadlineContext");
+  });
+  it("removes both surviving runtime ACL dependencies before fixed disposable role removal", async () => {
+    const source = await readFile(resolve(repositoryRoot, "scripts/test-staging-database-preflight-postgres.mjs"), "utf8");
+    const start = source.indexOf("async function reinitializeOwnedDisposableFixture");
+    const reset = source.slice(start, source.indexOf("async function transferPreparedOwnerWithManager", start));
+    const connect = reset.indexOf('REVOKE CONNECT ON DATABASE ${quoteIdentifier(configuration.database)} FROM ${quoteIdentifier(RUNTIME_ROLE)}');
+    const schema = reset.indexOf('REVOKE USAGE ON SCHEMA public FROM ${quoteIdentifier(RUNTIME_ROLE)}');
+    const drop = reset.indexOf('DROP ROLE ${quoteIdentifier(role)}');
+    expect(connect).toBeGreaterThan(0); expect(schema).toBeGreaterThan(connect); expect(drop).toBeGreaterThan(schema);
+    expect(reset.indexOf("await assertPostCanonicalOwnershipSnapshot")).toBeLessThan(reset.indexOf("await withPreparedTransaction"));
+    expect(reset).not.toMatch(/DROP OWNED|REASSIGN OWNED|DROP DATABASE|CREATE DATABASE|RESTRICT CASCADE/u);
+  });
+});
 
 describe("provider initial ACL bootstrap profile", () => {
   it("keeps the legacy strict rejection and explicitly passes the formal entrypoint with raw and classified counts", async () => {
@@ -9321,6 +9708,7 @@ describe("connection-only external fixture boundary", () => {
         "runHarnessTransactionBoundaryProbeForTests",
         "runMigrationOwnerBoundaryProbeForTests",
         "runOwnershipCanonicalizationProbeForTests",
+        "runPreparedOwnerCreationProbeForTests",
         "runReservationConcurrencySetupDiagnosticOutputProbeForTests",
         "runReservationConcurrencySetupObservabilityProbeForTests",
         "runReservationSetupTransactionPrimaryProbeForTests",
@@ -12446,6 +12834,7 @@ describe("connection-only external fixture boundary", () => {
         "postflightDriftRejected",
         "runtimeAuthSynchronization",
         "providerDefaultAclBootstrap",
+        "preparedOwnerBootstrap",
         "postgresqlMajor",
         "snapshotDriftRejected",
         "stablePreflight",

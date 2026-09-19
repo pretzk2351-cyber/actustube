@@ -1,6 +1,45 @@
 # ActusTube Staging Database Preflight / Postflight Runbook
 
-最終更新日：2026-09-03
+最終更新日：2026-09-19
+
+## 準備済みowner専用profileと準備順序（2026-09-19）
+
+今回の現行手順は本節です。後段の旧local recovery / reservation observabilityの状態と次工程は当時の履歴です。基準head`6f549ebf0b13727ac4978b32aa898fd1be069b66`のPush CI `34843269366` / PR CI `34843273939`はsuccessですが、新しい候補のCIではありません。新headの必要Push / PR CIとPostgreSQL 18.6追加経路は本記録時点でNOT RUN、実stagingとPreview QAはNOT VERIFIEDです。Production操作はNOT RUNです。
+
+`ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE=neon-pg18-prepared-app-owner-v1`と、接続URLから生成しない独立入力`ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER`を使用します。owner名はsafe lowercase identifier（最大63文字、underscore区切りのstaging marker）とし、direct / pooled双方のURL実解析role・実LOGIN session_user / current_user・DB名を一致させます。既存strictと初期ACL v1は変更せず、v1は追加自動ADMINを拒否します。
+
+新profileは既存provider3role属性 / 9 membership / 2 ACL rows・11 privilegesに加え、新owner exact 1roleと自動membership exact 1行を固定します。granted role＝事前固定owner、member＝固定管理者、grantor＝PostgreSQL native bootstrap（定義済みOIDとSUPERUSER属性）、ADMIN / INHERIT / SET＝true / false / falseです。任意superuserやcaller設定をgrantorの代用にしません。ownerはLOGIN / NOINHERIT、NOSUPERUSER / NOCREATEDB / NOCREATEROLE / NOREPLICATION / NOBYPASSRLS、connection limit -1、VALID UNTILなし、全DBのrole固有設定0です。必要な現在DB CONNECT以外の直接ACL、実効DB CREATE / public schema CREATE、未知role、逆方向membership、第三grantor、余分なSET / INHERITを拒否します。PUBLIC由来の標準CONNECT / TEMP / schema USAGEはownerへの直接準備GRANTとは区別します。
+
+ownerがACL grantee / grantorに現れる全列挙catalogと全DBの`pg_shdepend`を検査します。共有依存は正常な明示CONNECTと一対一で対応するDB ACLだけを許可し、column subobject、ownership、別DB、未知catalog / 依存、欠落・重複は拒否します。actual inventoryからexpected setを自己生成しません。4観測のOIDを含む完全比較でdriftを拒否し、公開出力は固定profile・status・countsのみです。native自動ADMINはSET能力ではありませんが、管理者はADMINで自己membershipを追加できるため、管理者からの隔離機構とは扱いません（[PostgreSQL 18 role仕様](https://www.postgresql.org/docs/18/role-attributes.html)）。
+
+### 秘密入力と開始条件
+
+| 入力 | 用途・扱い |
+|---|---|
+| 管理接続credential | 非公開promptまたは正規secret注入。CREATE ROLEを行う同じ接続でidentity / CREATEROLE / CREATEDB / 現owner / `createrole_self_grant`空文字を確認 |
+| owner direct / pooled credential | `DIRECT_DATABASE_URL` / `DATABASE_URL`へprocess-local注入。正式preflightでは双方が同じ新ownerの実LOGIN |
+| 独立owner名・endpoint・extension期待値 | `ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER` / `ACTUSTUBE_EXPECTED_STAGING_IDENTITY` / `ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS`。実inventoryから自動生成しない |
+| runtime pooled credential | 準備後の正式postflightとbranch限定Preview用。ownerと別credential、秘密値を表示・比較・hash保存しない |
+
+`.env.local`、Production credential、SQL Editor履歴、command line、通常ログ、平文一時fileへ秘密を出しません。本人の非公開入力が未準備ならDB工程だけを止め、独立したrepository検証は進められます。実CREATE ROLEのGUCが空でない場合は変更せず停止します。`pg_control_system()`等の必要関数 / catalogアクセスと移管能力は実定義・ACLで確認し、不足をsuperuser、provider membership、広い監視roleで補いません。
+
+### 承認済み専用stagingでの順序
+
+1. 専用project / branch / endpoint / databaseの実対応とcluster全体の分離を再確認し、実Productionを除外します。branch表示名だけで判定しません。既存owner / role / schema / 履歴 / ACLと管理接続の実権限を確認します。
+2. 正式preflight前の限定例外は新アプリowner exact 1の作成・非公開認証設定・必要な場合だけCONNECTです。runtime、移管、一時SET、schema変更、default ACL、Migrationはまだ行いません。可能な範囲をtransactionにまとめ、commit前に属性 / native自動ADMIN / ACL差分を照合します。準備上限はconnect 15秒、query 20秒、server statement 15秒、lock 3秒、idle transaction 20秒、transaction 60秒、close 5秒です。
+3. 新owner direct / pooled実LOGINで新profileの正式entrypointを実行します。SET ROLE、接続先別名、期待値上書きやlauncherでの判定加工は行いません。PASS / cleanup確認が得られなければ停止します。
+4. 各書込み前にidentityと許可差分を再確認し、管理者が元owner権限 / CREATEDBを持つ条件で、必要な一時SET-onlyを自己grantorで付与します。対象DBだけを新ownerへ移管し、自己付与したSET行だけを解除します。native自動ADMINとprovider9行は保持します。public schemaが`pg_database_owner`ならDB所有者の権限が連動するため不要なALTER SCHEMAをしません（[ALTER DATABASE条件](https://www.postgresql.org/docs/18/sql-alterdatabase.html)）。
+5. owner自身のfunction default PUBLIC EXECUTE抑止を準備し、変更していないcanonical migrator / ledger / checksumで未適用0000〜0006を適用します。provider由来2 default ACL rowsは保持します。
+6. 管理者がruntime exact 1を最小属性で作成し、その自動ADMINも照合します。runtime自身にはowner / provider membershipを与えません。ownerが既存runtime manifestだけを設定し、direct＝owner / pooled＝runtimeで正式postflightを実行します。bootstrap専用の全体2 ACL行や9＋1 membershipを完成後のDBへ誤適用しません。
+7. 不明・失敗時は後段を止めます。生きた自分の未commit transactionのみROLLBACK / closeし、timeoutや切断をROLLBACK成功の証明にしません。COMMIT / Migration結果不明時は再送せずread-only照合します。実stagingのrole削除・再作成、偽ledger、down Migration、DB restore / clone、provider ACL削除は行いません。
+
+### Disposable fixtureと成功flag
+
+既存service containerの旧ケースを最後まで維持した後、固定の自作function / table / enum / ledger / 8 fixture rolesだけを同一DB内でtransaction付きRESTRICT cleanupし、別のprepared-ownerケースを作ります。未知依存があれば止まり、CASCADE / DROP OWNED / REASSIGN OWNED / DB作成・削除は使いません。このfixture再初期化を実stagingへ向けてはいけません。superuserは旧fixture片付け・provider相当初期状態設定だけを行い、新ownerは非superuser管理者の実LOGIN / CREATE ROLEから作成します。autoADMINを手動GRANTして正例を模造しません。
+
+新しい固定成功flag `preparedOwnerBootstrap: true`は、管理者CREATE ROLEとnative自動ADMIN観測 → v1拒否 → 新profileの正式preflight → 一時SET / owner移管 / 自己付与SET解除 → owner実LOGINでcanonical Migration → 管理者runtime作成 → owner既存ACL manifest → 正式postflight → 既存の非owner認証同期の全経路をawaitして成功した意味です。`providerDefaultAclBootstrap: true`と`runtimeAuthSynchronization: true`も維持します。全Client / operationは既存の同一300秒absolute deadline内で、timeout後に同Clientへ追加queryや無制限cleanupを行いません。local fake Client testはactual PostgreSQL semanticsの証明ではなく、repository-owned PostgreSQL process lifecycle authorityは0です。
+
+新head Push CI / PR CIでは必要step / cleanup successと上記3flagをそれぞれ確認します。CI failure後は追加修正 / commit / push / rerun / PR更新を行わず診断だけとします。成功してもactual staging / Neon / pooler / Productionの検証に代用しません。実staging postflightと設定の分離が成立した後だけ、承認済みのbranch限定Preview設定・最大1回redeployment・本人認証1セッション・分析 / AI各最大1回へ進みます。
 
 ## 目的と適用範囲
 

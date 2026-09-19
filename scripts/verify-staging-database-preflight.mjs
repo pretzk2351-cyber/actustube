@@ -68,6 +68,10 @@ const USER_OBJECT_COUNT_KEYS = Object.freeze([
 ]);
 const PUBLIC_CHECK_IDS = new Set([
   "PROVIDER_INITIAL_ACL_PROFILE_INVALID",
+  "PREPARED_OWNER_INPUT_INVALID",
+  "PREPARED_OWNER_IDENTITY_MISMATCH",
+  "PREPARED_OWNER_INVENTORY_INVALID",
+  "PREPARED_OWNER_AUTHORITY_MISMATCH",
   "PROVIDER_INITIAL_ACL_INVENTORY_INVALID",
   "PROVIDER_INITIAL_ACL_ROLE_MISMATCH",
   "PROVIDER_INITIAL_ACL_MISMATCH",
@@ -393,7 +397,7 @@ export function projectPublicPreflightReport(report) {
     assertExactKeys(report.providerInitialAcl, ["profile", "status", "snapshots"]);
     assertExactKeys(report.providerInitialAcl.snapshots, VERSION_KEYS);
     providerInitialAcl = {
-      profile: publicEnum(report.providerInitialAcl.profile, ["neon-pg18-initial-default-acl-v1"]),
+      profile: publicEnum(report.providerInitialAcl.profile, ["neon-pg18-initial-default-acl-v1", "neon-pg18-prepared-app-owner-v1"]),
       status: publicEnum(report.providerInitialAcl.status, ["match", "not_verified"]),
       snapshots: Object.fromEntries(VERSION_KEYS.map((key) => {
         const counts = report.providerInitialAcl.snapshots[key];
