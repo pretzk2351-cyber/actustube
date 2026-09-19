@@ -1818,7 +1818,55 @@ const INTERNAL_PHASE_PROBE_FAILURE = Object.freeze(Object.create(null));
 const POSTFLIGHT_DIAGNOSTIC_SCOPE = new AsyncLocalStorage();
 const POSTFLIGHT_DIAGNOSTIC_FAILURES = new WeakMap();
 const POSTFLIGHT_ERROR_CLASSIFICATIONS = new WeakMap();
+const POSTFLIGHT_FORMAL_OBSERVATIONS = new WeakMap();
 const HARNESS_ISSUE_CODES = new WeakMap();
+// IDs are fixed literals; SQL is borrowed from the actual formal definitions.
+// Shared definitions have one ID. Unknown strings/config objects never match.
+const POSTFLIGHT_QUERY_DEFINITIONS = Object.freeze({
+  TRANSACTION_BEGIN: POSTFLIGHT_SQL_FOR_TESTS.begin,
+  STATEMENT_TIMEOUT: POSTFLIGHT_SQL_FOR_TESTS.statementTimeout,
+  LOCK_TIMEOUT: POSTFLIGHT_SQL_FOR_TESTS.lockTimeout,
+  TRANSACTION_READ_ONLY: POSTFLIGHT_SQL_FOR_TESTS.transactionReadOnly,
+  TRANSACTION_ROLLBACK: POSTFLIGHT_SQL_FOR_TESTS.rollback,
+  DATABASE_IDENTITY: POSTFLIGHT_SQL_FOR_TESTS.identity,
+  ROLE_SECURITY: POSTFLIGHT_SQL_FOR_TESTS.roleSecurity,
+  SEARCH_PATH: POSTFLIGHT_SQL_FOR_TESTS.searchPath,
+  MIGRATION_COLUMNS: POSTFLIGHT_SQL_FOR_TESTS.migrationColumns,
+  MIGRATION_PRIMARY_KEY: POSTFLIGHT_SQL_FOR_TESTS.migrationPrimaryKey,
+  MIGRATION_HISTORY: POSTFLIGHT_SQL_FOR_TESTS.migrationHistory,
+  COLUMNS: POSTFLIGHT_SQL_FOR_TESTS.columns,
+  CONSTRAINTS: POSTFLIGHT_SQL_FOR_TESTS.constraints,
+  INDEXES: POSTFLIGHT_SQL_FOR_TESTS.indexes,
+  ENUMS: POSTFLIGHT_SQL_FOR_TESTS.enums,
+  TABLES: POSTFLIGHT_SQL_FOR_TESTS.tables,
+  POLICIES: POSTFLIGHT_SQL_FOR_TESTS.policies,
+  SEQUENCES: POSTFLIGHT_SQL_FOR_TESTS.sequences,
+  FUNCTIONS: POSTFLIGHT_SQL_FOR_TESTS.functions,
+  SCHEMA_OWNERSHIP: POSTFLIGHT_SQL_FOR_TESTS.schemaOwnership,
+  DRIZZLE_OWNERSHIP: POSTFLIGHT_SQL_FOR_TESTS.drizzleOwnership,
+  DEFAULT_PRIVILEGES: POSTFLIGHT_SQL_FOR_TESTS.defaultPrivileges,
+  RUNTIME_TABLE_PRIVILEGES: POSTFLIGHT_SQL_FOR_TESTS.runtimeTablePrivileges,
+  RUNTIME_SEQUENCE_PRIVILEGES: POSTFLIGHT_SQL_FOR_TESTS.runtimeSequencePrivileges,
+  RUNTIME_TYPE_PRIVILEGES: POSTFLIGHT_SQL_FOR_TESTS.runtimeTypePrivileges,
+  COLUMN_PRIVILEGES: POSTFLIGHT_SQL_FOR_TESTS.columnPrivileges,
+  RUNTIME_OWNER_MEMBERSHIP: POSTFLIGHT_SQL_FOR_TESTS.runtimeOwnerMembership,
+  COUNTS: POSTFLIGHT_SQL_FOR_TESTS.counts,
+  COLLISION: POSTFLIGHT_SQL_FOR_TESTS.collision,
+  USAGE_SMOKE: POSTFLIGHT_SQL_FOR_TESTS.usageSmoke,
+  WEEKLY_SMOKE: POSTFLIGHT_SQL_FOR_TESTS.weeklySmoke,
+  PREPARED_SMOKE: POSTFLIGHT_SQL_FOR_TESTS.preparedSmoke,
+  PREPARED_OWNER: PREFLIGHT_SQL_FOR_TESTS.preparedOwner,
+  PROVIDER_INITIAL_ACL: PREFLIGHT_SQL_FOR_TESTS.providerInitialAcl,
+  SERVER_VERSION: PREFLIGHT_SQL_FOR_TESTS.serverVersion,
+  ROLE_IDENTITY: PREFLIGHT_SQL_FOR_TESTS.roleIdentity,
+  EXTENSION_INVENTORY: PREFLIGHT_SQL_FOR_TESTS.extensionInventory,
+  MIGRATION_CATALOG: PREFLIGHT_SQL_FOR_TESTS.migrationCatalog,
+  MIGRATION_COLUMN_EXACT: PREFLIGHT_SQL_FOR_TESTS.migrationColumnExact,
+  MIGRATION_EXACT: PREFLIGHT_SQL_FOR_TESTS.migrationExact,
+  USER_DEFINED_OBJECTS: PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects,
+});
+const POSTFLIGHT_QUERY_IDS = new Set(["UNCLASSIFIED", ...Object.keys(POSTFLIGHT_QUERY_DEFINITIONS)]);
+const POSTFLIGHT_CONNECTION_KINDS = new Set(["UNCLASSIFIED", "DIRECT", "POOLED"]);
 const POSTFLIGHT_SUBPHASES = new Set([
   "NONE", "UNCLASSIFIED", "DRIFT_CHECK", "DRIFT_RESTORE", "LEGACY_AUTH_SYNC",
   "PROVIDER_PRESERVATION", "PREPARED_BOOTSTRAP", "PREPARED_RESET_CHECK", "PREPARED_RESET",
@@ -1897,6 +1945,8 @@ function recordPostflightFailure(context, error) {
       subphase: frame.subphase,
       classification: frame.formal?.classification ?? POSTFLIGHT_ERROR_CLASSIFICATIONS.get(error) ?? "UNCLASSIFIED",
       publicCode: frame.formal?.publicCode ?? "UNCLASSIFIED",
+      queryId: frame.query?.queryId ?? "UNCLASSIFIED",
+      connectionKind: frame.query?.connectionKind ?? "UNCLASSIFIED",
     });
     if (frame.cleanup) {
       if (frame.tracker.primary === null && frame.tracker.cleanupFailure === null) {
@@ -1922,8 +1972,16 @@ function observePostflightFormalResult(context, report, expectedFailure = null) 
     const failure = diagnosticOwnValue(report, "failure");
     const code = diagnosticOwnValue(failure, "checkId");
     const status = diagnosticOwnValue(failure, "status");
-    if (exitCode === 0 && expectedFailure === null) return;
-    if (expectedFailure !== null && exitCode === 1 && status === "fail" && code === expectedFailure) return;
+    const observation = report && typeof report === "object" ? POSTFLIGHT_FORMAL_OBSERVATIONS.get(report) : null;
+    if (observation) POSTFLIGHT_FORMAL_OBSERVATIONS.delete(report);
+    const accepted = (exitCode === 0 && expectedFailure === null) ||
+      (expectedFailure !== null && exitCode === 1 && status === "fail" && code === expectedFailure);
+    // A rejected query is only a candidate inside its formal invocation.
+    // Expected negatives discard it instead of contaminating a later failure.
+    if (observation?.context === context && observation.parent === frame) {
+      mergeFormalObservation(frame.tracker, observation.tracker, !accepted);
+    }
+    if (accepted) return;
     frame.formal = Object.freeze({
       classification: [1, 2, 3].includes(exitCode) &&
         status === (exitCode === 3 ? "not_verified" : "fail") &&
@@ -1937,6 +1995,57 @@ function observePostflightFormalResult(context, report, expectedFailure = null) 
   }
 }
 
+function createPostflightTracker(lastSuccessful = "NONE") {
+  return { primary: null, cleanupFailure: null, cleanupStatus: "NOT_RUN", cleanupActive: 0,
+    failurePath: "UNCLASSIFIED", lastSuccessful, lastBeforeFailure: "NONE" };
+}
+
+function mergeFormalObservation(target, source, failed) {
+  if (target.primary === null && target.cleanupFailure === null) {
+    target.lastSuccessful = source.lastSuccessful;
+    if (failed && (source.primary !== null || source.cleanupFailure !== null)) {
+      target.primary = source.primary;
+      target.cleanupFailure = source.cleanupFailure;
+      target.failurePath = source.failurePath;
+      target.lastBeforeFailure = source.lastBeforeFailure;
+    }
+  }
+  if (failed && source.cleanupFailure !== null) target.cleanupFailure ??= source.cleanupFailure;
+  if (target.cleanupStatus !== "FAILED" && (failed || source.cleanupFailure === null) && source.cleanupStatus !== "NOT_RUN") {
+    target.cleanupStatus = source.cleanupStatus;
+  }
+}
+
+async function observeFormalInvocation(context, operation) {
+  const parent = postflightDiagnosticFrame(context);
+  if (!parent) return await operation();
+  const tracker = createPostflightTracker(parent.tracker.lastSuccessful);
+  return POSTFLIGHT_DIAGNOSTIC_SCOPE.run({ ...parent, tracker, formal: null }, async () => {
+    try {
+      const report = await operation();
+      if (report && typeof report === "object") POSTFLIGHT_FORMAL_OBSERVATIONS.set(report, { context, parent, tracker });
+      return report;
+    } catch (error) {
+      recordPostflightFailure(context, error);
+      mergeFormalObservation(parent.tracker, tracker, true);
+      throw error;
+    }
+  });
+}
+
+async function observeFormalQuery(context, connectionKind, statement, operation) {
+  const parent = postflightDiagnosticFrame(context);
+  if (!parent) return await operation();
+  const queryId = typeof statement === "string"
+    ? Object.entries(POSTFLIGHT_QUERY_DEFINITIONS).find(([, sql]) => sql === statement)?.[0] ?? "UNCLASSIFIED"
+    : "UNCLASSIFIED";
+  const query = Object.freeze({ queryId, connectionKind });
+  return POSTFLIGHT_DIAGNOSTIC_SCOPE.run({ ...parent, query }, async () => {
+    try { return await operation(); }
+    catch (error) { recordPostflightFailure(context, error); throw error; }
+  });
+}
+
 async function runPostflightSubphase(context, subphase, operation, cleanup = false) {
   const parent = postflightDiagnosticFrame(context);
   if (!parent) return await operation();
@@ -1944,7 +2053,7 @@ async function runPostflightSubphase(context, subphase, operation, cleanup = fal
     subphase: POSTFLIGHT_SUBPHASES.has(subphase) ? subphase : "UNCLASSIFIED",
     path: ["PREPARED_BOOTSTRAP", "PREPARED_AUTH_SYNC"].includes(subphase)
       ? "PREPARED" : subphase === "LEGACY_AUTH_SYNC" ? "LEGACY" : parent.path,
-    cleanup: parent.cleanup || cleanup, formal: null };
+    cleanup: parent.cleanup || cleanup, formal: null, query: parent.query };
   if (frame.cleanup && frame.tracker.cleanupStatus !== "FAILED") frame.tracker.cleanupStatus = "INCOMPLETE";
   if (frame.cleanup) frame.tracker.cleanupActive += 1;
   return POSTFLIGHT_DIAGNOSTIC_SCOPE.run(frame, async () => {
@@ -1974,12 +2083,18 @@ function postflightDiagnosticLines(error) {
     if (!diagnostic) return [];
     const projectFailure = (value) => {
       if (value === null) return null;
-      if (!exactOwnKeys(value, ["subphase", "classification", "publicCode"])) return undefined;
+      const version2 = diagnosticOwnValue(diagnostic, "schema") === "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V2";
+      if (!exactOwnKeys(value, version2 ? ["subphase", "classification", "publicCode", "queryId", "connectionKind"]
+        : ["subphase", "classification", "publicCode"])) return undefined;
       const subphase = diagnosticOwnValue(value, "subphase");
       const classification = diagnosticOwnValue(value, "classification");
       const publicCode = diagnosticOwnValue(value, "publicCode");
-      return POSTFLIGHT_SUBPHASES.has(subphase) && POSTFLIGHT_DIAGNOSTIC_CLASSES.has(classification) && POSTFLIGHT_PUBLIC_CODES.has(publicCode)
-        ? { subphase, classification, publicCode } : undefined;
+      if (!POSTFLIGHT_SUBPHASES.has(subphase) || !POSTFLIGHT_DIAGNOSTIC_CLASSES.has(classification) || !POSTFLIGHT_PUBLIC_CODES.has(publicCode)) return undefined;
+      if (!version2) return { subphase, classification, publicCode };
+      const queryId = diagnosticOwnValue(value, "queryId");
+      const connectionKind = diagnosticOwnValue(value, "connectionKind");
+      return POSTFLIGHT_QUERY_IDS.has(queryId) && POSTFLIGHT_CONNECTION_KINDS.has(connectionKind)
+        ? { subphase, classification, publicCode, queryId, connectionKind } : undefined;
     };
     if (!exactOwnKeys(diagnostic, ["schema", "path", "lastSuccessfulSubphase", "primaryObservation", "primary", "cleanup"])) return [];
     const schema = diagnosticOwnValue(diagnostic, "schema");
@@ -1991,7 +2106,7 @@ function postflightDiagnosticLines(error) {
     if (!exactOwnKeys(cleanup, ["status", "failure"])) return [];
     const status = diagnosticOwnValue(cleanup, "status");
     const failure = projectFailure(diagnosticOwnValue(cleanup, "failure"));
-    if (schema !== "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1" || !["LEGACY", "PREPARED", "UNCLASSIFIED"].includes(path) || !POSTFLIGHT_SUBPHASES.has(lastSuccessfulSubphase) ||
+    if (!["EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1", "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V2"].includes(schema) || !["LEGACY", "PREPARED", "UNCLASSIFIED"].includes(path) || !POSTFLIGHT_SUBPHASES.has(lastSuccessfulSubphase) ||
       primary === undefined || primaryObservation !== (primary === null ? "NOT_OBSERVED" : "OBSERVED") ||
       failure === undefined || !["NOT_RUN", "INCOMPLETE", "SUCCEEDED", "FAILED"].includes(status)) return [];
     // Only freshly projected fixed primitives are serialized, never the source object.
@@ -2000,8 +2115,7 @@ function postflightDiagnosticLines(error) {
 }
 
 async function withPostflightDiagnostics(context, operation) {
-  const tracker = { primary: null, cleanupFailure: null, cleanupStatus: "NOT_RUN", cleanupActive: 0, failurePath: "UNCLASSIFIED",
-    lastSuccessful: "NONE", lastBeforeFailure: "NONE" };
+  const tracker = createPostflightTracker();
   return POSTFLIGHT_DIAGNOSTIC_SCOPE.run({ context, tracker, subphase: "UNCLASSIFIED", path: "LEGACY", cleanup: false, formal: null }, async () => {
     try { return await operation(); }
     catch (error) {
@@ -2009,7 +2123,7 @@ async function withPostflightDiagnostics(context, operation) {
       const failure = EXTERNAL_FIXTURE_PHASE_FAILURES.get(error)?.context === context ? error
         : createExternalFixturePhaseFailure(context, EXTERNAL_FIXTURE_PHASES.postflightDrift, error);
       POSTFLIGHT_DIAGNOSTIC_FAILURES.set(failure, Object.freeze({
-        schema: "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1",
+        schema: "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V2",
         path: tracker.failurePath,
         lastSuccessfulSubphase: tracker.lastBeforeFailure,
         // Formal cores may replace an internal validation result on cleanup
@@ -3564,6 +3678,7 @@ function fixtureCredentials(configuration, overrides = {}) {
 function createAdapter(context, clientFactory, credentialsForKind) {
   return {
     async connect(kind) {
+      const connectionKind = kind === "direct" ? "DIRECT" : kind === "pooled" ? "POOLED" : "UNCLASSIFIED";
       const connect = () => openClient(
         context,
         clientFactory,
@@ -3577,17 +3692,10 @@ function createAdapter(context, clientFactory, credentialsForKind) {
         async query(statement, parameters = []) {
           // Formal read-only transaction rollback is cleanup, including the
           // intermediate snapshot boundary; it is not necessarily final close.
-          if (statement === POSTFLIGHT_SQL_FOR_TESTS.rollback) {
-            return runPostflightSubphase(context, "FORMAL_ROLLBACK", () => ownedClient.proxy.query(statement, parameters), true);
-          }
-          try { return await ownedClient.proxy.query(statement, parameters); }
-          catch (error) {
-            // Formal cores catch query errors before closing, and may replace
-            // their public report on close failure. Preserve only what was
-            // actually observed here, never reconstruct an unknown report code.
-            recordPostflightFailure(context, error);
-            throw error;
-          }
+          return observeFormalQuery(context, connectionKind, statement, () =>
+            statement === POSTFLIGHT_SQL_FOR_TESTS.rollback
+              ? runPostflightSubphase(context, "FORMAL_ROLLBACK", () => ownedClient.proxy.query(statement, parameters), true)
+              : ownedClient.proxy.query(statement, parameters));
         },
         close() {
           return closeOwnedClient(context, ownedClient);
@@ -7588,7 +7696,7 @@ async function runPostflight(context, clientFactory, configuration) {
           password: RUNTIME_PASSWORD,
         })
   );
-  const report = await runBoundedPhase(
+  const report = await observeFormalInvocation(context, () => runBoundedPhase(
     context,
     "phase",
     context.limits.phaseMilliseconds,
@@ -7606,7 +7714,7 @@ async function runPostflight(context, clientFactory, configuration) {
           output.push(line);
         },
       })
-  );
+  ));
   const serialized = output.join("\n");
   requireHarness(
     secretParts.every((part) => !serialized.includes(part)),
@@ -7980,7 +8088,7 @@ async function verifyPreparedOwnerThroughEntrypoint(context, clientFactory, conf
   const ownerCredentials = fixtureCredentials(ownerConfiguration);
   const runFormalPreflight = async (profile) => {
     const output = [];
-    const report = await runBoundedPhase(context, "phase", context.limits.phaseMilliseconds, () =>
+    const report = await observeFormalInvocation(context, () => runBoundedPhase(context, "phase", context.limits.phaseMilliseconds, () =>
       executeStagingDatabasePreflight({
         environment: { ...preflightEnvironment(ownerConfiguration, extensions),
           ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: profile,
@@ -7988,7 +8096,7 @@ async function verifyPreparedOwnerThroughEntrypoint(context, clientFactory, conf
         repositoryRoot, allowLoopback: true,
         adapter: createAdapter(context, clientFactory, () => ownerCredentials),
         onQuery: assertReadOnlySql, stdout(line) { output.push(line); },
-      }));
+      })));
     requireHarness(output.length > 0 && [PREPARED_FIXTURE_OWNER, PREPARED_FIXTURE_PASSWORD,
       PREPARED_MANAGER_PASSWORD, ownerUrl.href, configuration.password, configuration.database, "neondb_owner"]
       .every((part) => !output.join("\n").includes(part)), "EXTERNAL_FIXTURE_OUTPUT_REDACTION_FAILED");
@@ -10251,14 +10359,15 @@ export function harnessAuthorityBoundaryForTests() {
   });
 }
 
-// Fixed test-only entry into the same diagnostic scope and real owned-client /
-// transaction orchestration. No caller SQL, credentials or production options.
+// Test-only entry into the same diagnostic scope and real owned-client /
+// transaction orchestration. Synthetic query exercises are not production options.
 /** @param {{ client?: object, clientFactory?: () => object, scenario?: string, report?: unknown,
+ * formalInvocations?: { operation: (adapter: ReturnType<typeof createAdapter>) => Promise<object>, expectedFailure?: string }[],
  * deadlineLimits?: { [K in keyof typeof HARNESS_DEADLINE_LIMITS]?: number }, diagnosticFault?: unknown }} options */
 export async function runPostflightSubphaseProbeForTests({
-  client, clientFactory, scenario = "creation", report, deadlineLimits, diagnosticFault = null,
+  client, clientFactory, scenario = "creation", report, formalInvocations = [], deadlineLimits, diagnosticFault = null,
 }) {
-  requireHarness(["creation", "transfer", "formal", "formal-entrypoint", "direct", "pooled"].includes(scenario),
+  requireHarness(["creation", "transfer", "formal", "formal-entrypoint", "formal-queries", "direct", "pooled"].includes(scenario),
     "EXTERNAL_FIXTURE_PREPARED_PROBE_INVALID");
   const context = createDeadlineContext(deadlineLimits);
   let completed = false;
@@ -10266,16 +10375,26 @@ export async function runPostflightSubphaseProbeForTests({
   EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.add(context);
   try {
     await runPostflightDriftPhase(context, () => runPreparedBootstrapDiagnostics(context, async () => {
-      if (scenario === "formal-entrypoint") {
+      if (scenario === "formal-queries") {
+        for (const invocation of formalInvocations) {
+          await runPostflightSubphase(context, "PREPARED_PREFLIGHT", async () => {
+            const result = await observeFormalInvocation(context, () => invocation.operation(createAdapter(context, clientFactory, () => ({}))));
+            observePostflightFormalResult(context, result, invocation.expectedFailure ?? null);
+            requireHarness(diagnosticOwnValue(result, "exitCode") === (invocation.expectedFailure ? 1 : 0) &&
+              (!invocation.expectedFailure || diagnosticOwnValue(diagnosticOwnValue(result, "failure"), "checkId") === invocation.expectedFailure),
+            "EXTERNAL_FIXTURE_PREPARED_PREFLIGHT_FAILED");
+          });
+        }
+      } else if (scenario === "formal-entrypoint") {
         await runPostflightSubphase(context, "PREPARED_PREFLIGHT", async () => {
           const output = [];
-          const result = await executeStagingDatabasePreflight({
+          const result = await observeFormalInvocation(context, () => executeStagingDatabasePreflight({
             environment: preflightEnvironment({ rawUrl:
               "postgresql://actustube_ci_fixture:fixed_probe_only@127.0.0.1:5432/actustube_ci_fixture" }, fixedExpectedExtensionInventory()),
             repositoryRoot, allowLoopback: true,
             adapter: createAdapter(context, clientFactory, () => ({})),
             onQuery: assertReadOnlySql, stdout(line) { output.push(line); },
-          });
+          }));
           assertPreparedPreflightResult(context, result);
         });
       } else if (scenario === "formal") {
