@@ -1880,6 +1880,8 @@ const POSTFLIGHT_SUBPHASES = new Set([
   "PREPARED_AUTH_SYNC", "AUTH_POSTFLIGHT", "AUTH_ACL_CONTROL", "AUTH_EXECUTION",
   "AUTH_FINAL_STATE", "AUTH_ACL_RESTORE", "AUTH_ROLLBACK", "TRANSACTION_ROLLBACK",
   "CLIENT_CLOSE", "FORMAL_ROLLBACK",
+  "MAPPING_SETUP", "MAPPING_BASELINE", "MAPPING_OLD_REFERENCE", "MAPPING_INVENTORY",
+  "MAPPING_REJECTION", "MAPPING_RESTORE", "MAPPING_RESTORED",
 ]);
 const POSTFLIGHT_DIAGNOSTIC_CLASSES = new Set([
   "UNCLASSIFIED", "ASSERTION_REJECTED", "TIMEOUT", "CONNECTION_REJECTED",
@@ -7939,6 +7941,194 @@ async function verifyRuntimeAuthSynchronization(
 const PREPARED_FIXTURE_OWNER = "actustube_staging_prepared_owner";
 const PREPARED_FIXTURE_PASSWORD = "fixed_prepared_owner_fixture_password";
 const PREPARED_MANAGER_PASSWORD = "fixed_prepared_manager_fixture_password";
+const MAPPING_READER = "actustube_staging_mapping_reader";
+const MAPPING_READER_PASSWORD = "fixed_mapping_reader_fixture_password";
+// No handler, validator, options or foreign table: this FDW cannot contact a server.
+const MAPPING_FDW = "actustube_inventory_fdw";
+const MAPPING_SERVER = "actustube_inventory_server";
+const MAPPING_BASE_CATALOG_SQL = `SELECT
+  'pg_catalog.pg_user_mapping'::regclass::oid::text AS classid,
+  m.oid::text AS oid,
+  CASE WHEN m.umuser = 0 THEN 'public'
+    WHEN m.umuser = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1) THEN 'self'
+    WHEN m.umuser = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $2) THEN 'other'
+    ELSE 'unknown' END AS recipient,
+  m.umserver = (SELECT oid FROM pg_catalog.pg_foreign_server WHERE srvname = 'actustube_inventory_server') AS fixed_server
+  FROM pg_catalog.pg_user_mapping m ORDER BY m.oid`;
+const MAPPING_OLD_REFERENCE_SQL = "SELECT oid FROM pg_catalog.pg_user_mapping";
+const MAPPING_SUPPORT_SQL = `SELECT 'pg_catalog.pg_foreign_data_wrapper'::regclass::oid::text AS classid,
+  oid::text AS oid FROM pg_catalog.pg_foreign_data_wrapper WHERE fdwname = 'actustube_inventory_fdw'
+  UNION ALL SELECT 'pg_catalog.pg_foreign_server'::regclass::oid::text, oid::text
+  FROM pg_catalog.pg_foreign_server WHERE srvname = 'actustube_inventory_server'`;
+
+function mappingSignatures(rows, recipients) {
+  requireHarness(Array.isArray(rows) && rows.length === recipients.length &&
+    rows.every((row) => exactOwnKeys(row, ["classid", "oid", "recipient", "fixed_server"]) &&
+      /^[1-9][0-9]*$/.test(row.classid) && /^[1-9][0-9]*$/.test(row.oid) &&
+      Number(row.oid) >= 16384 && row.fixed_server === true) &&
+    recipients.every((recipient) => rows.filter((row) => row.recipient === recipient).length === 1) &&
+    new Set(rows.map((row) => `${row.classid}:${row.oid}`)).size === rows.length,
+  "EXTERNAL_FIXTURE_MAPPING_EXPECTATION_INVALID");
+  return rows.map((row) => `${row.classid}:${row.oid}:0`);
+}
+
+function assertMappingInventory(actual, baseline, additions) {
+  const sorted = (values) => [...values].sort();
+  const sameSet = (values, expected) => Array.isArray(values) &&
+    values.every((value) => typeof value === "string") && new Set(values).size === values.length &&
+    JSON.stringify(sorted(values)) === JSON.stringify(sorted(expected));
+  requireHarness(actual && baseline && exactOwnKeys(actual, Object.keys(baseline)) &&
+    additions.length === new Set(additions).size &&
+    sameSet(actual.object_signature, [...baseline.object_signature, ...additions.map((s) => `other:${s}`)]) &&
+    actual.total_count === baseline.total_count + additions.length &&
+    actual.other_count === baseline.other_count + additions.length &&
+    ["schema_count", "relation_count", "routine_count", "type_count", "trigger_count", "rule_count",
+      "policy_count", "constraint_count", "estimated_data_rows", "extension_unclassified_count",
+      "extension_ambiguous_count"].every((key) => actual[key] === baseline[key]) &&
+    sameSet(actual.extension_candidate_signature, [...baseline.extension_candidate_signature, ...additions]) &&
+    sameSet(actual.extension_residual_signature, [...baseline.extension_residual_signature, ...additions]) &&
+    sameSet(actual.extension_managed_signature, baseline.extension_managed_signature),
+  "EXTERNAL_FIXTURE_MAPPING_INVENTORY_MISMATCH");
+}
+
+// The caller selects only an internal fixed profile and credentials already bound
+// to this disposable loopback fixture. Production never accepts test callbacks.
+async function verifyUserMappingInventory(context, clientFactory, configuration, extensions, profile, preparedConfiguration = null) {
+  requireHarness([null, "neon-pg18-initial-default-acl-v1", "neon-pg18-prepared-app-owner-v1"].includes(profile) &&
+    (profile === "neon-pg18-prepared-app-owner-v1") === (preparedConfiguration !== null),
+  "EXTERNAL_FIXTURE_MAPPING_CONFIGURATION_INVALID");
+  const readerUrl = new URL(configuration.rawUrl);
+  readerUrl.username = MAPPING_READER; readerUrl.password = MAPPING_READER_PASSWORD;
+  const reader = preparedConfiguration ?? Object.freeze({ ...configuration, role: MAPPING_READER,
+    password: MAPPING_READER_PASSWORD, rawUrl: readerUrl.href });
+  const credentials = fixtureCredentials(reader);
+  return withClient(context, clientFactory, fixtureCredentials(configuration), async (admin) => {
+    await observeSessionIdentity(admin, configuration.role, "EXTERNAL_FIXTURE_MAPPING_ADMIN_INVALID");
+    const originalRoles = await admin.query("SELECT oid::text FROM pg_catalog.pg_roles ORDER BY oid");
+    requireHarness((await admin.query(MAPPING_BASE_CATALOG_SQL, [reader.role, configuration.role])).rows.length === 0 &&
+      (await admin.query(MAPPING_SUPPORT_SQL)).rows.length === 0, "EXTERNAL_FIXTURE_MAPPING_COLLISION");
+    if (preparedConfiguration === null) {
+      await runPostflightSubphase(context, "MAPPING_SETUP", () => admin.query(`CREATE ROLE ${quoteIdentifier(MAPPING_READER)}
+        LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+        PASSWORD '${MAPPING_READER_PASSWORD}'`));
+    }
+    const formal = async (expectedFailure = null) => {
+      const output = [];
+      const report = await observeFormalInvocation(context, () => runBoundedPhase(context, "phase", context.limits.phaseMilliseconds,
+        () => executeStagingDatabasePreflight({ repositoryRoot, allowLoopback: true,
+          environment: { ...preflightEnvironment(reader, extensions),
+            ...(profile === null ? {} : { ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: profile }),
+            ...(preparedConfiguration === null ? {} : { ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER: reader.role }) },
+          adapter: createAdapter(context, clientFactory, () => credentials), onQuery: assertReadOnlySql,
+          stdout(line) { output.push(line); } })));
+      observePostflightFormalResult(context, report, expectedFailure);
+      requireHarness(expectedFailure === null ? report.exitCode === 0 && report.overallStatus === "pass" &&
+        report.initialState === "pristine" && report.beforeAfterComparison === "match"
+        : report.exitCode === 1 && report.failure?.checkId === expectedFailure,
+      "EXTERNAL_FIXTURE_MAPPING_PREFLIGHT_INVALID");
+      requireHarness(output.length > 0 && [reader.role, reader.password, reader.rawUrl, configuration.password,
+        configuration.database, MAPPING_FDW, MAPPING_SERVER, "umoptions", "object_signature"]
+        .every((part) => !output.join("\n").includes(part)), "EXTERNAL_FIXTURE_OUTPUT_REDACTION_FAILED");
+    };
+    await runPostflightSubphase(context, "MAPPING_BASELINE", () => formal());
+    await withClient(context, clientFactory, credentials, async (client) => {
+      await observeSessionIdentity(client, reader.role, "EXTERNAL_FIXTURE_MAPPING_READER_INVALID");
+      const authority = singleExactRow(await client.query(`SELECT
+        NOT (rolsuper OR rolinherit OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls) AND rolcanlogin AS minimal
+        FROM pg_catalog.pg_roles WHERE rolname = session_user`), ["minimal"], "EXTERNAL_FIXTURE_MAPPING_READER_INVALID");
+      requireHarness(authority.minimal === true, "EXTERNAL_FIXTURE_MAPPING_READER_INVALID");
+      const inventory = async () => singleExactRow(await observeFormalQuery(context, "DIRECT", PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects,
+        () => client.query(PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects)), [
+        "total_count", "schema_count", "relation_count", "routine_count", "type_count", "trigger_count", "rule_count",
+        "policy_count", "constraint_count", "other_count", "estimated_data_rows", "object_signature",
+        "extension_classification_evidence", "extension_unclassified_count", "extension_ambiguous_count",
+        "extension_candidate_signature", "extension_managed_signature", "extension_residual_signature",
+      ], "EXTERNAL_FIXTURE_MAPPING_INVENTORY_INVALID");
+      const baseline = await runPostflightSubphase(context, "MAPPING_BASELINE", inventory);
+      await runPostflightSubphase(context, "MAPPING_OLD_REFERENCE", async () => {
+        let denied = false;
+        try { await client.query(MAPPING_OLD_REFERENCE_SQL); }
+        catch (error) { if (isHarnessTimeout(error)) throw error; denied = error?.code === "42501"; }
+        requireHarness(denied, "EXTERNAL_FIXTURE_MAPPING_OLD_REFERENCE_NOT_REJECTED");
+      });
+      // Set-up is committed by the fixture administrator; validation is real
+      // LOGIN on the distinct minimal Client, never SET ROLE or administrator delegation.
+      await runPostflightSubphase(context, "MAPPING_SETUP", () => withPreparedTransaction(context, admin, async () => {
+        await admin.query(`CREATE FOREIGN DATA WRAPPER ${quoteIdentifier(MAPPING_FDW)} NO HANDLER NO VALIDATOR`);
+        await admin.query(`CREATE SERVER ${quoteIdentifier(MAPPING_SERVER)} FOREIGN DATA WRAPPER ${quoteIdentifier(MAPPING_FDW)}`);
+      }));
+      const support = (await admin.query(MAPPING_SUPPORT_SQL)).rows;
+      requireHarness(support.length === 2 && support.every((r) => exactOwnKeys(r, ["classid", "oid"]) &&
+        /^[1-9][0-9]*$/.test(r.classid) && /^[1-9][0-9]*$/.test(r.oid) && Number(r.oid) >= 16384),
+      "EXTERNAL_FIXTURE_MAPPING_EXPECTATION_INVALID");
+      const supportSignatures = support.map((r) => `${r.classid}:${r.oid}:0`);
+      const recipients = [reader.role, configuration.role, "PUBLIC"];
+      for (let index = 0; index < recipients.length; index += 1) {
+        const recipient = index === 2 ? "PUBLIC" : quoteIdentifier(recipients[index]);
+        await runPostflightSubphase(context, "MAPPING_SETUP", () => admin.query(
+          `CREATE USER MAPPING FOR ${recipient} SERVER ${quoteIdentifier(MAPPING_SERVER)}`));
+        await runPostflightSubphase(context, "MAPPING_INVENTORY", async () => {
+          const usage = singleExactRow(await client.query(
+            "SELECT pg_catalog.has_server_privilege(current_user, $1, 'USAGE') AS allowed", [MAPPING_SERVER]),
+          ["allowed"], "EXTERNAL_FIXTURE_MAPPING_READER_INVALID");
+          requireHarness(usage.allowed === false, "EXTERNAL_FIXTURE_MAPPING_READER_INVALID");
+          const expected = mappingSignatures((await admin.query(MAPPING_BASE_CATALOG_SQL, [reader.role, configuration.role])).rows,
+            ["self", "other", "public"].slice(0, index + 1));
+          assertMappingInventory(await inventory(), baseline, [...supportSignatures, ...expected]);
+        });
+      }
+      // A self mapping creates an ownership/shared dependency for the prepared
+      // role. Remove only that case before testing the object-rejection gate,
+      // so an earlier authority rejection cannot masquerade as inventory coverage.
+      await runPostflightSubphase(context, "MAPPING_RESTORE", () => admin.query(
+        `DROP USER MAPPING FOR ${quoteIdentifier(reader.role)} SERVER ${quoteIdentifier(MAPPING_SERVER)}`), true);
+      await runPostflightSubphase(context, "MAPPING_INVENTORY", async () => {
+        const remaining = mappingSignatures((await admin.query(MAPPING_BASE_CATALOG_SQL, [reader.role, configuration.role])).rows, ["other", "public"]);
+        assertMappingInventory(await inventory(), baseline, [...supportSignatures, ...remaining]);
+      });
+      await runPostflightSubphase(context, "MAPPING_REJECTION", () => formal("USER_DEFINED_OBJECT_PRESENT"));
+      await runPostflightSubphase(context, "MAPPING_RESTORE", () => withPreparedTransaction(context, admin, async () => {
+        await admin.query(`DROP USER MAPPING FOR ${quoteIdentifier(configuration.role)} SERVER ${quoteIdentifier(MAPPING_SERVER)}`);
+        await admin.query(`DROP USER MAPPING FOR PUBLIC SERVER ${quoteIdentifier(MAPPING_SERVER)}`);
+        await admin.query(`DROP SERVER ${quoteIdentifier(MAPPING_SERVER)} RESTRICT`);
+        await admin.query(`DROP FOREIGN DATA WRAPPER ${quoteIdentifier(MAPPING_FDW)} RESTRICT`);
+      }), true);
+      await runPostflightSubphase(context, "MAPPING_RESTORED", async () => {
+        requireHarness((await admin.query(MAPPING_BASE_CATALOG_SQL, [reader.role, configuration.role])).rows.length === 0 &&
+          (await admin.query(MAPPING_SUPPORT_SQL)).rows.length === 0, "EXTERNAL_FIXTURE_MAPPING_RESIDUE");
+        const restored = await inventory();
+        assertMappingInventory(restored, baseline, []);
+        requireHarness(JSON.stringify(restored) === JSON.stringify(baseline), "EXTERNAL_FIXTURE_MAPPING_RESIDUE");
+        await formal();
+      });
+    });
+    if (preparedConfiguration === null) {
+      await runPostflightSubphase(context, "MAPPING_RESTORE", () => admin.query(`DROP ROLE ${quoteIdentifier(MAPPING_READER)}`), true);
+    }
+    requireHarness(JSON.stringify((await admin.query("SELECT oid::text FROM pg_catalog.pg_roles ORDER BY oid")).rows) ===
+      JSON.stringify(originalRoles.rows), "EXTERNAL_FIXTURE_MAPPING_ROLE_RESIDUE");
+    return true;
+  });
+}
+
+export function validateUserMappingInventoryForTests(actual, baseline, additions, rows, recipients) {
+  try { mappingSignatures(rows, recipients); assertMappingInventory(actual, baseline, additions); return true; }
+  catch { return false; }
+}
+
+export async function runUserMappingInventoryProbeForTests({ clientFactory, deadlineLimits = {} }) {
+  const context = createDeadlineContext(deadlineLimits);
+  const configuration = Object.freeze({ host: "127.0.0.1", port: 5432, database: "actustube_ci_fixture",
+    role: "actustube_ci_fixture", password: "fixed_test_only_password",
+    rawUrl: "postgresql://actustube_ci_fixture:fixed_test_only_password@127.0.0.1:5432/actustube_ci_fixture" });
+  let completed = false;
+  let output = "";
+  try {
+    completed = await withPostflightDiagnostics(context, () => verifyUserMappingInventory(context, clientFactory,
+      configuration, fixedExpectedExtensionInventory(), null));
+  } catch (error) { output = externalFixtureFailureOutput(error); }
+  return Object.freeze({ completed, output, timedOut: context.timedOut, activeClientCount: context.activeClients.size });
+}
 const PREPARED_MEMBERSHIP_SQL = `
   SELECT granted.rolname AS role, member_role.rolname AS member,
     m.grantor = 10 AND grantor.rolsuper AS native_grantor,
@@ -8078,6 +8268,9 @@ function runPreparedBootstrapDiagnostics(context, operation) {
 async function verifyPreparedOwnerThroughEntrypoint(context, clientFactory, configuration, specification, extensions) {
   return runPreparedBootstrapDiagnostics(context, async () => {
   await runPostflightSubphase(context, "PREPARED_RESET", () => reinitializeOwnedDisposableFixture(context, clientFactory, configuration, specification));
+  // The reset already supplies the v1 pristine fixture (no ledger, no new
+  // owner membership). Do not grant ledger/catalog privileges just for tests.
+  await verifyUserMappingInventory(context, clientFactory, configuration, extensions, "neon-pg18-initial-default-acl-v1");
   const managerCredentials = fixtureCredentials(configuration, { role: "neondb_owner", password: PREPARED_MANAGER_PASSWORD });
   await runPostflightSubphase(context, "OWNER_CREATION", () => withClient(context, clientFactory, managerCredentials,
     (client) => createPreparedOwnerWithManager(context, client, configuration.database)));
@@ -8108,6 +8301,8 @@ async function verifyPreparedOwnerThroughEntrypoint(context, clientFactory, conf
   requireHarness(legacy.exitCode === 1 && legacy.failure?.checkId === "PROVIDER_INITIAL_ACL_ROLE_MISMATCH",
     "EXTERNAL_FIXTURE_PREPARED_LEGACY_CONTROL_FAILED");
   });
+  await verifyUserMappingInventory(context, clientFactory, configuration, extensions,
+    "neon-pg18-prepared-app-owner-v1", ownerConfiguration);
   await runPostflightSubphase(context, "PREPARED_PREFLIGHT", async () => {
   const prepared = await runFormalPreflight("neon-pg18-prepared-app-owner-v1");
   assertPreparedPreflightResult(context, prepared);
@@ -8229,6 +8424,7 @@ function publicSuccessResult() {
     runtimeAuthSynchronization: true,
     providerDefaultAclBootstrap: true,
     preparedOwnerBootstrap: true,
+    userMappingInventory: true,
     verifierQueriesReadOnly: true,
     outputRedaction: true,
   });
@@ -9257,12 +9453,19 @@ async function runConnectionOnlyHarnessWithinContext(options, context) {
       await runFixtureIdentityPhase(context, () =>
         assertFixtureIdentity(client, configuration)
       );
-      await runFixtureLedgerSetupPhase(context, () =>
-        createEmptyMigrationLedger(client)
-      );
-      return await runExtensionInventoryPhase(context, () =>
+      await runFixtureLedgerSetupPhase(context, async () => {
+        // Strict pristine case precedes the original empty-ledger case. Keep
+        // both within the production fixture-setup phase (also used by the
+        // fixed phase probe), without granting the minimal reader ledger ACLs.
+        const mappingExtensions = await verifyIndependentExtensionInventory(client);
+        await withPostflightDiagnostics(context, () =>
+          verifyUserMappingInventory(context, resolvedClientFactory, configuration, mappingExtensions, null));
+        await createEmptyMigrationLedger(client);
+      });
+      const extensions = await runExtensionInventoryPhase(context, () =>
         verifyIndependentExtensionInventory(client)
       );
+      return extensions;
     },
     INITIAL_FIXTURE_CLIENT_LIFECYCLE
   );

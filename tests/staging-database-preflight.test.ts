@@ -45,6 +45,8 @@ import {
   runRuntimeAuthSynchronizationProbeForTests,
   runUsageBodyAclBoundaryProbeForTests,
   runUsageBodyAclOwnerOracleProbeForTests,
+  runUserMappingInventoryProbeForTests,
+  validateUserMappingInventoryForTests,
   validateExternalFixtureConfigurationForTests,
   validateIndependentExtensionInventoryForTests,
 } from "../scripts/test-staging-database-preflight-postgres.mjs";
@@ -634,6 +636,7 @@ const externalFixturePublicSuccessOracle = Object.freeze({
   runtimeAuthSynchronization: true,
   providerDefaultAclBootstrap: true,
   preparedOwnerBootstrap: true,
+  userMappingInventory: true,
   verifierQueriesReadOnly: true,
   outputRedaction: true,
 });
@@ -1686,6 +1689,200 @@ function preparedOwnerAdapter(state = preparedOwnerState(), pooledState = state)
   return createAdapter({ directState: state, pooledState,
     directOptions: { roleName: preparedOwnerName }, pooledOptions: { roleName: preparedOwnerName } });
 }
+
+describe("user mapping inventory least-privilege contract", () => {
+  const mappingIds = ["1418:94001:0", "1418:94002:0", "1418:94003:0"];
+  const supportIds = ["2328:94010:0", "1417:94011:0"];
+  function addObjects(state: ReturnType<typeof baseState>, signatures: string[]) {
+    for (const signature of signatures) {
+      const extra = residualState("other_count", { signature }).userDefinedObjects;
+      state.userDefinedObjects.total_count += 1; state.userDefinedObjects.other_count += 1;
+      for (const key of ["object_signature", "extension_classification_evidence", "extension_candidate_signature", "extension_residual_signature"])
+        state.userDefinedObjects[key].push(...extra[key]);
+    }
+    return state;
+  }
+  const modeCases = [
+    { name: "strict", state: baseState, environment: validEnvironment, adapter: (state: ReturnType<typeof baseState>) => createAdapter({ directState: state }) },
+    { name: "provider v1", state: providerBootstrapState, environment: providerBootstrapEnvironment, adapter: (state: ReturnType<typeof baseState>) => createAdapter({ directState: state }) },
+    { name: "prepared owner", state: preparedOwnerState, environment: preparedOwnerEnvironment, adapter: preparedOwnerAdapter },
+  ];
+  it("uses only the public view umid while preserving the base class, lower bound and extension exclusion", () => {
+    const branch = PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects.split("UNION ALL").find((s) => s.includes("pg_user_mappings AS object_entry"));
+    expect(branch?.trim()).toBe("SELECT 'other', 'pg_user_mapping'::pg_catalog.regclass::oid, object_entry.umid, 0 FROM pg_catalog.pg_user_mappings AS object_entry\n      WHERE object_entry.umid >= 16384 AND NOT EXISTS (SELECT 1 FROM extension_managed WHERE extension_managed.classid = 'pg_user_mapping'::pg_catalog.regclass AND extension_managed.objid = object_entry.umid)");
+    expect(PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects).not.toMatch(/FROM pg_catalog\.pg_user_mapping\s|umoptions|SELECT \*/);
+    expect(PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects).toContain("FROM pg_catalog.pg_subscription AS object_entry");
+    expect(() => assertReadOnlySql(PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects)).not.toThrow();
+  });
+  it.each(modeCases)("retains $name no-mapping acceptance and rejects mapping identities without relying on a server residual", async (mode) => {
+    expect((await runPreflight(mode.adapter(mode.state()), mode.environment())).exitCode).toBe(0);
+    const report = await runPreflight(mode.adapter(addObjects(mode.state(), mappingIds)), mode.environment());
+    expect(report.exitCode).toBe(1); expect(report.failure?.checkId).toBe("USER_DEFINED_OBJECT_PRESENT");
+    expect(report.userDefinedObjects.direct.other).toBe(mode.state().userDefinedObjects.other_count + 3);
+    const publicReport = JSON.stringify(projectPublicPreflightReport(report));
+    for (const value of [...mappingIds, "94001", fakeSecret, "umoptions", "object_signature"]) expect(publicReport).not.toContain(value);
+  });
+  it.each(modeCases.flatMap((mode) => ["rejected", "missing", "incomplete"].map((fault) => ({ ...mode, fault }))))(
+    "$name does not turn a $fault mapping inventory into an empty successful set", async (mode) => {
+      const adapter = mode.adapter(mode.state());
+      const original = adapter.directConnection.query.getMockImplementation();
+      if (!original) throw new Error("MAPPING_TEST_QUERY_MISSING");
+      adapter.directConnection.query.mockImplementation((sql: string, params?: unknown[]) => {
+        if (sql === PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects) {
+          if (mode.fault === "rejected") return Promise.reject(Object.assign(new Error(fakeSecret), { code: "42501" }));
+          return Promise.resolve({ rows: mode.fault === "missing" ? [] : [{ total_count: 0 }] });
+        }
+        return original(sql, params);
+      });
+      const report = await runPreflight(adapter, mode.environment());
+      expect(report.exitCode).toBe(3); expect(report.overallStatus).toBe("not_verified");
+      expect(adapter.directConnection.close).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(projectPublicPreflightReport(report))).not.toContain(fakeSecret);
+    });
+  it.each(["direct extension", "wrong class", "wrong mapping id"])("keeps mapping extension identity exact: %s", async (variant) => {
+    const state = extensionClassificationState({ dependencyType: "e", dependentClass: "other_catalog", referencedClass: "pg_extension" },
+      { managed: true, signature: mappingIds[0] });
+    if (variant === "wrong class") state.userDefinedObjects.extension_managed_signature = ["1259:94001:0"];
+    if (variant === "wrong mapping id") state.userDefinedObjects.extension_managed_signature = ["1418:94002:0"];
+    const result = await runPreflight(createAdapter({ directState: state }));
+    expect(result.exitCode).toBe(variant === "direct extension" ? 0 : 3);
+  });
+  it.each(["complete", "missing self", "missing other", "missing public", "duplicate", "wrong class", "wrong oid", "wrong count", "unknown recipient"])(
+    "independently checks the mapping-specific signature set: %s", (fault) => {
+      const baseline = baseState().userDefinedObjects;
+      const actual = addObjects(baseState(), [...supportIds, ...mappingIds]).userDefinedObjects;
+      const rows = mappingIds.map((s, i) => ({ classid: s.split(":")[0], oid: s.split(":")[1], recipient: ["self", "other", "public"][i], fixed_server: true }));
+      if (fault.startsWith("missing")) actual.object_signature.splice(2 + ["missing self", "missing other", "missing public"].indexOf(fault), 1);
+      if (fault === "duplicate") actual.object_signature.push(actual.object_signature[2]);
+      if (fault === "wrong class") actual.object_signature[2] = "other:1259:94001:0";
+      if (fault === "wrong oid") actual.object_signature[2] = "other:1418:94101:0";
+      if (fault === "wrong count") actual.total_count -= 1;
+      if (fault === "unknown recipient") rows[2].recipient = "unknown";
+      expect(validateUserMappingInventoryForTests(actual, baseline, [...supportIds, ...mappingIds], rows, ["self", "other", "public"])).toBe(fault === "complete");
+    });
+
+  function fixture(fault = "none") {
+    let signalHang = () => undefined;
+    const hangStarted = new Promise<void>((resolveHang) => { signalHang = () => { resolveHang(); return undefined; }; });
+    const mappings = new Set<number>();
+    let support = false; let readerExists = false;
+    const log: { role: string; sql: string; params: unknown[] }[] = [];
+    const clients: { role: string; end: number; destroy: number }[] = [];
+    const reader = "actustube_staging_mapping_reader";
+    const admin = "actustube_ci_fixture";
+    const normalize = (s: string) => s.split(/\r?\n/).map((line) => line.trim()).join("\n").trim();
+    const createReader = `CREATE ROLE "actustube_staging_mapping_reader"
+      LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+      PASSWORD 'fixed_mapping_reader_fixture_password'`;
+    const mutations = new Map<string, () => void>([
+      [normalize(createReader), () => { readerExists = true; }],
+      ['DROP ROLE "actustube_staging_mapping_reader"', () => { readerExists = false; }],
+      ['CREATE FOREIGN DATA WRAPPER "actustube_inventory_fdw" NO HANDLER NO VALIDATOR', () => { support = true; }],
+      ['CREATE SERVER "actustube_inventory_server" FOREIGN DATA WRAPPER "actustube_inventory_fdw"', () => undefined],
+      ['DROP SERVER "actustube_inventory_server" RESTRICT', () => undefined],
+      ['DROP FOREIGN DATA WRAPPER "actustube_inventory_fdw" RESTRICT', () => { support = false; }],
+    ]);
+    [reader, admin, "PUBLIC"].forEach((role, index) => {
+      const recipient = role === "PUBLIC" ? role : `"${role}"`;
+      mutations.set(`CREATE USER MAPPING FOR ${recipient} SERVER "actustube_inventory_server"`, () => { mappings.add(index); });
+      mutations.set(`DROP USER MAPPING FOR ${recipient} SERVER "actustube_inventory_server"`, () => {
+        if (fault !== "cleanup residue") mappings.delete(index);
+      });
+    });
+    const clientFactory = ({ role }: { role: string }) => {
+      const clientState = { role, end: 0, destroy: 0 }; clients.push(clientState);
+      const state = () => {
+        const value = addObjects(baseState(), [...(support ? supportIds : []), ...[...mappings].map((i) => mappingIds[i])]);
+        value.extensionInventory = [{ name: "plpgsql", schema: "pg_catalog", version: "1.0" }];
+        if (fault === "omit mapping" && mappings.size) value.userDefinedObjects.object_signature.pop();
+        return value;
+      };
+      const formal = createConnection(state, { roleName: role });
+      return {
+        async connect() { expect(role === admin || readerExists).toBe(true); },
+        async end() { clientState.end += 1; },
+        connection: { stream: { destroy() { clientState.destroy += 1; } } },
+        async query(sql: string, params: unknown[] = []) {
+          log.push({ role, sql, params });
+          const normalized = normalize(sql);
+          if (sql.includes("session_user AS session_role")) return { rows: [{ session_role: role, effective_role: role }] };
+          if (sql === "SELECT oid::text FROM pg_catalog.pg_roles ORDER BY oid") return { rows: readerExists ? [{ oid: "10" }, { oid: "93000" }] : [{ oid: "10" }] };
+          if (sql.includes("m.oid::text AS oid")) {
+            expect(role).toBe(admin); expect(params).toEqual([reader, admin]);
+            return { rows: [...mappings].map((i) => ({ classid: "1418", oid: mappingIds[i].split(":")[1], recipient: ["self", "other", "public"][i], fixed_server: true })) };
+          }
+          if (sql.includes("FROM pg_catalog.pg_foreign_data_wrapper WHERE fdwname = 'actustube_inventory_fdw'")) {
+            expect(role).toBe(admin);
+            return { rows: support ? supportIds.map((s) => ({ classid: s.split(":")[0], oid: s.split(":")[1] })) : [] };
+          }
+          if (mutations.has(normalized)) {
+            expect(role).toBe(admin); expect(params).toEqual([]);
+            mutations.get(normalized)?.(); return { rows: [] };
+          }
+          if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+          if (sql.includes("AS minimal")) return { rows: [{ minimal: true }] };
+          if (sql === "SELECT oid FROM pg_catalog.pg_user_mapping") {
+            expect(role).toBe(reader);
+            if (fault === "old succeeds") return { rows: [] };
+            throw Object.assign(new Error(fakeSecret), { code: fault === "wrong old error" ? "42P01" : "42501" });
+          }
+          if (sql === "SELECT pg_catalog.has_server_privilege(current_user, $1, 'USAGE') AS allowed") {
+            expect(role).toBe(reader); expect(params).toEqual(["actustube_inventory_server"]);
+            return { rows: [{ allowed: fault === "server usage" }] };
+          }
+          if (sql === PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects && mappings.size && fault === "inventory rejection") throw new Error(fakeSecret);
+          if (sql === PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects && mappings.size && fault === "inventory timeout") {
+            signalHang(); return new Promise(() => undefined);
+          }
+          expect(role).toBe(reader);
+          return formal.query(sql, params);
+        },
+      };
+    };
+    return { clientFactory, log, clients, mappings, hangStarted, residue: () => ({ support, readerExists, mappings: mappings.size }) };
+  }
+  it("executes the shared disposable mapping matrix on a distinct minimal Client and restores its fixture", async () => {
+    const f = fixture();
+    const result = await runUserMappingInventoryProbeForTests({ clientFactory: f.clientFactory });
+    expect(result).toEqual({ completed: true, output: "", timedOut: false, activeClientCount: 0 });
+    expect(f.residue()).toEqual({ support: false, readerExists: false, mappings: 0 });
+    expect(f.log.filter((entry) => entry.sql.startsWith("CREATE USER MAPPING"))).toHaveLength(3);
+    expect(f.log.filter((entry) => entry.sql.startsWith("DROP USER MAPPING"))).toHaveLength(3);
+    expect(f.log.filter((entry) => entry.sql === PREFLIGHT_SQL_FOR_TESTS.userDefinedObjects).every((entry) => entry.role === "actustube_staging_mapping_reader")).toBe(true);
+    expect(f.clients.every((c) => c.end === 1 && c.destroy === 0)).toBe(true);
+  });
+  it.each(["old succeeds", "wrong old error", "omit mapping", "server usage", "inventory rejection", "cleanup residue"])(
+    "fails closed without a successful mapping flag for %s", async (fault) => {
+      const f = fixture(fault);
+      const result = await runUserMappingInventoryProbeForTests({ clientFactory: f.clientFactory });
+      expect(result.completed).toBe(false); expect(result.activeClientCount).toBe(0);
+      expect(result.output).toContain("EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V2");
+      const observed = JSON.parse(result.output.split("\n")[0]);
+      expect(observed.primary.subphase).toBe(["old succeeds", "wrong old error"].includes(fault) ? "MAPPING_OLD_REFERENCE" : "MAPPING_INVENTORY");
+      expect(observed.primary.classification).toBe(fault === "inventory rejection" ? "QUERY_REJECTED" : "ASSERTION_REJECTED");
+      expect(f.log.filter((entry) => entry.sql.startsWith("CREATE USER MAPPING"))).toHaveLength(
+        ["old succeeds", "wrong old error"].includes(fault) ? 0 : fault === "cleanup residue" ? 3 : 1);
+      expect(f.log.some((entry) => entry.sql === 'DROP ROLE "actustube_staging_mapping_reader"')).toBe(false);
+      for (const value of [fakeSecret, "94001", "actustube_inventory_server", "fixed_mapping_reader_fixture_password", "umoptions"]) expect(result.output).not.toContain(value);
+      expect(f.clients.every((c) => c.end === 1 && c.destroy === 0)).toBe(true);
+    });
+  it("bounds a mapping query timeout without reusing Clients or extending cleanup", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture("inventory timeout");
+      const pending = runUserMappingInventoryProbeForTests({ clientFactory: f.clientFactory, deadlineLimits: { queryMilliseconds: 20 } });
+      await f.hangStarted;
+      await vi.advanceTimersByTimeAsync(21);
+      const result = await pending;
+      expect(result.completed).toBe(false); expect(result.timedOut).toBe(true); expect(result.activeClientCount).toBe(0);
+      expect(result.output).toContain('"queryId":"USER_DEFINED_OBJECTS"');
+      expect(f.log.some((entry) => entry.sql.startsWith("DROP USER MAPPING"))).toBe(false);
+      expect(f.clients.filter((c) => c.destroy === 1).length).toBeGreaterThan(0);
+      expect(f.clients.every((c) => c.end + c.destroy === 1)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+});
 
 describe("prepared staging owner profile", () => {
   it("accepts only the independent owner and native automatic ADMIN edge through the formal entrypoint", async () => {
@@ -10222,8 +10419,10 @@ describe("connection-only external fixture boundary", () => {
         "runRuntimeAuthSynchronizationProbeForTests",
         "runUsageBodyAclBoundaryProbeForTests",
         "runUsageBodyAclOwnerOracleProbeForTests",
+        "runUserMappingInventoryProbeForTests",
         "validateExternalFixtureConfigurationForTests",
         "validateIndependentExtensionInventoryForTests",
+        "validateUserMappingInventoryForTests",
       ].sort()
     );
 
@@ -13341,6 +13540,7 @@ describe("connection-only external fixture boundary", () => {
         "runtimeAuthSynchronization",
         "providerDefaultAclBootstrap",
         "preparedOwnerBootstrap",
+        "userMappingInventory",
         "postgresqlMajor",
         "snapshotDriftRejected",
         "stablePreflight",
@@ -14205,7 +14405,7 @@ describe("external PostgreSQL public-safe phase observability oracle", () => {
     );
     for (const binding of [
       /runFixtureIdentityPhase\([\s\S]{0,100}assertFixtureIdentity\(/,
-      /runFixtureLedgerSetupPhase\([\s\S]{0,100}createEmptyMigrationLedger\(/,
+      /runFixtureLedgerSetupPhase\(context, async \(\) => \{[\s\S]{0,350}const mappingExtensions = await verifyIndependentExtensionInventory\(client\);\s+await withPostflightDiagnostics\(context, \(\) =>\s+verifyUserMappingInventory\(context, resolvedClientFactory, configuration, mappingExtensions, null\)\);\s+await createEmptyMigrationLedger\(client\);\s+\}\);/,
       /runExtensionInventoryPhase\([\s\S]{0,100}verifyIndependentExtensionInventory\(/,
       /INITIAL_FIXTURE_CLIENT_LIFECYCLE/,
       /runPreflightStabilityPhase\([\s\S]{0,180}runStablePreflight\(/,

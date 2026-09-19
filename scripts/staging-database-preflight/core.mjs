@@ -1319,8 +1319,8 @@ const SQL = Object.freeze({
       SELECT 'other', 'pg_foreign_server'::pg_catalog.regclass::oid, object_entry.oid, 0 FROM pg_catalog.pg_foreign_server AS object_entry
       WHERE object_entry.oid >= 16384 AND NOT EXISTS (SELECT 1 FROM extension_managed WHERE extension_managed.classid = 'pg_foreign_server'::pg_catalog.regclass AND extension_managed.objid = object_entry.oid)
       UNION ALL
-      SELECT 'other', 'pg_user_mapping'::pg_catalog.regclass::oid, object_entry.oid, 0 FROM pg_catalog.pg_user_mapping AS object_entry
-      WHERE object_entry.oid >= 16384 AND NOT EXISTS (SELECT 1 FROM extension_managed WHERE extension_managed.classid = 'pg_user_mapping'::pg_catalog.regclass AND extension_managed.objid = object_entry.oid)
+      SELECT 'other', 'pg_user_mapping'::pg_catalog.regclass::oid, object_entry.umid, 0 FROM pg_catalog.pg_user_mappings AS object_entry
+      WHERE object_entry.umid >= 16384 AND NOT EXISTS (SELECT 1 FROM extension_managed WHERE extension_managed.classid = 'pg_user_mapping'::pg_catalog.regclass AND extension_managed.objid = object_entry.umid)
       UNION ALL
       SELECT 'other', 'pg_publication'::pg_catalog.regclass::oid, object_entry.oid, 0 FROM pg_catalog.pg_publication AS object_entry
       WHERE object_entry.oid >= 16384 AND NOT EXISTS (SELECT 1 FROM extension_managed WHERE extension_managed.classid = 'pg_publication'::pg_catalog.regclass AND extension_managed.objid = object_entry.oid)
