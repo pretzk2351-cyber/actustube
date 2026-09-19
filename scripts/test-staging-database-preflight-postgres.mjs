@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
@@ -1809,11 +1810,225 @@ const CANONICAL_CLEANUP_CLIENT_LIFECYCLE = Symbol(
 );
 const INTERNAL_PHASE_PROBE_FAILURE = Object.freeze(Object.create(null));
 
+// Orthogonal to the legacy phase marker. Only the POSTFLIGHT_DRIFT body opens
+// this scope; async-local frames distinguish concurrent formal adapter calls.
+// Boundary map: old drift/restore/auth/provider -> reset -> manager/create ->
+// formal preflight -> transfer -> owner/Migration -> runtime -> postflight/auth.
+// Cleanup frames observe existing rollback/restore/close; they never add work.
+const POSTFLIGHT_DIAGNOSTIC_SCOPE = new AsyncLocalStorage();
+const POSTFLIGHT_DIAGNOSTIC_FAILURES = new WeakMap();
+const POSTFLIGHT_ERROR_CLASSIFICATIONS = new WeakMap();
+const HARNESS_ISSUE_CODES = new WeakMap();
+const POSTFLIGHT_SUBPHASES = new Set([
+  "NONE", "UNCLASSIFIED", "DRIFT_CHECK", "DRIFT_RESTORE", "LEGACY_AUTH_SYNC",
+  "PROVIDER_PRESERVATION", "PREPARED_BOOTSTRAP", "PREPARED_RESET_CHECK", "PREPARED_RESET",
+  "MANAGER_CONNECT", "MANAGER_IDENTITY", "OWNER_CREATION", "OWNER_CREATE", "OWNER_MEMBERSHIP",
+  "LEGACY_PREFLIGHT_CONTROL", "PREPARED_PREFLIGHT", "OWNER_DIRECT_CONNECT",
+  "OWNER_POOLED_CONNECT", "TRANSFER_PREPARATION", "TRANSFER_CONNECT", "TRANSFER_IDENTITY",
+  "TRANSFER_MEMBERSHIP", "TRANSFER_SET", "TRANSFER_OWNER", "TRANSFER_REVOKE",
+  "OWNER_PREPARATION", "OWNER_IDENTITY", "OWNER_DEFAULT_ACL", "OWNER_MIGRATION",
+  "OWNER_LEDGER", "RUNTIME_PREPARATION", "RUNTIME_IDENTITY", "RUNTIME_CREATE",
+  "RUNTIME_SETTINGS", "RUNTIME_MEMBERSHIP", "RUNTIME_ACL", "PREPARED_POSTFLIGHT",
+  "PREPARED_AUTH_SYNC", "AUTH_POSTFLIGHT", "AUTH_ACL_CONTROL", "AUTH_EXECUTION",
+  "AUTH_FINAL_STATE", "AUTH_ACL_RESTORE", "AUTH_ROLLBACK", "TRANSACTION_ROLLBACK",
+  "CLIENT_CLOSE", "FORMAL_ROLLBACK",
+]);
+const POSTFLIGHT_DIAGNOSTIC_CLASSES = new Set([
+  "UNCLASSIFIED", "ASSERTION_REJECTED", "TIMEOUT", "CONNECTION_REJECTED",
+  "QUERY_REJECTED", "CLOSE_REJECTED", "FORMAL_REJECTION", "RESULT_UNCLASSIFIED",
+  "INSUFFICIENT_PRIVILEGE", "DEPENDENT_OBJECTS", "UNDEFINED_OBJECT",
+  "DUPLICATE_OBJECT", "SQL_SYNTAX_ERROR", "AUTHENTICATION_REJECTED",
+]);
+const POSTFLIGHT_PUBLIC_CODES = new Set([
+  "UNCLASSIFIED", "PROVIDER_INITIAL_ACL_PROFILE_INVALID",
+  "PREPARED_OWNER_INPUT_INVALID", "PREPARED_OWNER_IDENTITY_MISMATCH",
+  "PREPARED_OWNER_INVENTORY_INVALID", "PREPARED_OWNER_AUTHORITY_MISMATCH",
+  "PROVIDER_INITIAL_ACL_INVENTORY_INVALID", "PROVIDER_INITIAL_ACL_ROLE_MISMATCH",
+  "PROVIDER_INITIAL_ACL_MISMATCH", "PROVIDER_INITIAL_ACL_COVERAGE_MISMATCH",
+  "DIRECT_CONNECTION_UNAVAILABLE", "POOLED_CONNECTION_UNAVAILABLE",
+  "DATABASE_QUERY_TIMEOUT", "DATABASE_QUERY_UNAVAILABLE", "DATABASE_OPERATION_ABORTED",
+  "CONNECTION_CLEANUP_TIMEOUT", "CONNECTION_CLEANUP_UNVERIFIED",
+  "LOGICAL_DATABASE_IDENTITY_UNAVAILABLE", "LOGICAL_DATABASE_IDENTITY_MISMATCH",
+  "DIRECT_POOLED_STATE_MISMATCH", "DIRECT_POOLED_SCHEMA_MISMATCH",
+  "EXPECTED_STAGING_IDENTITY_MISMATCH", "TABLE_SET_MISMATCH",
+  "DEFAULT_PRIVILEGE_SET_MISMATCH", "DEFAULT_PRIVILEGE_UNEXPECTED_GRANTEE",
+  "DEFAULT_PUBLIC_PRIVILEGE_PRESENT", "FUNCTION_ACL_UNEXPECTED_GRANTEE",
+  "FUNCTION_OWNER_MISMATCH", "FUNCTION_PUBLIC_EXECUTE_PRESENT",
+  "RUNTIME_TABLE_PRIVILEGE_MISSING", "RUNTIME_TABLE_PRIVILEGE_EXCESS",
+  "DIRECT_DATABASE_OWNER_MISMATCH", "READ_ONLY_INVARIANT_MISMATCH", "POSTFLIGHT_UNAVAILABLE",
+  "USER_DEFINED_OBJECT_PRESENT", "CATALOG_VALUE_INVALID",
+]);
+const POSTFLIGHT_SQLSTATE_CLASSES = Object.freeze({
+  "42501": "INSUFFICIENT_PRIVILEGE", "2BP01": "DEPENDENT_OBJECTS",
+  "42704": "UNDEFINED_OBJECT", "42710": "DUPLICATE_OBJECT",
+  "42601": "SQL_SYNTAX_ERROR", "28P01": "AUTHENTICATION_REJECTED",
+});
+
+function diagnosticOwnValue(value, key) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  return Object.getOwnPropertyDescriptor(value, key)?.value;
+}
+
+function postflightDiagnosticFrame(context) {
+  const frame = POSTFLIGHT_DIAGNOSTIC_SCOPE.getStore();
+  return frame?.context === context ? frame : null;
+}
+
+function capturePostflightError(context, error, fallback) {
+  try {
+    if (!postflightDiagnosticFrame(context) || !error || typeof error !== "object") return;
+    if (fallback === "UNCLASSIFIED" && POSTFLIGHT_ERROR_CLASSIFICATIONS.has(error)) return;
+    const internalCode = HARNESS_ISSUE_CODES.get(error);
+    const code = diagnosticOwnValue(error, "code");
+    const classification = internalCode === "EXTERNAL_FIXTURE_OPERATION_TIMEOUT"
+      ? "TIMEOUT" : internalCode !== undefined ? "ASSERTION_REJECTED"
+        : typeof code === "string" && Object.hasOwn(POSTFLIGHT_SQLSTATE_CLASSES, code)
+          ? POSTFLIGHT_SQLSTATE_CLASSES[code] : fallback;
+    POSTFLIGHT_ERROR_CLASSIFICATIONS.set(error, classification);
+  } catch { /* Diagnostics never replace an operational failure. */ }
+}
+
+function recordPostflightFailure(context, error) {
+  try {
+    const frame = postflightDiagnosticFrame(context);
+    if (!frame) return;
+    capturePostflightError(context, error, "UNCLASSIFIED");
+    const failure = Object.freeze({
+      subphase: frame.subphase,
+      classification: frame.formal?.classification ?? POSTFLIGHT_ERROR_CLASSIFICATIONS.get(error) ?? "UNCLASSIFIED",
+      publicCode: frame.formal?.publicCode ?? "UNCLASSIFIED",
+    });
+    if (frame.cleanup) {
+      if (frame.tracker.primary === null && frame.tracker.cleanupFailure === null) {
+        frame.tracker.failurePath = frame.path;
+        frame.tracker.lastBeforeFailure = frame.tracker.lastSuccessful;
+      }
+      frame.tracker.cleanupFailure ??= failure;
+      frame.tracker.cleanupStatus = "FAILED";
+    } else if (frame.tracker.primary === null && frame.tracker.cleanupFailure === null) {
+      frame.tracker.primary = failure;
+      frame.tracker.failurePath = frame.path;
+      frame.tracker.lastBeforeFailure = frame.tracker.lastSuccessful;
+    }
+  } catch { /* No raw-error fallback. */ }
+}
+
+function observePostflightFormalResult(context, report, expectedFailure = null) {
+  try {
+    const frame = postflightDiagnosticFrame(context);
+    if (!frame) return;
+    frame.formal = null;
+    const exitCode = diagnosticOwnValue(report, "exitCode");
+    const failure = diagnosticOwnValue(report, "failure");
+    const code = diagnosticOwnValue(failure, "checkId");
+    const status = diagnosticOwnValue(failure, "status");
+    if (exitCode === 0 && expectedFailure === null) return;
+    if (expectedFailure !== null && exitCode === 1 && status === "fail" && code === expectedFailure) return;
+    frame.formal = Object.freeze({
+      classification: [1, 2, 3].includes(exitCode) &&
+        status === (exitCode === 3 ? "not_verified" : "fail") &&
+        typeof code === "string" && code !== "UNCLASSIFIED" && POSTFLIGHT_PUBLIC_CODES.has(code)
+        ? "FORMAL_REJECTION" : "RESULT_UNCLASSIFIED",
+      publicCode: typeof code === "string" && POSTFLIGHT_PUBLIC_CODES.has(code) ? code : "UNCLASSIFIED",
+    });
+  } catch {
+    const frame = postflightDiagnosticFrame(context);
+    if (frame) frame.formal = Object.freeze({ classification: "RESULT_UNCLASSIFIED", publicCode: "UNCLASSIFIED" });
+  }
+}
+
+async function runPostflightSubphase(context, subphase, operation, cleanup = false) {
+  const parent = postflightDiagnosticFrame(context);
+  if (!parent) return await operation();
+  const frame = { context, tracker: parent.tracker,
+    subphase: POSTFLIGHT_SUBPHASES.has(subphase) ? subphase : "UNCLASSIFIED",
+    path: ["PREPARED_BOOTSTRAP", "PREPARED_AUTH_SYNC"].includes(subphase)
+      ? "PREPARED" : subphase === "LEGACY_AUTH_SYNC" ? "LEGACY" : parent.path,
+    cleanup: parent.cleanup || cleanup, formal: null };
+  if (frame.cleanup && frame.tracker.cleanupStatus !== "FAILED") frame.tracker.cleanupStatus = "INCOMPLETE";
+  if (frame.cleanup) frame.tracker.cleanupActive += 1;
+  return POSTFLIGHT_DIAGNOSTIC_SCOPE.run(frame, async () => {
+    try {
+      const result = await operation();
+      if (frame.cleanup) {
+        if (frame.tracker.cleanupStatus !== "FAILED" && frame.tracker.cleanupActive === 1) frame.tracker.cleanupStatus = "SUCCEEDED";
+      } else if (frame.tracker.primary === null && frame.tracker.cleanupFailure === null) {
+        frame.tracker.lastSuccessful = frame.subphase;
+      }
+      return result;
+    } catch (error) {
+      if (frame.cleanup && frame.tracker.primary === null && frame.tracker.cleanupFailure === null) {
+        frame.tracker.lastBeforeFailure = frame.tracker.lastSuccessful;
+      }
+      recordPostflightFailure(context, error);
+      throw error;
+    } finally {
+      if (frame.cleanup) frame.tracker.cleanupActive -= 1;
+    }
+  });
+}
+
+function postflightDiagnosticLines(error) {
+  try {
+    const diagnostic = POSTFLIGHT_DIAGNOSTIC_FAILURES.get(error);
+    if (!diagnostic) return [];
+    const projectFailure = (value) => {
+      if (value === null) return null;
+      if (!exactOwnKeys(value, ["subphase", "classification", "publicCode"])) return undefined;
+      const subphase = diagnosticOwnValue(value, "subphase");
+      const classification = diagnosticOwnValue(value, "classification");
+      const publicCode = diagnosticOwnValue(value, "publicCode");
+      return POSTFLIGHT_SUBPHASES.has(subphase) && POSTFLIGHT_DIAGNOSTIC_CLASSES.has(classification) && POSTFLIGHT_PUBLIC_CODES.has(publicCode)
+        ? { subphase, classification, publicCode } : undefined;
+    };
+    if (!exactOwnKeys(diagnostic, ["schema", "path", "lastSuccessfulSubphase", "primaryObservation", "primary", "cleanup"])) return [];
+    const schema = diagnosticOwnValue(diagnostic, "schema");
+    const path = diagnosticOwnValue(diagnostic, "path");
+    const lastSuccessfulSubphase = diagnosticOwnValue(diagnostic, "lastSuccessfulSubphase");
+    const primary = projectFailure(diagnosticOwnValue(diagnostic, "primary"));
+    const primaryObservation = diagnosticOwnValue(diagnostic, "primaryObservation");
+    const cleanup = diagnosticOwnValue(diagnostic, "cleanup");
+    if (!exactOwnKeys(cleanup, ["status", "failure"])) return [];
+    const status = diagnosticOwnValue(cleanup, "status");
+    const failure = projectFailure(diagnosticOwnValue(cleanup, "failure"));
+    if (schema !== "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1" || !["LEGACY", "PREPARED", "UNCLASSIFIED"].includes(path) || !POSTFLIGHT_SUBPHASES.has(lastSuccessfulSubphase) ||
+      primary === undefined || primaryObservation !== (primary === null ? "NOT_OBSERVED" : "OBSERVED") ||
+      failure === undefined || !["NOT_RUN", "INCOMPLETE", "SUCCEEDED", "FAILED"].includes(status)) return [];
+    // Only freshly projected fixed primitives are serialized, never the source object.
+    return [JSON.stringify({ schema, path, lastSuccessfulSubphase, primaryObservation, primary, cleanup: { status, failure } })];
+  } catch { return []; }
+}
+
+async function withPostflightDiagnostics(context, operation) {
+  const tracker = { primary: null, cleanupFailure: null, cleanupStatus: "NOT_RUN", cleanupActive: 0, failurePath: "UNCLASSIFIED",
+    lastSuccessful: "NONE", lastBeforeFailure: "NONE" };
+  return POSTFLIGHT_DIAGNOSTIC_SCOPE.run({ context, tracker, subphase: "UNCLASSIFIED", path: "LEGACY", cleanup: false, formal: null }, async () => {
+    try { return await operation(); }
+    catch (error) {
+      recordPostflightFailure(context, error);
+      const failure = EXTERNAL_FIXTURE_PHASE_FAILURES.get(error)?.context === context ? error
+        : createExternalFixturePhaseFailure(context, EXTERNAL_FIXTURE_PHASES.postflightDrift, error);
+      POSTFLIGHT_DIAGNOSTIC_FAILURES.set(failure, Object.freeze({
+        schema: "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1",
+        path: tracker.failurePath,
+        lastSuccessfulSubphase: tracker.lastBeforeFailure,
+        // Formal cores may replace an internal validation result on cleanup
+        // failure. Absence of an observed primary is NOT proof of body success.
+        primaryObservation: tracker.primary === null ? "NOT_OBSERVED" : "OBSERVED",
+        primary: tracker.primary,
+        cleanup: Object.freeze({ status: tracker.cleanupStatus, failure: tracker.cleanupFailure }),
+      }));
+      throw failure;
+    }
+  });
+}
+
 class HarnessIssue extends Error {
   constructor(code) {
     super(code);
     this.name = "HarnessIssue";
     this.code = code;
+    HARNESS_ISSUE_CODES.set(this, code);
     if (code === "EXTERNAL_FIXTURE_NOT_CONFIGURED") {
       EXTERNAL_FIXTURE_NOT_CONFIGURED_FAILURES.add(this);
     }
@@ -1840,6 +2055,8 @@ function createExternalFixturePhaseFailure(context, phase, sourceFailure = null)
     Object.freeze({ context, phase: fixedExternalFixturePhase(phase) })
   );
   const diagnostic = GRANT_INVENTORY_DIAGNOSTIC_FAILURES.get(sourceFailure);
+  const classification = POSTFLIGHT_ERROR_CLASSIFICATIONS.get(sourceFailure);
+  if (classification) POSTFLIGHT_ERROR_CLASSIFICATIONS.set(failure, classification);
   if (diagnostic) GRANT_INVENTORY_DIAGNOSTIC_FAILURES.set(failure, diagnostic);
   const grantorDelta =
     GRANT_INVENTORY_GRANTOR_DELTA_DIAGNOSTICS.get(sourceFailure);
@@ -2146,6 +2363,7 @@ function grantInventoryDiagnosticLines(error) {
 function externalFixtureFailureOutput(error) {
   const marker = externalFixtureFailureMarker(error);
   return `${[
+    ...postflightDiagnosticLines(error),
     ...grantInventoryDiagnosticLines(error),
     ...reservationSetupDiagnosticLines(error),
     marker,
@@ -2476,6 +2694,7 @@ async function queryOwnedClient(context, ownedClient, ...argumentsList) {
       () => ownedClient.rawClient.query(...argumentsList)
     );
   } catch (error) {
+    capturePostflightError(context, error, "QUERY_REJECTED");
     recordReservationSetupPrimary(
       context,
       isHarnessTimeout(error) ? "SETUP_QUERY_TIMEOUT" : "SETUP_QUERY_REJECTED"
@@ -2489,6 +2708,7 @@ async function closeOwnedClient(context, ownedClient) {
     context.activeClients.delete(ownedClient);
     return;
   }
+  return runPostflightSubphase(context, "CLIENT_CLOSE", async () => {
   try {
     try {
       await runBoundedOperation(
@@ -2501,6 +2721,7 @@ async function closeOwnedClient(context, ownedClient) {
         () => ownedClient.rawClient.end()
       );
     } catch (error) {
+      capturePostflightError(context, error, "CLOSE_REJECTED");
       recordReservationSetupPrimary(
         context,
         isHarnessTimeout(error)
@@ -2514,6 +2735,7 @@ async function closeOwnedClient(context, ownedClient) {
   } finally {
     context.activeClients.delete(ownedClient);
   }
+  }, true);
 }
 
 async function runBoundedPhase(context, category, maximumMilliseconds, operation) {
@@ -3181,7 +3403,7 @@ function runPostflightDriftPhase(context, operation) {
   return runExternalFixturePhase(
     context,
     EXTERNAL_FIXTURE_PHASES.postflightDrift,
-    operation
+    () => withPostflightDiagnostics(context, operation)
   );
 }
 
@@ -3243,6 +3465,8 @@ async function openClient(context, clientFactory, credentials) {
     );
     return ownedClient;
   } catch (error) {
+    capturePostflightError(context, error, "CONNECTION_REJECTED");
+    recordPostflightFailure(context, error);
     recordReservationSetupPrimary(
       context,
       isHarnessTimeout(error)
@@ -3270,7 +3494,15 @@ async function withClient(
   operation,
   lifecycle = null
 ) {
-  const openOperation = () => openClient(context, clientFactory, credentials);
+  const openOperation = () => {
+    const connect = () => openClient(context, clientFactory, credentials);
+    const phase = postflightDiagnosticFrame(context)?.subphase;
+    if (phase === "OWNER_CREATION" || phase === "RUNTIME_PREPARATION")
+      return runPostflightSubphase(context, "MANAGER_CONNECT", connect);
+    if (phase === "TRANSFER_PREPARATION") return runPostflightSubphase(context, "TRANSFER_CONNECT", connect);
+    if (phase === "OWNER_PREPARATION" || phase === "RUNTIME_ACL") return runPostflightSubphase(context, "OWNER_DIRECT_CONNECT", connect);
+    return connect();
+  };
   const ownedClient =
     lifecycle === INITIAL_FIXTURE_CLIENT_LIFECYCLE
       ? await runFixtureClientConnectPhase(context, openOperation)
@@ -3285,6 +3517,7 @@ async function withClient(
   try {
     operationResult = await operation(ownedClient.proxy, ownedClient);
   } catch (error) {
+    recordPostflightFailure(context, error);
     primaryFailed = true;
     primaryFailure = error;
   }
@@ -3331,14 +3564,30 @@ function fixtureCredentials(configuration, overrides = {}) {
 function createAdapter(context, clientFactory, credentialsForKind) {
   return {
     async connect(kind) {
-      const ownedClient = await openClient(
+      const connect = () => openClient(
         context,
         clientFactory,
         credentialsForKind(kind)
       );
+      const phase = postflightDiagnosticFrame(context)?.subphase;
+      const ownedClient = await (phase === "LEGACY_PREFLIGHT_CONTROL" || phase === "PREPARED_PREFLIGHT"
+        ? runPostflightSubphase(context, kind === "direct" ? "OWNER_DIRECT_CONNECT" : "OWNER_POOLED_CONNECT", connect)
+        : connect());
       return {
-        query(statement, parameters = []) {
-          return ownedClient.proxy.query(statement, parameters);
+        async query(statement, parameters = []) {
+          // Formal read-only transaction rollback is cleanup, including the
+          // intermediate snapshot boundary; it is not necessarily final close.
+          if (statement === POSTFLIGHT_SQL_FOR_TESTS.rollback) {
+            return runPostflightSubphase(context, "FORMAL_ROLLBACK", () => ownedClient.proxy.query(statement, parameters), true);
+          }
+          try { return await ownedClient.proxy.query(statement, parameters); }
+          catch (error) {
+            // Formal cores catch query errors before closing, and may replace
+            // their public report on close failure. Preserve only what was
+            // actually observed here, never reconstruct an unknown report code.
+            recordPostflightFailure(context, error);
+            throw error;
+          }
         },
         close() {
           return closeOwnedClient(context, ownedClient);
@@ -7510,12 +7759,13 @@ async function verifyAuthRuntimeExecution(context, client, oldAcl) {
       "EXTERNAL_FIXTURE_RUNTIME_AUTH_RESYNC_INVALID");
     }
   } catch (error) {
+    recordPostflightFailure(context, error);
     primaryFailure = error;
   }
   // Use only this still-usable Client and the original absolute deadline. Closing
   // a destroyed connection rolls back server-side; do not query after timeout.
   if (!context.timedOut) {
-    try { await client.query("ROLLBACK"); }
+    try { await runPostflightSubphase(context, "AUTH_ROLLBACK", () => client.query("ROLLBACK"), true); }
     catch (error) { if (primaryFailure === null) primaryFailure = error; }
   }
   if (primaryFailure !== null) throw primaryFailure;
@@ -7531,21 +7781,23 @@ async function verifyRuntimeAuthSynchronization(
   const expectedOwner = requireOriginalObservedSessionIdentity(
     identityAuthority, identityAuthority.observedSessionIdentity
   );
-  const mutateAcl = (sql) => withClient(context, clientFactory,
+  const mutateAcl = (sql) => runPostflightSubphase(context,
+    postflightDiagnosticFrame(context)?.cleanup ? "AUTH_ACL_RESTORE" : "AUTH_ACL_CONTROL", () => withClient(context, clientFactory,
     fixtureCredentials(configuration), async (client) => {
       await observeSessionIdentity(client, expectedOwner, "EXTERNAL_FIXTURE_RUNTIME_AUTH_OWNER_INVALID");
       await client.query(sql);
-    });
-  const runtimeExecution = (oldAcl) => withClient(context, clientFactory,
+    }));
+  const runtimeExecution = (oldAcl) => runPostflightSubphase(context, "AUTH_EXECUTION", () => withClient(context, clientFactory,
     fixtureCredentials(configuration, { role: RUNTIME_ROLE, password: RUNTIME_PASSWORD }),
-    (client) => verifyAuthRuntimeExecution(context, client, oldAcl));
-  const requirePostflight = async (checkId) => {
+    (client) => verifyAuthRuntimeExecution(context, client, oldAcl)));
+  const requirePostflight = async (checkId, phase = "AUTH_POSTFLIGHT") => runPostflightSubphase(context, phase, async () => {
     const { report } = await postflightOperation();
+    observePostflightFormalResult(context, report, checkId);
     requireHarness(checkId === null
       ? report.exitCode === 0 && report.runtimePrivileges === "pass" && report.acl === "pass"
       : report.exitCode === 1 && report.failure?.checkId === checkId,
     "EXTERNAL_FIXTURE_RUNTIME_AUTH_POSTFLIGHT_INVALID");
-  };
+  });
   let restoreSql = null;
   let primaryFailure = null;
   try {
@@ -7562,14 +7814,15 @@ async function verifyRuntimeAuthSynchronization(
     await mutateAcl(`GRANT UPDATE ON TABLE public.user_plan_assignments TO ${quoteIdentifier(RUNTIME_ROLE)}`);
     await requirePostflight("RUNTIME_TABLE_PRIVILEGE_EXCESS");
   } catch (error) {
+    recordPostflightFailure(context, error);
     primaryFailure = error;
   }
   if (restoreSql !== null && !context.timedOut) {
-    try { await mutateAcl(restoreSql); }
+    try { await runPostflightSubphase(context, "AUTH_ACL_RESTORE", () => mutateAcl(restoreSql), true); }
     catch (error) { if (primaryFailure === null) primaryFailure = error; }
   }
   if (primaryFailure !== null) throw primaryFailure;
-  await requirePostflight(null);
+  await requirePostflight(null, "AUTH_FINAL_STATE");
   return true;
 }
 
@@ -7614,8 +7867,9 @@ async function withPreparedTransaction(context, client, operation) {
   } catch (error) {
     // A sent COMMIT can have an unknown outcome. Never re-send it, nor query a
     // timed-out Client. The owned proxy enforces the same absolute deadline.
+    recordPostflightFailure(context, error);
     if (!commitStarted && !context.timedOut) {
-      try { await client.query("ROLLBACK"); } catch { /* Preserve primary failure. */ }
+      try { await runPostflightSubphase(context, "TRANSACTION_ROLLBACK", () => client.query("ROLLBACK"), true); } catch { /* Preserve primary failure. */ }
     }
     throw error;
   }
@@ -7641,12 +7895,12 @@ async function preparedManagerIdentity(client, expectedDatabase, expectedOwner) 
 async function createPreparedOwnerWithManager(context, client, database) {
   // The GUC is observed on the very connection that executes CREATE ROLE.
   // Never SET it or fabricate the automatic native grant with a GRANT command.
-  await preparedManagerIdentity(client, database, "neondb_owner");
+  await runPostflightSubphase(context, "MANAGER_IDENTITY", () => preparedManagerIdentity(client, database, "neondb_owner"));
   await withPreparedTransaction(context, client, async () => {
-    await client.query(`CREATE ROLE ${quoteIdentifier(PREPARED_FIXTURE_OWNER)}
+    await runPostflightSubphase(context, "OWNER_CREATE", () => client.query(`CREATE ROLE ${quoteIdentifier(PREPARED_FIXTURE_OWNER)}
       LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
-      CONNECTION LIMIT -1 PASSWORD '${PREPARED_FIXTURE_PASSWORD}'`);
-    await assertPreparedAutomaticMembership(client);
+      CONNECTION LIMIT -1 PASSWORD '${PREPARED_FIXTURE_PASSWORD}'`));
+    await runPostflightSubphase(context, "OWNER_MEMBERSHIP", () => assertPreparedAutomaticMembership(client));
   });
 }
 
@@ -7654,8 +7908,11 @@ async function reinitializeOwnedDisposableFixture(context, clientFactory, config
   // This is a second, bounded case in the SAME disposable service DB, after
   // the complete original case passed. No DB creation, CASCADE, down-migration
   // launcher, catalog-generated cleanup, or staging target is accepted.
-  const before = await runPostflight(context, clientFactory, configuration);
-  requireHarness(before.report.exitCode === 0, "EXTERNAL_FIXTURE_PREPARED_RESET_PRECONDITION_FAILED");
+  await runPostflightSubphase(context, "PREPARED_RESET_CHECK", async () => {
+    const before = await runPostflight(context, clientFactory, configuration);
+    observePostflightFormalResult(context, before.report);
+    requireHarness(before.report.exitCode === 0, "EXTERNAL_FIXTURE_PREPARED_RESET_PRECONDITION_FAILED");
+  });
   await runPreMutationSessionIdentityBoundary({
     context, clientFactory, credentials: fixtureCredentials(configuration), expectedSessionRole: configuration.role,
     async operation(client) {
@@ -7694,23 +7951,28 @@ async function reinitializeOwnedDisposableFixture(context, clientFactory, config
 }
 
 async function transferPreparedOwnerWithManager(context, client, database) {
-  await preparedManagerIdentity(client, database, "neondb_owner");
-  await assertPreparedAutomaticMembership(client);
+  await runPostflightSubphase(context, "TRANSFER_IDENTITY", () => preparedManagerIdentity(client, database, "neondb_owner"));
+  await runPostflightSubphase(context, "TRANSFER_MEMBERSHIP", () => assertPreparedAutomaticMembership(client));
   await withPreparedTransaction(context, client, async () => {
-    await client.query(`GRANT ${quoteIdentifier(PREPARED_FIXTURE_OWNER)} TO neondb_owner
-      WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY neondb_owner`);
-    await assertPreparedAutomaticMembership(client, PREPARED_FIXTURE_OWNER, true);
-    await client.query(`ALTER DATABASE ${quoteIdentifier(database)} OWNER TO ${quoteIdentifier(PREPARED_FIXTURE_OWNER)}`);
-    await client.query(`REVOKE ${quoteIdentifier(PREPARED_FIXTURE_OWNER)} FROM neondb_owner GRANTED BY neondb_owner`);
-    await assertPreparedAutomaticMembership(client);
+    await runPostflightSubphase(context, "TRANSFER_SET", () => client.query(`GRANT ${quoteIdentifier(PREPARED_FIXTURE_OWNER)} TO neondb_owner
+      WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY neondb_owner`));
+    await runPostflightSubphase(context, "TRANSFER_MEMBERSHIP", () => assertPreparedAutomaticMembership(client, PREPARED_FIXTURE_OWNER, true));
+    await runPostflightSubphase(context, "TRANSFER_OWNER", () => client.query(`ALTER DATABASE ${quoteIdentifier(database)} OWNER TO ${quoteIdentifier(PREPARED_FIXTURE_OWNER)}`));
+    await runPostflightSubphase(context, "TRANSFER_REVOKE", () => client.query(`REVOKE ${quoteIdentifier(PREPARED_FIXTURE_OWNER)} FROM neondb_owner GRANTED BY neondb_owner`));
+    await runPostflightSubphase(context, "TRANSFER_MEMBERSHIP", () => assertPreparedAutomaticMembership(client));
   });
 }
 
+function runPreparedBootstrapDiagnostics(context, operation) {
+  return runPostflightSubphase(context, "PREPARED_BOOTSTRAP", operation);
+}
+
 async function verifyPreparedOwnerThroughEntrypoint(context, clientFactory, configuration, specification, extensions) {
-  await reinitializeOwnedDisposableFixture(context, clientFactory, configuration, specification);
+  return runPreparedBootstrapDiagnostics(context, async () => {
+  await runPostflightSubphase(context, "PREPARED_RESET", () => reinitializeOwnedDisposableFixture(context, clientFactory, configuration, specification));
   const managerCredentials = fixtureCredentials(configuration, { role: "neondb_owner", password: PREPARED_MANAGER_PASSWORD });
-  await withClient(context, clientFactory, managerCredentials,
-    (client) => createPreparedOwnerWithManager(context, client, configuration.database));
+  await runPostflightSubphase(context, "OWNER_CREATION", () => withClient(context, clientFactory, managerCredentials,
+    (client) => createPreparedOwnerWithManager(context, client, configuration.database)));
   const ownerUrl = new URL(configuration.rawUrl);
   ownerUrl.username = PREPARED_FIXTURE_OWNER; ownerUrl.password = PREPARED_FIXTURE_PASSWORD;
   const ownerConfiguration = Object.freeze({ ...configuration, role: PREPARED_FIXTURE_OWNER,
@@ -7732,19 +7994,23 @@ async function verifyPreparedOwnerThroughEntrypoint(context, clientFactory, conf
       .every((part) => !output.join("\n").includes(part)), "EXTERNAL_FIXTURE_OUTPUT_REDACTION_FAILED");
     return report;
   };
+  await runPostflightSubphase(context, "LEGACY_PREFLIGHT_CONTROL", async () => {
   const legacy = await runFormalPreflight("neon-pg18-initial-default-acl-v1");
+  observePostflightFormalResult(context, legacy, "PROVIDER_INITIAL_ACL_ROLE_MISMATCH");
   requireHarness(legacy.exitCode === 1 && legacy.failure?.checkId === "PROVIDER_INITIAL_ACL_ROLE_MISMATCH",
     "EXTERNAL_FIXTURE_PREPARED_LEGACY_CONTROL_FAILED");
+  });
+  await runPostflightSubphase(context, "PREPARED_PREFLIGHT", async () => {
   const prepared = await runFormalPreflight("neon-pg18-prepared-app-owner-v1");
-  requireHarness(prepared.exitCode === 0 && prepared.overallStatus === "pass" &&
-    prepared.initialState === "pristine" && prepared.beforeAfterComparison === "match" &&
-    prepared.providerInitialAcl?.status === "match", "EXTERNAL_FIXTURE_PREPARED_PREFLIGHT_FAILED");
+  assertPreparedPreflightResult(context, prepared);
+  });
 
-  await withClient(context, clientFactory, managerCredentials,
-    (client) => transferPreparedOwnerWithManager(context, client, configuration.database));
-  const { identityAuthority } = await runPreMutationSessionIdentityBoundary({
+  await runPostflightSubphase(context, "TRANSFER_PREPARATION", () => withClient(context, clientFactory, managerCredentials,
+    (client) => transferPreparedOwnerWithManager(context, client, configuration.database)));
+  const { identityAuthority } = await runPostflightSubphase(context, "OWNER_PREPARATION", () => runPreMutationSessionIdentityBoundary({
     context, clientFactory, credentials: ownerCredentials, expectedSessionRole: PREPARED_FIXTURE_OWNER,
     async operation(client) {
+      await runPostflightSubphase(context, "OWNER_IDENTITY", async () => {
       const result = await client.query(`SELECT r.rolsuper AS superuser, r.rolcreaterole AS create_role,
         d.datdba = r.oid AS owns_database, n.nspowner = 'pg_database_owner'::regrole AS native_schema_owner
         FROM pg_catalog.pg_roles r CROSS JOIN pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_namespace n
@@ -7753,33 +8019,46 @@ async function verifyPreparedOwnerThroughEntrypoint(context, clientFactory, conf
         result.rows[0].superuser === false && result.rows[0].create_role === false &&
         result.rows[0].owns_database === true && result.rows[0].native_schema_owner === true,
       "EXTERNAL_FIXTURE_PREPARED_OWNER_AUTHORITY_INVALID");
-      await client.query("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
-      await applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT);
-      await assertMigrationLedger(client, EXPECTED_MIGRATION_COUNT);
+      });
+      await runPostflightSubphase(context, "OWNER_DEFAULT_ACL", () => client.query("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"));
+      await runPostflightSubphase(context, "OWNER_MIGRATION", () => applyMigrationCount(context, client, EXPECTED_MIGRATION_COUNT));
+      await runPostflightSubphase(context, "OWNER_LEDGER", () => assertMigrationLedger(client, EXPECTED_MIGRATION_COUNT));
     },
-  });
-  await withClient(context, clientFactory, managerCredentials, async (client) => {
-    await preparedManagerIdentity(client, configuration.database, PREPARED_FIXTURE_OWNER);
-    await assertPreparedAutomaticMembership(client);
+  }));
+  await runPostflightSubphase(context, "RUNTIME_PREPARATION", () => withClient(context, clientFactory, managerCredentials, async (client) => {
+    await runPostflightSubphase(context, "RUNTIME_IDENTITY", () => preparedManagerIdentity(client, configuration.database, PREPARED_FIXTURE_OWNER));
+    await runPostflightSubphase(context, "RUNTIME_MEMBERSHIP", () => assertPreparedAutomaticMembership(client));
     await withPreparedTransaction(context, client, async () => {
-      await client.query(`CREATE ROLE ${quoteIdentifier(RUNTIME_ROLE)}
-        LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${RUNTIME_PASSWORD}'`);
-      await client.query(`ALTER ROLE ${quoteIdentifier(RUNTIME_ROLE)} SET search_path = public, pg_temp`);
-      await assertPreparedAutomaticMembership(client, RUNTIME_ROLE);
+      await runPostflightSubphase(context, "RUNTIME_CREATE", () => client.query(`CREATE ROLE ${quoteIdentifier(RUNTIME_ROLE)}
+        LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${RUNTIME_PASSWORD}'`));
+      await runPostflightSubphase(context, "RUNTIME_SETTINGS", () => client.query(`ALTER ROLE ${quoteIdentifier(RUNTIME_ROLE)} SET search_path = public, pg_temp`));
+      await runPostflightSubphase(context, "RUNTIME_MEMBERSHIP", () => assertPreparedAutomaticMembership(client, RUNTIME_ROLE));
     });
-  });
-  await withClient(context, clientFactory, ownerCredentials, async (client) => {
+  }));
+  await runPostflightSubphase(context, "RUNTIME_ACL", () => withClient(context, clientFactory, ownerCredentials, async (client) => {
     await observeSessionIdentity(client, requireOriginalObservedSessionIdentity(identityAuthority, identityAuthority.observedSessionIdentity),
       "EXTERNAL_FIXTURE_PREPARED_OWNER_IDENTITY_INVALID");
     await configureRuntimeAcl(client, ownerConfiguration, true);
     await verifyProviderBootstrapPreserved(client);
-  });
+  }));
   const postflight = () => runPostflight(context, clientFactory, ownerConfiguration);
+  await runPostflightSubphase(context, "PREPARED_POSTFLIGHT", async () => {
   const final = await postflight();
+  observePostflightFormalResult(context, final.report);
   requireHarness(final.report.exitCode === 0, "EXTERNAL_FIXTURE_PREPARED_POSTFLIGHT_FAILED");
-  await verifyRuntimeAuthSynchronization(context, clientFactory, ownerConfiguration, identityAuthority, postflight);
+  });
+  await runPostflightSubphase(context, "PREPARED_AUTH_SYNC", () => verifyRuntimeAuthSynchronization(context, clientFactory, ownerConfiguration, identityAuthority, postflight));
   return true;
+  });
 }
+
+function assertPreparedPreflightResult(context, prepared) {
+  observePostflightFormalResult(context, prepared);
+  requireHarness(prepared.exitCode === 0 && prepared.overallStatus === "pass" &&
+    prepared.initialState === "pristine" && prepared.beforeAfterComparison === "match" &&
+    prepared.providerInitialAcl?.status === "match", "EXTERNAL_FIXTURE_PREPARED_PREFLIGHT_FAILED");
+}
+
 
 export async function runPreparedOwnerCreationProbeForTests({ client, deadlineLimits, scenario = "creation" }) {
   requireHarness(["creation", "transfer"].includes(scenario), "EXTERNAL_FIXTURE_PREPARED_PROBE_INVALID");
@@ -7796,7 +8075,10 @@ export async function runPreparedOwnerCreationProbeForTests({ client, deadlineLi
     output: failure === null ? "" : externalFixtureFailureOutput(failure) });
 }
 
-export async function runRuntimeAuthSynchronizationProbeForTests(options) {
+/** @param {"LEGACY" | "PREPARED" | null} [diagnosticPath] */
+export async function runRuntimeAuthSynchronizationProbeForTests(options, diagnosticPath = null) {
+  requireHarness(diagnosticPath === null || diagnosticPath === "LEGACY" || diagnosticPath === "PREPARED",
+    "EXTERNAL_FIXTURE_RUNTIME_AUTH_PROBE_INVALID");
   requireHarness(exactOwnKeys(options, ["clientFactory", "postflight", "deadlineLimits"]) &&
     typeof options.clientFactory === "function" && typeof options.postflight === "function",
   "EXTERNAL_FIXTURE_RUNTIME_AUTH_PROBE_INVALID");
@@ -7805,10 +8087,12 @@ export async function runRuntimeAuthSynchronizationProbeForTests(options) {
   let completed = false;
   let failure = null;
   try {
-    completed = await verifyRuntimeAuthSynchronization(context, options.clientFactory,
+    const operation = () => verifyRuntimeAuthSynchronization(context, options.clientFactory,
       Object.freeze({ host: "127.0.0.1", port: 5432, database: "actustube_ci_fixture",
         role: "actustube_ci_fixture", password: "fixed_test_only_password" }),
       createObservedSessionIdentityAuthority(observed), options.postflight);
+    completed = await (diagnosticPath === null ? operation() : withPostflightDiagnostics(context, () =>
+      runPostflightSubphase(context, diagnosticPath === "LEGACY" ? "LEGACY_AUTH_SYNC" : "PREPARED_AUTH_SYNC", operation)));
   } catch (error) { failure = error; }
   return Object.freeze({ completed, timedOut: context.timedOut,
     activeClientCount: context.activeClients.size,
@@ -9005,6 +9289,7 @@ async function runConnectionOnlyHarnessWithinContext(options, context) {
   });
 
   await runPostflightDriftPhase(context, async () => {
+    await runPostflightSubphase(context, "DRIFT_CHECK", async () => {
     await withClient(
       context,
       resolvedClientFactory,
@@ -9019,26 +9304,30 @@ async function runConnectionOnlyHarnessWithinContext(options, context) {
       resolvedClientFactory,
       configuration
     );
+    observePostflightFormalResult(context, postflightDrift.report, "TABLE_SET_MISMATCH");
     requireHarness(
       postflightDrift.report.exitCode === 1 &&
         postflightDrift.report.failure?.checkId === "TABLE_SET_MISMATCH",
       "EXTERNAL_FIXTURE_POSTFLIGHT_DRIFT_NOT_REJECTED"
     );
-    await withClient(
+    });
+    await runPostflightSubphase(context, "DRIFT_RESTORE", () => withClient(
       context,
       resolvedClientFactory,
       fixtureCredentials(configuration),
       (client) => client.query("DROP TABLE public.external_fixture_postflight_drift")
-    );
+    ), true);
     // Required, awaited production path; a fake probe or static catalog PASS is
     // not a substitute for the non-owner runtime's actual function calls.
-    await verifyRuntimeAuthSynchronization(
+    await runPostflightSubphase(context, "LEGACY_AUTH_SYNC", () => verifyRuntimeAuthSynchronization(
       context, resolvedClientFactory, configuration, identityAuthority,
       () => runPostflight(context, resolvedClientFactory, configuration)
-    );
+    ));
+    await runPostflightSubphase(context, "PROVIDER_PRESERVATION", async () => {
     requireHarness(providerBootstrapVerified === true &&
       await withClient(context, resolvedClientFactory, fixtureCredentials(configuration), verifyProviderBootstrapPreserved),
     "EXTERNAL_FIXTURE_PROVIDER_BOOTSTRAP_PRESERVATION_FAILED");
+    });
     requireHarness(await verifyPreparedOwnerThroughEntrypoint(context, resolvedClientFactory, configuration, specification, extensions) === true,
       "EXTERNAL_FIXTURE_PREPARED_BOOTSTRAP_FAILED");
   });
@@ -9960,6 +10249,56 @@ export function harnessAuthorityBoundaryForTests() {
     fixtureOwner: "github_actions_service_container",
     connectionInputs: Object.freeze(Object.values(FIXTURE_KEYS)),
   });
+}
+
+// Fixed test-only entry into the same diagnostic scope and real owned-client /
+// transaction orchestration. No caller SQL, credentials or production options.
+/** @param {{ client?: object, clientFactory?: () => object, scenario?: string, report?: unknown,
+ * deadlineLimits?: { [K in keyof typeof HARNESS_DEADLINE_LIMITS]?: number }, diagnosticFault?: unknown }} options */
+export async function runPostflightSubphaseProbeForTests({
+  client, clientFactory, scenario = "creation", report, deadlineLimits, diagnosticFault = null,
+}) {
+  requireHarness(["creation", "transfer", "formal", "formal-entrypoint", "direct", "pooled"].includes(scenario),
+    "EXTERNAL_FIXTURE_PREPARED_PROBE_INVALID");
+  const context = createDeadlineContext(deadlineLimits);
+  let completed = false;
+  let failure = null;
+  EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.add(context);
+  try {
+    await runPostflightDriftPhase(context, () => runPreparedBootstrapDiagnostics(context, async () => {
+      if (scenario === "formal-entrypoint") {
+        await runPostflightSubphase(context, "PREPARED_PREFLIGHT", async () => {
+          const output = [];
+          const result = await executeStagingDatabasePreflight({
+            environment: preflightEnvironment({ rawUrl:
+              "postgresql://actustube_ci_fixture:fixed_probe_only@127.0.0.1:5432/actustube_ci_fixture" }, fixedExpectedExtensionInventory()),
+            repositoryRoot, allowLoopback: true,
+            adapter: createAdapter(context, clientFactory, () => ({})),
+            onQuery: assertReadOnlySql, stdout(line) { output.push(line); },
+          });
+          assertPreparedPreflightResult(context, result);
+        });
+      } else if (scenario === "formal") {
+        await runPostflightSubphase(context, "PREPARED_PREFLIGHT", () => assertPreparedPreflightResult(context, report));
+      } else if (scenario === "direct" || scenario === "pooled") {
+        await runPostflightSubphase(context, "PREPARED_PREFLIGHT", async () => {
+          const connection = await createAdapter(context, () => client, () => ({})).connect(scenario);
+          await connection.close();
+        });
+      } else {
+        await runPostflightSubphase(context, scenario === "creation" ? "OWNER_CREATION" : "TRANSFER_PREPARATION", () =>
+          withClient(context, () => client, {}, (ownedClient) => scenario === "creation"
+            ? createPreparedOwnerWithManager(context, ownedClient, "actustube_ci_fixture")
+            : transferPreparedOwnerWithManager(context, ownedClient, "actustube_ci_fixture")));
+      }
+    }));
+    completed = true;
+  } catch (error) { failure = error; }
+  finally { EXTERNAL_FIXTURE_OBSERVABILITY_CONTEXTS.delete(context); }
+  // Corruption controls exercise the actual output projector, not a test copy.
+  if (failure !== null && diagnosticFault !== null) POSTFLIGHT_DIAGNOSTIC_FAILURES.set(failure, diagnosticFault);
+  return Object.freeze({ completed, timedOut: context.timedOut, activeClientCount: context.activeClients.size,
+    output: failure === null ? "" : externalFixtureFailureOutput(failure) });
 }
 
 function normalizedInvocationPath(value) {

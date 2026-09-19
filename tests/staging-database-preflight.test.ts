@@ -37,6 +37,7 @@ import {
   runMigrationOwnerBoundaryProbeForTests,
   runOwnershipCanonicalizationProbeForTests,
   runPreparedOwnerCreationProbeForTests,
+  runPostflightSubphaseProbeForTests,
   runReservationConcurrencySetupDiagnosticOutputProbeForTests,
   runReservationConcurrencySetupObservabilityProbeForTests,
   runReservationSetupTransactionPrimaryProbeForTests,
@@ -719,7 +720,7 @@ function createRuntimeAuthFake(fault = "none") {
           expect(role).toBe(ownerRole);
           expect(values).toEqual([]);
           state.acl.push(key);
-          if (fault === "acl-rejection") throw new Error("fixed-private-auth-error");
+          if (fault === "acl-rejection" || (fault === "restore-rejection" && aclIndex === 3)) throw new Error("fixed-private-auth-error");
           if (aclIndex < 2) state.insert = aclIndex === 1;
           else state.update = aclIndex === 2;
           return { rows: [] };
@@ -800,6 +801,45 @@ function createRuntimeAuthFake(fault = "none") {
 }
 
 describe("formal runtime auth synchronization fixture", () => {
+  it("postflight subphase diagnostics freeze last success before an early cleanup query latch", async () => {
+    const fake = createRuntimeAuthFake("restore-rejection");
+    const result = await runRuntimeAuthSynchronizationProbeForTests({
+      clientFactory: fake.clientFactory, postflight: fake.postflight, deadlineLimits: undefined,
+    }, "LEGACY");
+    expect(result.completed).toBe(false); expect(result.activeClientCount).toBe(0);
+    const lines = result.output.trimEnd().split("\n"); expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0])).toEqual({ schema: "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1", path: "LEGACY",
+      lastSuccessfulSubphase: "AUTH_POSTFLIGHT", primaryObservation: "NOT_OBSERVED", primary: null,
+      cleanup: { status: "FAILED", failure: { subphase: "AUTH_ACL_RESTORE", classification: "QUERY_REJECTED", publicCode: "UNCLASSIFIED" } } });
+    expect(fake.state.postflightCalls).toBe(3); expect(fake.state.syncCalls).toBe(4);
+    expect(fake.state.clients).toHaveLength(6); expect(fake.state.clients.every((client) => client.end === 1 && client.destroy === 0)).toBe(true);
+    expect(fake.state.update).toBe(true); expect(result.output).not.toContain("fixed-private-auth-error");
+  });
+  it.each(["LEGACY", "PREPARED"] as const)("postflight subphase diagnostics distinguish %s auth failure after identical shared operations", async (path) => {
+    const fake = createRuntimeAuthFake("runtime-identity-rejection");
+    const result = await runRuntimeAuthSynchronizationProbeForTests({
+      clientFactory: fake.clientFactory, postflight: fake.postflight, deadlineLimits: undefined,
+    }, path);
+    expect(result.completed).toBe(false); expect(result.activeClientCount).toBe(0);
+    const lines = result.output.trimEnd().split("\n"); expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0])).toEqual({ schema: "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1", path,
+      primaryObservation: "OBSERVED",
+      lastSuccessfulSubphase: "AUTH_POSTFLIGHT", primary: { subphase: "AUTH_EXECUTION", classification: "QUERY_REJECTED", publicCode: "UNCLASSIFIED" },
+      cleanup: { status: "SUCCEEDED", failure: null } });
+    expect(fake.state.syncCalls).toBe(0); expect(fake.state.postflightCalls).toBe(2);
+    expect(fake.state.insert).toBe(true); expect(fake.state.update).toBe(false);
+    expect(result.output).not.toContain("fixed-private-auth-error");
+  });
+  it.each(["LEGACY", "PREPARED"] as const)("postflight subphase diagnostics do not mistake expected auth negatives for primary failure: %s", async (path) => {
+    const fake = createRuntimeAuthFake();
+    const result = await runRuntimeAuthSynchronizationProbeForTests({
+      clientFactory: fake.clientFactory, postflight: fake.postflight, deadlineLimits: undefined,
+    }, path);
+    expect(result.completed).toBe(true); expect(result.output).toBe("");
+    expect(fake.state.syncCalls).toBe(4); expect(fake.state.postflightCalls).toBe(4);
+    expect(fake.state.clients).toHaveLength(6);
+    expect(fake.state.clients.every((client) => client.end === 1 && client.destroy === 0)).toBe(true);
+  });
   it("executes old ACL rejection, new auth and re-sync, manual assignment preservation, exact postflight and rollback", async () => {
     const fake = createRuntimeAuthFake();
     const result = await runRuntimeAuthSynchronizationProbeForTests({
@@ -879,8 +919,8 @@ describe("formal runtime auth synchronization fixture", () => {
     const source = await readFile(resolve(repositoryRoot, "scripts/test-staging-database-preflight-postgres.mjs"), "utf8");
     const main = sourceSection(source, "async function runConnectionOnlyHarnessWithinContext(options, context)",
       "export async function runConnectionOnlyHarness(options = {})");
-    expect(main).toMatch(/await verifyRuntimeAuthSynchronization\(\s*context, resolvedClientFactory, configuration, identityAuthority,\s*\(\) => runPostflight\(context, resolvedClientFactory, configuration\)\s*\);/);
-    expect(main.indexOf("await verifyRuntimeAuthSynchronization(")).toBeLessThan(main.indexOf("return publicSuccessResult()"));
+    expect(main).toMatch(/await runPostflightSubphase\(context, "LEGACY_AUTH_SYNC", \(\) => verifyRuntimeAuthSynchronization\(\s*context, resolvedClientFactory, configuration, identityAuthority,\s*\(\) => runPostflight\(context, resolvedClientFactory, configuration\)\s*\)\);/);
+    expect(main.indexOf('await runPostflightSubphase(context, "LEGACY_AUTH_SYNC"')).toBeLessThan(main.indexOf("return publicSuccessResult()"));
     const workflow = await readFile(resolve(repositoryRoot, ".github/workflows/staging-database-preflight.yml"), "utf8");
     expect(workflow).toContain("node scripts/test-staging-database-preflight-postgres.mjs");
     expect(workflow).toContain("Run external disposable PostgreSQL verifier");
@@ -1827,12 +1867,13 @@ describe("prepared owner real-login orchestration boundary", () => {
   const grantOracle = 'GRANT "actustube_staging_prepared_owner" TO neondb_owner WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY neondb_owner';
   const transferOracle = 'ALTER DATABASE "actustube_ci_fixture" OWNER TO "actustube_staging_prepared_owner"';
   const revokeOracle = 'REVOKE "actustube_staging_prepared_owner" FROM neondb_owner GRANTED BY neondb_owner';
-  function fixture(fault = "none", transfer = false) {
+  function fixture(fault = "none", transfer = false, failure: unknown = new Error(fakeSecret)) {
     const log: string[] = []; let created = transfer; let temporary = false;
     const state = { connect: 0, end: 0, destroy: 0, mutations: 0 };
     const client = {
       connection: { stream: { destroy() { state.destroy += 1; } } },
-      async connect() { state.connect += 1; }, async end() { state.end += 1; },
+      async connect() { state.connect += 1; if (fault === "connect-reject") throw failure; },
+      async end() { state.end += 1; if (["close-reject", "primary-close-reject"].includes(fault)) throw failure; },
       async query(sql: string, values: unknown[] = []) {
         const key = authSqlOracleKey(sql); log.push(key);
         if (key === authSqlOracleKey(authIdentitySqlOracle)) {
@@ -1850,7 +1891,7 @@ describe("prepared owner real-login orchestration boundary", () => {
         if (key === authSqlOracleKey(createOracle)) {
           expect(values).toEqual([]); expect(log.at(-2)).toBe("BEGIN");
           state.mutations += 1;
-          if (fault === "create-reject" || fault === "rollback-reject") throw new Error(fakeSecret);
+          if (["create-reject", "rollback-reject", "primary-close-reject"].includes(fault)) throw failure;
           created = true; return { rows: [] };
         }
         if (key === authSqlOracleKey(membershipOracle)) {
@@ -1948,16 +1989,222 @@ describe("prepared owner real-login orchestration boundary", () => {
       expect(f.state).toEqual({ connect: 1, end: 0, destroy: 1, mutations: 0 }); expect(vi.getTimerCount()).toBe(0);
     } finally { vi.useRealTimers(); }
   });
+  const diagnosticMarker = "EXTERNAL_FIXTURE_VERIFICATION_FAILED_PHASE_POSTFLIGHT_DRIFT";
+  function diagnosticOutput(result: { completed: boolean; output: string }) {
+    expect(result.completed).toBe(false);
+    const lines = result.output.trimEnd().split("\n");
+    expect(lines).toHaveLength(2); expect(lines[1]).toBe(diagnosticMarker);
+    const diagnostic = JSON.parse(lines[0]);
+    expect(Object.keys(diagnostic).sort()).toEqual(["cleanup", "lastSuccessfulSubphase", "path", "primary", "primaryObservation", "schema"]);
+    expect(diagnostic.schema).toBe("EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1");
+    expect(diagnostic.path).toBe("PREPARED");
+    expect(diagnostic.primaryObservation).toBe(diagnostic.primary === null ? "NOT_OBSERVED" : "OBSERVED");
+    expect(result.output).not.toContain(fakeSecret);
+    expect(result.output).not.toContain("neondb_owner");
+    expect(result.output).not.toContain("actustube_staging_prepared_owner");
+    return diagnostic;
+  }
+  it.each([
+    ["identity", "MANAGER_IDENTITY", "ASSERTION_REJECTED", "MANAGER_CONNECT", 0],
+    ["identity-rejection", "MANAGER_IDENTITY", "QUERY_REJECTED", "MANAGER_CONNECT", 0],
+    ["create-reject", "OWNER_CREATE", "QUERY_REJECTED", "MANAGER_IDENTITY", 1],
+    ["wrong-grantor", "OWNER_MEMBERSHIP", "ASSERTION_REJECTED", "OWNER_CREATE", 1],
+    ["commit-reject", "OWNER_CREATION", "QUERY_REJECTED", "OWNER_MEMBERSHIP", 1],
+  ])("postflight subphase diagnostics preserve first failure and no later work: %s", async (fault, subphase, classification, last, mutations) => {
+    if (typeof fault !== "string") throw new Error("invalid static test case");
+    const f = fixture(fault);
+    const result = await runPostflightSubphaseProbeForTests({ client: f.client });
+    expect(diagnosticOutput(result)).toEqual({
+      schema: "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1", path: "PREPARED", lastSuccessfulSubphase: last,
+      primaryObservation: "OBSERVED",
+      primary: { subphase, classification, publicCode: "UNCLASSIFIED" },
+      cleanup: { status: "SUCCEEDED", failure: null },
+    });
+    expect(f.state).toEqual({ connect: 1, end: 1, destroy: 0, mutations });
+    expect(result.activeClientCount).toBe(0);
+    if (mutations === 0) expect(f.log).not.toContain("BEGIN");
+    if (fault === "create-reject") expect(f.log).not.toContain(authSqlOracleKey(membershipOracle));
+    if (fault !== "commit-reject") expect(f.log).not.toContain("COMMIT");
+  });
+  it.each([
+    ["rollback-reject", "OWNER_CREATE", "TRANSACTION_ROLLBACK", "QUERY_REJECTED"],
+    ["primary-close-reject", "OWNER_CREATE", "CLIENT_CLOSE", "CLOSE_REJECTED"],
+    ["close-reject", null, "CLIENT_CLOSE", "CLOSE_REJECTED"],
+  ])("postflight subphase diagnostics distinguish cleanup-only and dual failure: %s", async (fault, primary, cleanup, classification) => {
+    if (typeof fault !== "string") throw new Error("invalid static test case");
+    const f = fixture(fault);
+    const result = await runPostflightSubphaseProbeForTests({ client: f.client });
+    const diagnostic = diagnosticOutput(result);
+    expect(diagnostic.primary).toEqual(primary === null ? null : { subphase: primary, classification: "QUERY_REJECTED", publicCode: "UNCLASSIFIED" });
+    expect(diagnostic.cleanup).toEqual({ status: "FAILED", failure: { subphase: cleanup, classification, publicCode: "UNCLASSIFIED" } });
+    expect(diagnostic.lastSuccessfulSubphase).toBe(primary === null ? "OWNER_MEMBERSHIP" : "MANAGER_IDENTITY");
+    expect(f.state.end).toBe(1); expect(result.activeClientCount).toBe(0);
+    expect(f.log.filter((sql) => sql === "ROLLBACK")).toHaveLength(primary === null ? 0 : 1);
+  });
+  it.each(["direct", "pooled"])("postflight subphase diagnostics distinguish actual %s adapter connect", async (scenario) => {
+    const f = fixture("connect-reject");
+    const result = await runPostflightSubphaseProbeForTests({ client: f.client, scenario });
+    expect(diagnosticOutput(result).primary).toEqual({ subphase: scenario === "direct" ? "OWNER_DIRECT_CONNECT" : "OWNER_POOLED_CONNECT",
+      classification: "CONNECTION_REJECTED", publicCode: "UNCLASSIFIED" });
+    expect(f.state).toEqual({ connect: 1, end: 1, destroy: 0, mutations: 0 });
+    expect(f.log).toEqual([]);
+  });
+  it.each([
+    ["wrong-temporary-grantor", "TRANSFER_MEMBERSHIP", "TRANSFER_SET", "ASSERTION_REJECTED"],
+    ["revoke-reject", "TRANSFER_REVOKE", "TRANSFER_OWNER", "QUERY_REJECTED"],
+    ["revoke-residue", "TRANSFER_MEMBERSHIP", "TRANSFER_REVOKE", "ASSERTION_REJECTED"],
+  ])("postflight subphase diagnostics preserve exact transfer boundary: %s", async (fault, subphase, last, classification) => {
+    const f = fixture(fault, true);
+    const result = await runPostflightSubphaseProbeForTests({ client: f.client, scenario: "transfer" });
+    const diagnostic = diagnosticOutput(result);
+    expect(diagnostic.primary).toEqual({ subphase, classification, publicCode: "UNCLASSIFIED" });
+    expect(diagnostic.lastSuccessfulSubphase).toBe(last);
+    expect(f.log.at(-1)).toBe("ROLLBACK"); expect(f.log).not.toContain("COMMIT");
+    if (fault === "wrong-temporary-grantor") expect(f.log).not.toContain(transferOracle);
+  });
+  it("postflight subphase diagnostics retain timeout with no query after destruction or pending timers", async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture("identity-timeout");
+      const running = runPostflightSubphaseProbeForTests({ client: f.client, deadlineLimits: { totalMilliseconds: 1000, queryMilliseconds: 10 } });
+      await vi.advanceTimersByTimeAsync(11);
+      const result = await running;
+      expect(diagnosticOutput(result).primary).toEqual({ subphase: "MANAGER_IDENTITY", classification: "TIMEOUT", publicCode: "UNCLASSIFIED" });
+      expect(diagnosticOutput(result).cleanup).toEqual({ status: "NOT_RUN", failure: null });
+      expect(result.timedOut).toBe(true); expect(result.activeClientCount).toBe(0);
+      expect(f.state).toEqual({ connect: 1, end: 0, destroy: 1, mutations: 0 });
+      expect(f.log).toEqual([authSqlOracleKey(authIdentitySqlOracle)]); expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it("postflight subphase diagnostics preserve successful real transaction without emitting a diagnostic", async () => {
+    const f = fixture();
+    const result = await runPostflightSubphaseProbeForTests({ client: f.client });
+    expect(result).toEqual({ completed: true, timedOut: false, activeClientCount: 0, output: "" });
+    expect(f.log).toEqual([authIdentitySqlOracle, managerOracle, "BEGIN", createOracle, membershipOracle, "COMMIT"].map(authSqlOracleKey));
+    expect(f.state).toEqual({ connect: 1, end: 1, destroy: 0, mutations: 1 });
+  });
+  it.each([
+    { code: "USER_DEFINED_OBJECT_PRESENT", exitCode: 1, status: "fail", classification: "FORMAL_REJECTION", publicCode: "USER_DEFINED_OBJECT_PRESENT" },
+    { code: "USER_DEFINED_OBJECTS_PRESENT", exitCode: 1, status: "fail", classification: "RESULT_UNCLASSIFIED", publicCode: "UNCLASSIFIED" },
+    { code: "UNCLASSIFIED", exitCode: 1, status: "fail", classification: "RESULT_UNCLASSIFIED", publicCode: "UNCLASSIFIED" },
+    { code: "PREPARED_OWNER_AUTHORITY_MISMATCH", exitCode: 1, status: "fail", classification: "FORMAL_REJECTION", publicCode: "PREPARED_OWNER_AUTHORITY_MISMATCH" },
+    { code: "PREPARED_OWNER_INVENTORY_INVALID", exitCode: 3, status: "not_verified", classification: "FORMAL_REJECTION", publicCode: "PREPARED_OWNER_INVENTORY_INVALID" },
+    { code: fakeSecret, exitCode: 1, status: "fail", classification: "RESULT_UNCLASSIFIED", publicCode: "UNCLASSIFIED" },
+    { code: "prepared_owner_authority_mismatch", exitCode: 1, status: "fail", classification: "RESULT_UNCLASSIFIED", publicCode: "UNCLASSIFIED" },
+  ])("postflight subphase diagnostics project only exact public result codes %#", async ({ code, exitCode, status, classification, publicCode }) => {
+    const result = await runPostflightSubphaseProbeForTests({ scenario: "formal", report: { exitCode, failure: { checkId: code, status, message: fakeSecret, cause: fakeSecret } } });
+    expect(diagnosticOutput(result).primary).toEqual({ subphase: "PREPARED_PREFLIGHT", classification, publicCode });
+  });
+  it.each([
+    { name: "query and close", queryRejects: true, rollbackRejects: false, closeRejects: true },
+    { name: "query and rollback", queryRejects: true, rollbackRejects: true, closeRejects: false },
+    { name: "unobserved core validation and rollback", queryRejects: false, rollbackRejects: true, closeRejects: false },
+  ])("postflight subphase diagnostics use the actual formal entrypoint: $name", async ({ queryRejects, rollbackRejects, closeRejects }) => {
+    const clients: { queries: string[]; connect: number; end: number; destroy: number }[] = [];
+    const clientFactory = () => {
+      const state = { queries: [] as string[], connect: 0, end: 0, destroy: 0 }; clients.push(state);
+      return {
+        connection: { stream: { destroy() { state.destroy += 1; } } },
+        async connect() { state.connect += 1; },
+        async end() { state.end += 1; if (closeRejects) throw new Error(fakeSecret); },
+        async query(sql: string) {
+          state.queries.push(sql);
+          if (sql === "ROLLBACK") { if (rollbackRejects) throw new Error(fakeSecret); return { rows: [] }; }
+          if (sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") return { rows: [] };
+          if (queryRejects) throw Object.assign(new Error(fakeSecret), { code: "42501" });
+          // With no query rejection, this deliberately fails the formal core's
+          // transaction_read_only oracle. Its code is then replaced by cleanup
+          // failure inside core: this is NOT a successful-main/cleanup-only case.
+          return { rows: [] };
+        },
+      };
+    };
+    const result = await runPostflightSubphaseProbeForTests({ scenario: "formal-entrypoint", clientFactory });
+    const diagnostic = diagnosticOutput(result);
+    expect(diagnostic.primary).toEqual(queryRejects ? { subphase: "PREPARED_PREFLIGHT", classification: "INSUFFICIENT_PRIVILEGE", publicCode: "UNCLASSIFIED" } : null);
+    expect(diagnostic.primaryObservation).toBe(queryRejects ? "OBSERVED" : "NOT_OBSERVED");
+    expect(diagnostic.cleanup).toEqual({ status: "FAILED", failure: { subphase: rollbackRejects ? "FORMAL_ROLLBACK" : "CLIENT_CLOSE",
+      classification: rollbackRejects ? "QUERY_REJECTED" : "CLOSE_REJECTED", publicCode: "UNCLASSIFIED" } });
+    expect(clients.length).toBeGreaterThan(0);
+    for (const client of clients) {
+      expect(client.queries.at(-1)).toBe("ROLLBACK"); expect(client.connect).toBe(1); expect(client.end).toBe(1);
+      expect(client.queries.every((sql) => !/^(CREATE|ALTER|GRANT|REVOKE|DROP)/.test(sql.trim()))).toBe(true);
+    }
+    expect(result.activeClientCount).toBe(0);
+  });
+  it.each([null, {}, { exitCode: "1", failure: null }, { exitCode: 1, failure: { checkId: null, status: "fail" } },
+    { get exitCode() { throw new Error(fakeSecret); } },
+    new Proxy({}, { getOwnPropertyDescriptor() { throw new Error(fakeSecret); } }),
+  ])("postflight subphase diagnostics fail safely on malformed formal result %#", async (report) => {
+    const result = await runPostflightSubphaseProbeForTests({ scenario: "formal", report });
+    expect(diagnosticOutput(result).primary).toEqual({ subphase: "PREPARED_PREFLIGHT", classification: "RESULT_UNCLASSIFIED", publicCode: "UNCLASSIFIED" });
+  });
+  it.each([
+    { code: "42501", classification: "INSUFFICIENT_PRIVILEGE" },
+    { code: "2BP01", classification: "DEPENDENT_OBJECTS" },
+    { code: fakeSecret, classification: "QUERY_REJECTED" },
+  ])("postflight subphase diagnostics never serialize raw structured error fields %#", async ({ code, classification }) => {
+    const failure = { code, message: fakeSecret, stack: fakeSecret, cause: fakeSecret, toJSON() { throw new Error(fakeSecret); } };
+    const f = fixture("create-reject", false, failure);
+    const result = await runPostflightSubphaseProbeForTests({ client: f.client });
+    expect(diagnosticOutput(result).primary).toEqual({ subphase: "OWNER_CREATE", classification, publicCode: "UNCLASSIFIED" });
+  });
+  it("postflight subphase diagnostics do not invoke error getters or raw serialization", async () => {
+    const getter = vi.fn(() => { throw new Error(fakeSecret); });
+    const failure = Object.create(null);
+    for (const key of ["code", "message", "stack", "cause", "toJSON"]) Object.defineProperty(failure, key, { get: getter });
+    const f = fixture("create-reject", false, failure);
+    const result = await runPostflightSubphaseProbeForTests({ client: f.client });
+    expect(diagnosticOutput(result).primary.classification).toBe("QUERY_REJECTED");
+    expect(getter).not.toHaveBeenCalled();
+  });
+  it("postflight subphase diagnostics redact URL credential role SQL and hostile error proxies", async () => {
+    const privateValues = [directUrl, fakeSecret, "fixed_private_role", "SELECT fixed_private_column FROM fixed_private_relation"];
+    const failure = { message: privateValues[0], stack: privateValues[1], cause: privateValues[2], code: privateValues[3] };
+    const proxy = new Proxy(failure, { getOwnPropertyDescriptor() { throw new Error(privateValues.join(" ")); } });
+    for (const error of [failure, proxy]) {
+      const f = fixture("create-reject", false, error);
+      const result = await runPostflightSubphaseProbeForTests({ client: f.client });
+      expect(diagnosticOutput(result).primary).toEqual({ subphase: "OWNER_CREATE",
+        classification: error === proxy ? "UNCLASSIFIED" : "QUERY_REJECTED", publicCode: "UNCLASSIFIED" });
+      for (const value of privateValues) expect(result.output).not.toContain(value);
+    }
+  });
+  it("postflight subphase diagnostics serialize a fresh projection without inherited toJSON or field getters", async () => {
+    const serialize = vi.fn(() => directUrl);
+    const diagnostic = Object.assign(Object.create({ toJSON: serialize }), {
+      schema: "EXTERNAL_FIXTURE_POSTFLIGHT_DIAGNOSTIC_V1", path: "PREPARED", lastSuccessfulSubphase: "NONE",
+      primaryObservation: "OBSERVED",
+      primary: { subphase: "OWNER_CREATE", classification: "UNCLASSIFIED", publicCode: "UNCLASSIFIED" },
+      cleanup: { status: "NOT_RUN", failure: null },
+    });
+    const f = fixture("create-reject");
+    const result = await runPostflightSubphaseProbeForTests({ client: f.client, diagnosticFault: diagnostic });
+    diagnosticOutput(result); expect(serialize).not.toHaveBeenCalled(); expect(result.output).not.toContain(directUrl);
+    const getter = vi.fn(() => directUrl);
+    Object.defineProperty(diagnostic.primary, "publicCode", { get: getter, enumerable: true });
+    const second = await runPostflightSubphaseProbeForTests({ client: fixture("create-reject").client, diagnosticFault: diagnostic });
+    expect(second.output).toBe(`${diagnosticMarker}\n`); expect(getter).not.toHaveBeenCalled();
+  });
+  it.each([{}, { schema: fakeSecret }, new Proxy({}, { ownKeys() { throw new Error(fakeSecret); } })])(
+    "postflight subphase diagnostics retain only the old safe marker if projection is corrupted %#", async (diagnosticFault) => {
+      const f = fixture("create-reject");
+      const result = await runPostflightSubphaseProbeForTests({ client: f.client, diagnosticFault });
+      expect(result.completed).toBe(false); expect(result.output).toBe(`${diagnosticMarker}\n`);
+    });
   it("awaits the separate complete prepared path before the new public success flag", async () => {
     const source = await readFile(resolve(repositoryRoot, "scripts/test-staging-database-preflight-postgres.mjs"), "utf8");
     const start = source.indexOf("async function verifyPreparedOwnerThroughEntrypoint");
     const end = source.indexOf("export async function runPreparedOwnerCreationProbeForTests", start);
     const path = source.slice(start, end);
-    const ordered = ["await reinitializeOwnedDisposableFixture", "createPreparedOwnerWithManager(context, client", "const legacy = await runFormalPreflight",
+    expect(path).toMatch(/^async function verifyPreparedOwnerThroughEntrypoint[^\n]+\{\r?\n\s*return runPreparedBootstrapDiagnostics\(context, async \(\) => \{/);
+    for (const phase of ["OWNER_PREPARATION", "OWNER_MIGRATION", "RUNTIME_PREPARATION", "RUNTIME_ACL", "PREPARED_POSTFLIGHT"])
+      expect(path).toContain(`runPostflightSubphase(context, "${phase}"`);
+    const ordered = ["() => reinitializeOwnedDisposableFixture", "createPreparedOwnerWithManager(context, client", "const legacy = await runFormalPreflight",
       'const prepared = await runFormalPreflight("neon-pg18-prepared-app-owner-v1")',
-      "transferPreparedOwnerWithManager(context, client", "const { identityAuthority } = await runPreMutationSessionIdentityBoundary",
-      "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE", "await applyMigrationCount", "await assertMigrationLedger", "CREATE ROLE", "await configureRuntimeAcl",
-      "const final = await postflight()", "await verifyRuntimeAuthSynchronization", "return true"];
+      "transferPreparedOwnerWithManager(context, client", '"OWNER_PREPARATION", () => runPreMutationSessionIdentityBoundary',
+      "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE", "() => applyMigrationCount", "() => assertMigrationLedger", "CREATE ROLE", "await configureRuntimeAcl",
+      "const final = await postflight()", "() => verifyRuntimeAuthSynchronization", "return true"];
     let previous = -1;
     for (const token of ordered) { const index = path.indexOf(token, previous + 1); expect(index, token).toBeGreaterThan(previous); previous = index; }
     const production = source.slice(source.indexOf("async function runConnectionOnlyHarnessWithinContext"), source.indexOf("export async function runConnectionOnlyHarness(options"));
@@ -9709,6 +9956,7 @@ describe("connection-only external fixture boundary", () => {
         "runMigrationOwnerBoundaryProbeForTests",
         "runOwnershipCanonicalizationProbeForTests",
         "runPreparedOwnerCreationProbeForTests",
+        "runPostflightSubphaseProbeForTests",
         "runReservationConcurrencySetupDiagnosticOutputProbeForTests",
         "runReservationConcurrencySetupObservabilityProbeForTests",
         "runReservationSetupTransactionPrimaryProbeForTests",
