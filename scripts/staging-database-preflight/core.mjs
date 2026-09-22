@@ -14,6 +14,7 @@ import {
   runQuery,
   validateMigrationTableShape,
 } from "../staging-database-postflight/core.mjs";
+import { EXPECTED_MIGRATION_TAGS } from "../staging-database-postflight/manifest.mjs";
 
 const EXPECTED_MIGRATION_OBJECTS = Object.freeze([
   "S:__drizzle_migrations_id_seq",
@@ -162,7 +163,8 @@ function validateExtensionString(value, pattern) {
 function normalizeExtensionEntries(value, invalidCode, exitCode) {
   if (
     !Array.isArray(value) ||
-    value.length > STAGING_EXTENSION_INVENTORY_LIMITS.entries
+    value.length > STAGING_EXTENSION_INVENTORY_LIMITS.entries ||
+    Array.from(value.keys()).some((index) => !Object.hasOwn(value, index))
   ) {
     throw new PostflightIssue(invalidCode, exitCode, exitCode === 1 ? "fail" : "not_verified");
   }
@@ -213,9 +215,13 @@ export function parseExpectedStagingExtensions(environment) {
   ) {
     throw new PostflightIssue("STAGING_EXTENSION_INVENTORY_INVALID", 2, "fail");
   }
+  return normalizeExpectedExtensionEntries(parsed.extensions);
+}
+
+function normalizeExpectedExtensionEntries(entries) {
   try {
     return normalizeExtensionEntries(
-      parsed.extensions,
+      entries,
       "STAGING_EXTENSION_INVENTORY_INVALID",
       2
     );
@@ -1464,11 +1470,18 @@ const SQL = Object.freeze({
   `,
 });
 
+/**
+ * @param {object} connection
+ * @param {((...args: unknown[]) => void) | undefined} [onQuery]
+ * @param {{ signal?: AbortSignal, providerProfile?: string | null,
+ *   preparedOwner?: { name: string, database: string } | null }} [options]
+ */
 async function collectPreflightEvidence(
   connection,
-  onQuery,
-  { signal, providerProfile = null, preparedOwner = null } = {}
+  onQuery = undefined,
+  options = {}
 ) {
+  const { signal, providerProfile = null, preparedOwner = null } = options;
   throwIfPreflightAborted(signal);
   const serverVersionRow = (
     await runQuery(connection, SQL.serverVersion, [], onQuery, { signal })
@@ -1574,12 +1587,16 @@ function parseProviderInitialAclProfile(environment) {
   return profile;
 }
 
+function requirePreparedOwnerName(name) {
+  requireCondition(typeof name === "string" && /^[a-z][a-z0-9_]{0,62}$/u.test(name) &&
+    /(?:^|_)staging(?:_|$)/u.test(name), "PREPARED_OWNER_INPUT_INVALID");
+}
+
 function parsePreparedOwner(environment, safety, profile) {
   const name = environment.ACTUSTUBE_EXPECTED_STAGING_PREPARED_OWNER;
   // An opt-in profile must not change the legacy strict/v1 acceptance range.
   if (profile !== PREPARED_OWNER_PROFILE) return null;
-  requireCondition(typeof name === "string" && /^[a-z][a-z0-9_]{0,62}$/u.test(name) &&
-    /(?:^|_)staging(?:_|$)/u.test(name), "PREPARED_OWNER_INPUT_INVALID");
+  requirePreparedOwnerName(name);
   requireCondition(safety.directRole === name && safety.pooledRole === name,
     "PREPARED_OWNER_IDENTITY_MISMATCH");
   return Object.freeze({ name, database: safety.directAuthority.database });
@@ -2572,6 +2589,97 @@ function validateInitialDatabaseState(
   };
 }
 
+// Pure, single-snapshot initial-state acceptance. This is NOT connection
+// authorization or formal preflight: the caller still owns target/session
+// identity, authority, read-only collection and fresh before/after comparison.
+// Accept the collector's evidence, never a caller-supplied classified summary.
+export function validatePreflightInitialEvidence(specification, evidence, expectations) {
+  try {
+    if (!isPlainOwnObject(expectations) ||
+        Reflect.ownKeys(expectations).some((key) =>
+          !["profile", "expectedExtensions", "preparedOwner"].includes(key))) {
+      throw notVerified("PREFLIGHT_UNAVAILABLE");
+    }
+    if (!Object.hasOwn(expectations, "expectedExtensions")) {
+      throw new PostflightIssue("STAGING_EXTENSION_INVENTORY_REQUIRED", 2, "fail");
+    }
+    const profile = Object.hasOwn(expectations, "profile") ? expectations.profile : null;
+    if (profile !== null) parseProviderInitialAclProfile({ ACTUSTUBE_STAGING_BOOTSTRAP_PROFILE: profile });
+    if (profile === undefined) throw verifiedFailure("PROVIDER_INITIAL_ACL_PROFILE_INVALID");
+    const preparedOwner = Object.hasOwn(expectations, "preparedOwner") ? expectations.preparedOwner : null;
+    if (profile === PREPARED_OWNER_PROFILE) {
+      if (!hasExactOwnKeys(preparedOwner, ["database", "name"]) ||
+          typeof preparedOwner.database !== "string" || preparedOwner.database.length === 0 ||
+          preparedOwner.database.length > 63 || /[\u0000-\u001f\u007f]/u.test(preparedOwner.database)) {
+        throw verifiedFailure("PREPARED_OWNER_INPUT_INVALID");
+      }
+      requirePreparedOwnerName(preparedOwner.name);
+    } else if (preparedOwner !== null) {
+      throw verifiedFailure("PREPARED_OWNER_INPUT_INVALID");
+    }
+    const keys = ["serverVersion", "identity", "roleIdentity", "extensionInventory",
+      "migrationCatalog", "migrationColumns", "migrationColumnExact", "migrationPrimaryKey",
+      "migrationHistory", "migrationExact", "userDefinedObjects",
+      ...(profile === null ? [] : ["providerInitialAcl"]),
+      ...(preparedOwner === null ? [] : ["preparedOwner"])].sort();
+    if (!hasExactOwnKeys(evidence, keys) || Reflect.ownKeys(evidence).length !== keys.length ||
+        !hasExactOwnKeys(evidence.serverVersion, ["server_version_num"]) ||
+        !Array.isArray(evidence.identity) || evidence.identity.length !== 1 ||
+        !hasExactOwnKeys(evidence.identity[0], ["database_oid", "system_identifier"]) ||
+        !Array.isArray(evidence.roleIdentity) || evidence.roleIdentity.length !== 1 ||
+        !hasExactOwnKeys(evidence.roleIdentity[0], ["role_name"]) ||
+        typeof evidence.roleIdentity[0].role_name !== "string" || evidence.roleIdentity[0].role_name.length === 0 ||
+        !hasExactOwnKeys(evidence.migrationCatalog, ["objects", "schema_exists", "table_exists"]) ||
+        !Array.isArray(evidence.migrationCatalog.objects) ||
+        !["migrationColumns", "migrationColumnExact", "migrationPrimaryKey", "migrationHistory"]
+          .every((key) => Array.isArray(evidence[key]))) {
+      throw notVerified("PREFLIGHT_UNAVAILABLE");
+    }
+    // The specification comes from loadRepositorySpecification, independently
+    // of DB evidence. Reject incomplete substitutes, including an empty set.
+    if (!Array.isArray(specification?.migrations) ||
+        specification.migrations.length !== EXPECTED_MIGRATION_TAGS.length ||
+        !EXPECTED_MIGRATION_TAGS.every((tag, index) => {
+          const entry = specification.migrations[index];
+          return Object.hasOwn(specification.migrations, index) &&
+            hasExactOwnKeys(entry, ["createdAt", "hash", "tag"]) && entry.tag === tag &&
+            typeof entry.hash === "string" && /^[a-f0-9]{64}$/u.test(entry.hash) &&
+            typeof entry.createdAt === "string" && /^[1-9][0-9]*$/u.test(entry.createdAt);
+        })) {
+      throw verifiedFailure("REPOSITORY_MIGRATION_METADATA_INVALID");
+    }
+    validatePostgresqlVersion(evidence.serverVersion);
+    validateDatabaseIdentity(evidence);
+    const expectedExtensions = normalizeExpectedExtensionEntries(expectations.expectedExtensions);
+    requireExtensionInventoryMatch(expectedExtensions, [normalizeActualStagingExtensions(evidence.extensionInventory)]);
+    if (evidence.migrationCatalog.table_exists === false &&
+        (evidence.migrationExact !== null || evidence.migrationColumns.length !== 0 ||
+         evidence.migrationColumnExact.length !== 0 || evidence.migrationPrimaryKey.length !== 0)) {
+      throw notVerified("MIGRATION_CATALOG_STATE_INVALID");
+    }
+    if (preparedOwner !== null) {
+      validatePreparedOwner([evidence.preparedOwner], preparedOwner);
+      validateRoleIdentity(evidence, preparedOwner.name, "direct");
+    }
+    // SQL count columns can be numbers or pg bigint decimal strings, never
+    // null/boolean/empty values coerced into a false zero by Number().
+    for (const key of [...USER_OBJECT_COUNT_FIELDS.map(([, field]) => field),
+      "total_count", "estimated_data_rows", "extension_unclassified_count", "extension_ambiguous_count"]) {
+      const value = evidence.userDefinedObjects?.[key];
+      if (!((typeof value === "number" && Number.isSafeInteger(value) && value >= 0) ||
+          (typeof value === "string" && /^(?:0|[1-9][0-9]*)$/u.test(value) && Number.isSafeInteger(Number(value))))) {
+        throw notVerified("USER_OBJECT_CATALOG_INVALID");
+      }
+    }
+    const summary = summarizeUserDefinedObjects(evidence.userDefinedObjects);
+    const classified = profile === null ? summary : classifyProviderInitialObjects(
+      summary, normalizeProviderInitialAcl([evidence.providerInitialAcl]), preparedOwner);
+    return validateInitialDatabaseState(specification, evidence, classified);
+  } catch (error) {
+    throw safeIssueFrom(error, "PREFLIGHT_UNAVAILABLE", 3);
+  }
+}
+
 function comparableEvidence(evidence) {
   return JSON.stringify({
     serverVersion: evidence.serverVersion,
@@ -2797,16 +2905,13 @@ export async function verifyStagingDatabasePreflight({
     report.applicationFunctions = directUserObjects.counts.routines;
     report.applicationData = directUserObjects.estimatedDataRows;
 
-    const directState = validateInitialDatabaseState(
-      specification,
-      directBefore,
-      classifyObjects(directUserObjects, directBefore, "direct")
-    );
-    validateInitialDatabaseState(
-      specification,
-      pooledBefore,
-      classifyObjects(pooledUserObjects, pooledBefore, "pooled")
-    );
+    // Preserve the report's pre-failure counts, then share the pure acceptance
+    // entry with bootstrap callers. Connection and snapshot gates stay here.
+    classifyObjects(directUserObjects, directBefore, "direct");
+    const initialExpectations = { profile: providerProfile, expectedExtensions, preparedOwner };
+    const directState = validatePreflightInitialEvidence(specification, directBefore, initialExpectations);
+    classifyObjects(pooledUserObjects, pooledBefore, "pooled");
+    validatePreflightInitialEvidence(specification, pooledBefore, initialExpectations);
     requireCondition(
       comparableEvidence(directBefore) === comparableEvidence(pooledBefore),
       "DIRECT_POOLED_STATE_MISMATCH"

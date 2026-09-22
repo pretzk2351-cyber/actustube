@@ -11,7 +11,9 @@ import {
   PREFLIGHT_SQL_FOR_TESTS,
   STAGING_EXTENSION_INVENTORY_LIMITS,
   createPreflightBaseReport,
+  collectPreflightEvidence,
   parseExpectedStagingExtensions,
+  validatePreflightInitialEvidence,
   verifyStagingDatabasePreflight,
 } from "../scripts/staging-database-preflight/core.mjs";
 import {
@@ -1689,6 +1691,195 @@ function preparedOwnerAdapter(state = preparedOwnerState(), pooledState = state)
   return createAdapter({ directState: state, pooledState,
     directOptions: { roleName: preparedOwnerName }, pooledOptions: { roleName: preparedOwnerName } });
 }
+
+describe("provider-aware initial validation entry", () => {
+  const initialProfile = "neon-pg18-initial-default-acl-v1";
+  const preparedProfile = "neon-pg18-prepared-app-owner-v1";
+  async function collected(profile: string | null = initialProfile) {
+    const state = profile === preparedProfile ? preparedOwnerState() : providerBootstrapState();
+    const adapter = profile === preparedProfile ? preparedOwnerAdapter(state) : createAdapter({ directState: state });
+    const preparedOwner = profile === preparedProfile ? { name: preparedOwnerName, database: "staging_database" } : null;
+    const evidence = await collectPreflightEvidence(adapter.directConnection, undefined,
+      { providerProfile: profile, preparedOwner });
+    const specification = await loadRepositorySpecification(repositoryRoot);
+    return { state, adapter, evidence, specification,
+      expectations: { profile, expectedExtensions: [], preparedOwner } };
+  }
+
+  it.each([initialProfile, preparedProfile])("reuses formal acceptance for %s without mutating inputs or querying", async (profile) => {
+    const input = await collected(profile);
+    const original = structuredClone([input.evidence, input.expectations, input.specification]);
+    const calls = input.adapter.directConnection.query.mock.calls.length;
+    const log = vi.spyOn(console, "log"); const error = vi.spyOn(console, "error");
+    const result = validatePreflightInitialEvidence(input.specification, input.evidence, input.expectations);
+    expect(result).toMatchObject({ initialState: "pristine", migrationHistory: { applied: 0, pending: 7 }, applicationData: 0 });
+    expect([input.evidence, input.expectations, input.specification]).toEqual(original);
+    expect(input.adapter.directConnection.query).toHaveBeenCalledTimes(calls);
+    expect(input.adapter.connect).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled(); expect(error).not.toHaveBeenCalled();
+    const formal = await runPreflight(input.adapter, profile === preparedProfile ? preparedOwnerEnvironment() : providerBootstrapEnvironment());
+    expect(formal.exitCode).toBe(0);
+    for (const [key, value] of Object.entries(result)) expect(formal[key]).toEqual(value);
+    expect(JSON.stringify(result)).not.toMatch(/cloud_admin|neondb_owner|neon_superuser|92000|91001|91002/);
+    expect(result).not.toHaveProperty("overallStatus");
+    expect(result).not.toHaveProperty("exitCode");
+  });
+
+  it("keeps omitted-profile strict and initial/prepared phases distinct", async () => {
+    const strict = await collected(null);
+    expect(() => validatePreflightInitialEvidence(strict.specification, strict.evidence, { expectedExtensions: [] }))
+      .toThrow("USER_DEFINED_OBJECT_PRESENT");
+    const initial = await collected();
+    expect(() => validatePreflightInitialEvidence(initial.specification, initial.evidence,
+      { ...initial.expectations, profile: preparedProfile })).toThrow("PREPARED_OWNER_INPUT_INVALID");
+    const prepared = await collected(preparedProfile);
+    expect(() => validatePreflightInitialEvidence(prepared.specification, prepared.evidence,
+      { ...prepared.expectations, profile: initialProfile })).toThrow("PREPARED_OWNER_INPUT_INVALID");
+    const plain = baseState(); const adapter = createAdapter({ directState: plain });
+    const evidence = await collectPreflightEvidence(adapter.directConnection);
+    expect(validatePreflightInitialEvidence(strict.specification, evidence, { expectedExtensions: [] }).initialState).toBe("pristine");
+  });
+
+  it.each(["unknown", "", undefined, false, 1])("rejects an explicit invalid profile %#", async (profile) => {
+    const input = await collected();
+    expect(() => validatePreflightInitialEvidence(input.specification, input.evidence,
+      { ...input.expectations, profile })).toThrow("PROVIDER_INITIAL_ACL_PROFILE_INVALID");
+  });
+
+  const changes: { name: string; change: (row: ReturnType<typeof providerBootstrapInventoryFixture>) => void }[] = [
+    { name: "missing ACL", change: (r) => { r.acls.pop(); r.catalog_count--; } },
+    { name: "extra ACL", change: (r) => { r.acls.push({ ...r.acls[0], signature: "other:826:91003:0" }); r.catalog_count++; } },
+    { name: "duplicate ACL", change: (r) => { r.acls[1].signature = r.acls[0].signature; } },
+    { name: "missing privilege", change: (r) => { r.acls[0].entries.pop(); } },
+    { name: "extra privilege", change: (r) => { r.acls[0].entries.push({ ...r.acls[0].entries[0], privilege: "EXECUTE" }); } },
+    { name: "duplicate privilege", change: (r) => { r.acls[0].entries.push({ ...r.acls[0].entries[0] }); } },
+    { name: "wrong grantor", change: (r) => { r.acls[0].entries[0].grantor = "unexpected_grantor"; } },
+    { name: "wrong recipient", change: (r) => { r.acls[0].entries[0].recipient = "unexpected_recipient"; } },
+    { name: "wrong schema", change: (r) => { r.acls[0].schema = "unexpected_schema"; } },
+    { name: "wrong grant option", change: (r) => { r.acls[0].entries[0].grantOption = false; } },
+    { name: "missing role", change: (r) => { r.roles.pop(); } },
+    { name: "extra role", change: (r) => { r.roles.push({ ...r.roles[0], name: "unexpected_role" }); } },
+    { name: "role attribute", change: (r) => { r.roles[1].superuser = true; } },
+    { name: "missing membership", change: (r) => { r.memberships.pop(); } },
+    { name: "extra membership", change: (r) => { r.memberships.push({ ...r.memberships[0], member: "unexpected_member" }); } },
+    { name: "duplicate membership", change: (r) => { r.memberships.push({ ...r.memberships[0] }); } },
+    { name: "membership ADMIN", change: (r) => { r.memberships[0].admin = true; } },
+    { name: "membership INHERIT", change: (r) => { r.memberships[0].inherit = false; } },
+    { name: "membership SET", change: (r) => { r.memberships[0].set = false; } },
+    { name: "membership grantor", change: (r) => { r.memberships[0].grantorIsBootstrap = false; } },
+  ];
+  it.each(changes)("rejects $name at the public entry and formal path", async ({ change }) => {
+    const input = await collected();
+    const changedProvider = providerBootstrapInventoryFixture();
+    change(changedProvider);
+    input.evidence.providerInitialAcl = changedProvider;
+    const changed = structuredClone(input.evidence);
+    let rejection;
+    try { validatePreflightInitialEvidence(input.specification, input.evidence, input.expectations); }
+    catch (error) { rejection = error; }
+    expect(rejection).toMatchObject({ code: expect.stringMatching(/^PROVIDER_INITIAL_ACL_/), exitCode: expect.any(Number) });
+    expect(input.evidence).toEqual(changed);
+    change(input.state.providerInventory);
+    const formal = await runPreflight(input.adapter, providerBootstrapEnvironment());
+    expect(formal.exitCode).not.toBe(0);
+    expect(rejection).toMatchObject({ code: formal.failure.checkId, exitCode: formal.exitCode });
+    expect(String(rejection)).not.toMatch(/unexpected_|cloud_admin|neondb_owner|neon_superuser|91001|91002/);
+  });
+
+  it.each(["serverVersion", "identity", "roleIdentity", "extensionInventory", "migrationCatalog", "migrationColumns",
+    "migrationColumnExact", "migrationPrimaryKey", "migrationHistory", "migrationExact", "userDefinedObjects", "providerInitialAcl"])
+  ("rejects missing or null collector field %s", async (key) => {
+    const input = await collected();
+    for (const value of [undefined, null]) {
+      const evidence = structuredClone(input.evidence);
+      if (value === undefined) Reflect.deleteProperty(evidence, key); else Reflect.set(evidence, key, value);
+      if (key === "migrationExact" && value === null) continue; // Collector's documented absent-ledger sentinel.
+      expect(() => validatePreflightInitialEvidence(input.specification, evidence, input.expectations)).toThrow();
+    }
+  });
+
+  it.each(["1418:94001:0", "1259:94002:0", "1255:94003:0"])("rejects unknown residual including user mapping %s", async (signature) => {
+    const input = await collected();
+    const extra = residualState("other_count", { signature }).userDefinedObjects;
+    const row = input.evidence.userDefinedObjects;
+    row.total_count++; row.other_count++;
+    for (const key of ["object_signature", "extension_classification_evidence", "extension_candidate_signature", "extension_residual_signature"])
+      row[key].push(...extra[key]);
+    expect(() => validatePreflightInitialEvidence(input.specification, input.evidence, input.expectations)).toThrow("USER_DEFINED_OBJECT_PRESENT");
+    input.state.userDefinedObjects = row;
+    expect((await runPreflight(input.adapter, providerBootstrapEnvironment())).failure.checkId).toBe("USER_DEFINED_OBJECT_PRESENT");
+  });
+
+  it("rejects ledger, incomplete specification and independent extension mismatch without overwriting expected input", async () => {
+    const input = await collected();
+    const expectedExtensions = [{ name: "plpgsql", schema: "pg_catalog", version: "1.0" }];
+    const original = structuredClone(expectedExtensions);
+    expect(() => validatePreflightInitialEvidence(input.specification, input.evidence,
+      { ...input.expectations, expectedExtensions })).toThrow("STAGING_EXTENSION_INVENTORY_MISMATCH");
+    expect(expectedExtensions).toEqual(original);
+    expect(() => validatePreflightInitialEvidence({ ...input.specification, migrations: [] }, input.evidence, input.expectations))
+      .toThrow("REPOSITORY_MIGRATION_METADATA_INVALID");
+    input.evidence.migrationHistory.push({ id: "1", hash: "unrecognized", created_at: "1" });
+    expect(() => validatePreflightInitialEvidence(input.specification, input.evidence, input.expectations)).toThrow("MIGRATION_HISTORY_UNKNOWN");
+  });
+
+  it.each(["schema_count", "relation_count", "routine_count", "type_count", "trigger_count", "rule_count",
+    "policy_count", "constraint_count", "other_count", "total_count", "estimated_data_rows",
+    "extension_unclassified_count", "extension_ambiguous_count"])
+  ("rejects incomplete or coerced %s counts and retains collector decimal strings", async (key) => {
+    const input = await collected();
+    for (const invalid of [null, undefined, false, "", "0x0", "0.0", -1]) {
+      const evidence = structuredClone(input.evidence);
+      Reflect.set(evidence.userDefinedObjects, key, invalid);
+      expect(() => validatePreflightInitialEvidence(input.specification, evidence, input.expectations))
+        .toThrow("USER_OBJECT_CATALOG_INVALID");
+    }
+    Reflect.set(input.evidence.userDefinedObjects, key, String(input.evidence.userDefinedObjects[key]));
+    expect(validatePreflightInitialEvidence(input.specification, input.evidence, input.expectations).applicationData).toBe(0);
+  });
+
+  it.each(["one missing migration", "all missing migrations", "expected extension hole", "actual extension hole", "both extension holes"])
+  ("rejects sparse independent input: %s", async (variant) => {
+    const input = await collected();
+    if (variant === "one missing migration") Reflect.deleteProperty(input.specification.migrations, "0");
+    if (variant === "all missing migrations") {
+      for (let index = 0; index < input.specification.migrations.length; index++)
+        Reflect.deleteProperty(input.specification.migrations, String(index));
+    }
+    if (variant === "expected extension hole" || variant === "both extension holes") input.expectations.expectedExtensions.length = 1;
+    if (variant === "actual extension hole" || variant === "both extension holes") input.evidence.extensionInventory.length = 1;
+    expect(() => validatePreflightInitialEvidence(input.specification, input.evidence, input.expectations)).toThrow();
+  });
+
+  it.each(["missing", "null", "invalid entry"])("matches formal input failure classification for %s expected extensions", async (variant) => {
+    const input = await collected();
+    const expectations = { ...input.expectations };
+    if (variant === "missing") Reflect.deleteProperty(expectations, "expectedExtensions");
+    else Reflect.set(expectations, "expectedExtensions", variant === "null" ? null : [{}]);
+    let rejection;
+    try { validatePreflightInitialEvidence(input.specification, input.evidence, expectations); }
+    catch (error) { rejection = error; }
+    const environment = providerBootstrapEnvironment();
+    if (variant === "missing") Reflect.deleteProperty(environment, "ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS");
+    else environment.ACTUSTUBE_EXPECTED_STAGING_EXTENSIONS = JSON.stringify({ schemaVersion: 1,
+      extensions: variant === "null" ? null : [{}] });
+    const formal = await runPreflight(createAdapter({ directState: providerBootstrapState() }), environment);
+    expect(formal.exitCode).toBe(2);
+    expect(formal.overallStatus).toBe("fail");
+    expect(rejection).toMatchObject({ code: variant === "missing" ? "STAGING_EXTENSION_INVENTORY_REQUIRED" : "STAGING_EXTENSION_INVENTORY_INVALID",
+      exitCode: formal.exitCode, status: formal.overallStatus });
+    expect(rejection).toMatchObject({ code: formal.failure.checkId });
+  });
+
+  it("rechecks prepared-owner evidence and independent owner identity at the public boundary", async () => {
+    const input = await collected(preparedProfile);
+    expect(() => validatePreflightInitialEvidence(input.specification, input.evidence,
+      { ...input.expectations, preparedOwner: { name: "other_staging_owner", database: "staging_database" } }))
+      .toThrow("PREPARED_OWNER_IDENTITY_MISMATCH");
+    input.evidence.preparedOwner.owner.createRole = true;
+    expect(() => validatePreflightInitialEvidence(input.specification, input.evidence, input.expectations)).toThrow("PREPARED_OWNER_AUTHORITY_MISMATCH");
+  });
+});
 
 describe("user mapping inventory least-privilege contract", () => {
   const mappingIds = ["1418:94001:0", "1418:94002:0", "1418:94003:0"];
