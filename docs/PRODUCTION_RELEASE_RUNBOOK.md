@@ -2,47 +2,87 @@
 
 ## 目的
 
-Production公開とDB接続を安全に保護するための手順と停止条件を定めます。2026-07-22のProduction DBパスワード認証失敗は、今回限定の例外手順、本人による単一Googleログイン、同時間帯のRuntime Log確認を経て復旧完了しました。通常のVercel環境変数変更禁止を再び全面適用します。
+Production公開とDB接続を安全に保護するための手順と停止条件を定めます。2026-07-27にProduction Persistence 500のincident remediationと動画あり最終スモークが完了しました。incident限定の変更許可は終了しており、通常のVercel環境変数変更禁止を維持します。今後同種障害が発生しても、本書の一般要件と新しいproject owner明示承認なしに環境変数変更へ進めません。
 
 ## 現在の前提
 
-以下は2026-07-23 02:10:39 JSTのProductionスナップショットです。deployment情報は確認日時に限定した状態であり、将来の作業では必ず読み取り専用で実状態を再確認してください。
+以下は2026-07-27 JSTのProductionスナップショットです。deployment情報は確認日時に限定した状態であり、後続作業の開始時に必ず読み取り専用で実状態を再確認します。
 
-- GitHub `main` は `e036d34db3939a79073fcb05db9c27acda06d0e9`
+- GitHub `main` と `origin/main` は `08ec587f7a242b40ada53a0eb69acb33ebb9253b`
 - `main` と `origin/main` は0 / 0で同期し、作業ツリーはclean
-- 正式仕様書v1.0 `docs/ACTUSTUBE_PRODUCT_SPEC.md` はmainへfast-forward統合済みで、merge commitはない
-- `7ef73eddf081cc0f558aa69e7e00af3a75f2fdbd` から `e036d34` の変更は `AGENTS.md`、正式仕様書Markdown、Project Status、本Runbookだけで、アプリコードは `7ef73ed` の内容から変わっていない
-- Vercel projectはActusTube
-- Vercel Production deploymentは `dpl_HgAsgkcPyJwkrSqgf5GCSHxqsfSn`
+- 承認済みrelease candidateは`main`へfast-forward統合済み
 - Production domainは `https://actustube.vercel.app`
-- deploymentはREADY / Currentで、source branchは `main`、commitは `e036d34db3939a79073fcb05db9c27acda06d0e9`
-- トップページ、主要CSS、主要JavaScriptはHTTP 200
-- deployment開始は2026-07-23 01:38:17 JST
-- docs-only統合と自動deploymentでは、DB、Migration、schema、データ、Vercel設定・環境変数、Neon、Google Cloudを変更していない
-- 週次改善サイクルrelease candidate `c6b403e` とGoogle OAuth callback互換性修正 `2f79fa7` はmain統合・公開済み
-- `redirect_uri_mismatch` とOAuth callbackの `missing iss` は解消済み
-- 安全な認証DB診断ログ `c3e71ff` はProduction公開済み
-- 有効なpooled接続資格情報による読み取り専用接続確認と、Vercel Productionの `DATABASE_URL` 1件の更新が完了
-- 本人による単一Googleログインに成功し、Google callbackはHTTP 302、callback直後のトップページはHTTP 200
-- 本人申告のログイン時刻周辺にGoogle callbackとHTTP 200を確認し、エラー、5xx、DB認証失敗は確認されなかった。Vercel側ログの表示時刻にはタイムゾーンまたは表示形式による差があるため、本人申告時刻との秒単位の一致は断定しない
-- Auth.jsエラー、DB同期診断ログ、DBパスワード認証失敗、Neon / PostgreSQL接続エラー、HTTP 5xxは0件
-- 以前失敗していたGoogle OAuthアカウントのDB同期境界を正常に通過し、Production DB接続復旧は正式完了
-- 復旧でrollbackは不要だった
-- Production DBは `br-blue-bonus-aza51iwc`
-- Production DBのEndpoint IDは `ep-polished-cloud-az8xdsqg`
-- Production DBのMigration履歴は0000〜0005の6件
-- Migration 0005はProduction本体へ適用済みで、再適用しない
-- ActusTube管理SchemaはMigration 0005、`schema.ts`、0005 snapshotと一致
-- 管理外のNeonサンプルテーブル `playing_with_neon` はアプリ未参照で、削除・変更しない
-- バックアップブランチでMigrationリハーサル合格済み
-- バックアップブランチ `br-crimson-shadow-azkeq0kc` は削除せず保持中
-- Production公開前バックアップ `backup-pre-release-20260721-c6b403e`（`br-withered-darkness-azjg6fpl`）はReady確認済み
-- アプリコード基準 `7ef73ed` の `npm audit` は全severity 0件
-- 所有者による単一Googleログインは成功済みだが、チャンネル・動画・分析・AI提案・利用枠・週次改善を含む認証済みProduction全機能スモークテストは未実施
+- Current Productionはsource branch `main`、source commit `08ec587f7a242b40ada53a0eb69acb33ebb9253b`、READY / Current
+- ProductionトップはHTTP 200
+- Google認証とsessionは成功し、所有チャンネルは1件取得成功
+- Migration履歴は0000〜0006の7件
+- Migration 0006は正式Production branchへexact 1回適用済みで、postflight合格
+- schema、function、owner、ACL、PUBLIC権限、security mode、固定search path、runtime role権限は期待状態
+- Migration由来の想定外データ件数変化なし
+- Migrationリハーサル用child branchとProduction復旧用backup child branchはREADYで保持中
+- Productionの`DATABASE_URL`はProduction scopeだけに維持し、Sensitiveを維持したまま、正式Production branchの公式pooled接続へ修正済み
+- PreviewとDevelopmentの`DATABASE_URL`は各0件
+- 同じsource commitを1回だけRedeployし、追加Redeploy、Promote、Rollbackなし
+- `/api/usage/status`と`/api/weekly-cycle`はHTTP 200へ復旧し、PersistenceErrorの再発なし
+- 正式Production branchへのruntime activityを確認済み
+- 所有チャンネル1件の自動選択、通常動画2本、Shorts 1本の取得に成功
+- 分析1回とAI提案1回が各HTTP 200で、履歴と利用枠は各1回分だけ増加
+- スモーク専用改善項目1件はplanned／進行中で、再取得後の永続化を確認済み
+- Browser Console error / warning、runtime error / fatal、HTTP 5xx、重複request、重複利用枠消費は0件
+- rollbackとrestoreは未実施
 
-直前のdocs-only deployment `dpl_6YzgHwYxG2w9XhwpGpZfJsjQ42sa`（`main@f6014a1`）と、直近のアプリコード公開deployment `dpl_37GSvgbM3Y23QAs9571UtAwzD42d`（`main@7ef73ed`）は比較用履歴です。Production DB接続復旧時の `dpl_Gk8TkDoUfG5dbpdn3HKpEc5k36aa`（`main@696d4b0`）、旧状態の `main` `92f834d`、旧安定版 `5964c2d`、診断ログ未公開、原因未確定、DB資格情報の復旧待ちは完了済みの監査履歴です。これらは現在のCurrentまたは自動的なrollback先ではありません。
+本docs-only同期は`main`、Production、Vercel設定、DB、Migration、Neonを変更せず、下記手順の再実行または将来の変更承認にもなりません。
 
-今回の `docs/allow-safe-docs-only-state-drift` はdocs-only状態差の限定規則を追加し、Project Statusと本Runbookを同期する文書branchです。作業branchのcommit・pushは、`main` 統合、Production操作、DB操作、設定変更を許可しません。認証済みProduction主要機能スモークは未実施です。
+## Production Persistence 500 incident remediation完了記録と再発時手順
+
+2026-07-27に完了した接続先branch不一致incidentでは、以下のgateと1回限りの手順を適用しました。今後同種障害が発生した場合は、これを一般要件として参照できますが、対象incident、source commit、変更対象、変更回数、deployment回数、スモーク範囲を新しいproject owner明示承認で固定した場合だけ発動できます。完了済みincidentまたは本docs-only工程の承認を流用してはいけません。
+
+### 2026-07-27実施時の発動前gate（監査履歴）
+
+1. `main` / `origin/main`、Current Production sourceが `08ec587f7a242b40ada53a0eb69acb33ebb9253b` と一致する。
+2. Current ProductionがREADY / Currentで、トップがHTTP 200である。
+3. Migration 0006適用済みの正式Production branch、既存database、既存runtime role、runtime用pooled endpointを、秘密値を表示せず一意に特定する。
+4. schemaの空のdefault / primary branch、Preview用branch、Migrationリハーサルbranch、Production復旧用backup branchを選択対象から除外する。
+5. Vercelの`DATABASE_URL`がProduction scopeだけに一意に存在し、Sensitiveが有効、Preview / Developmentに含まれないことをmetadataだけで確認する。
+6. 1項目でもFAILまたはNOT VERIFIEDなら、値の保存やRedeployを行わず停止する。
+
+再発時は、上記1のSHAをそのincidentについてproject ownerが明示承認した完全SHAへ置き換え、その他の対象値も現在の読み取り専用確認で固定します。2026-07-27のSHA、対象、回数、許可を将来へ流用しません。
+
+### 実施済みの1回限りの手順（再実行禁止）
+
+1. Neon Consoleで正式Production branch、既存database、既存runtime role、Connection pooling ONを確認し、公式pooled接続文字列を本人がCopyする。
+2. 接続文字列、password、token、Cookie、host、database名、role名、内部識別子をCodexが取得、表示、読み上げ、clipboard参照、手作業生成しない。
+3. 本人がVercel Productionの既存`DATABASE_URL`だけを編集し、現在値を全置換してSaveを1回だけ行う。
+4. Production更新操作について、Production scopeのみ、Sensitive有効、今回の更新時刻であることを値を再表示せず確認する。Previewだけの`DATABASE_URL`削除はこの更新より前の別の限定操作として完了済みで、Developmentとその他の環境変数は変更しない。
+5. 同じsource commitのCurrent Production deploymentを最大1回だけRedeployする。別commit、空commit、manual source変更を使用しない。
+6. Node.js 24.x、Corepack、npm 11.18.0、install、`npm run build`、READY / Current、Production domainを確認する。
+7. 新deploymentがREADY / Currentになった場合だけ、`/api/usage/status`と`/api/weekly-cycle`を認証済みChromeから各最大1回確認する。
+8. どちらかが500または結果不明なら2回目を実行せず停止する。
+9. 両APIがHTTP 200で、利用枠・履歴・leaseにGET由来の変更がなく、runtime activityが正式Production branchだけに発生した場合に限り、残りのProductionスモークを再開する。
+10. 復旧完了後は、Current Production、API結果、実行回数、安全確認をProject Statusと本Runbookへ別のdocs-only工程で再同期する。
+
+### incident中も禁止する操作
+
+- Migrationの追加・再実行、DDL、DML、GRANT、REVOKE、role、schema、function、ACLの変更
+- Neon branchの作成、削除、変更、reset、backup restore、rehearsal / backup branchの流用
+- code、test、package、lockfile、Migration SQL、`main`の変更
+- Preview / Developmentの環境変数変更、`DATABASE_URL`以外の環境変数変更、`ENABLE_EXPERIMENTAL_COREPACK`変更、Build設定変更
+- 2回目のRedeploy、Deploy、Promote、Rollback、alias手動変更
+- 接続文字列、資格情報、個人情報の表示または保存
+
+SaveやRedeployの結果が不明、source commit不一致、build失敗、READY未達、Production alias不一致、接続先不一致、重大なruntime error / fatal / 5xxがある場合は追加操作せず停止します。rollback、restore、2回目のRedeployは自動的に許可しません。
+
+### 2026-07-27完了結果
+
+- Production `DATABASE_URL`：Production scopeだけを正式Production branchの公式pooled接続へ修正。Sensitive維持
+- Preview `DATABASE_URL`：1件削除後0件。Development `DATABASE_URL`：0件のまま変更なし。その他の環境変数変更なし
+- Production Redeploy：同一source commitで1回。追加Redeploy、Promote、Rollbackなし
+- `/api/usage/status`と`/api/weekly-cycle`：HTTP 200
+- PersistenceError再発、runtime error、fatal、HTTP 5xx：0件
+- 正式Production branchへのruntime activity：確認済み
+- DBの直接修正、Migration再実行、rollback、restore、Neon branch変更：なし
+- 動画あり最終スモーク：合格。詳細は「Phase 4」と本書末尾の完了記録に記載
+- incident限定の環境変数変更許可：終了。通常の変更禁止を再適用
 
 ## 依存関係セキュリティrelease gate
 
@@ -111,9 +151,9 @@ Production DBへの任意変更、手作業のSQL修正、未レビューSQL、�
 - Migration SQLに定義された変更以外を加えず、実行時編集、既存Migration変更、再適用、手動追加SQL、部分修正、補修SQLを行わない。
 - owner名とrole名は期待値一致のbooleanだけを記録し、個別ユーザーデータを取得しない。
 
-Migration 0006を対象とするreleaseでは、対象を`drizzle/0006_usage_status_plan_snapshot.sql`へ固定します。このMigrationは4つのversion付き利用枠関数を追加し、旧`reserve_usage_limits`を互換wrapperへ置換し、ACL preflight後に旧関数のowner、ACL、security modeをversion付き関数へ継承して、固定`search_path`とPUBLIC実行権限なしを検証します。変更可能範囲は同SQLに定義された関数定義、互換wrapper、owner、ACL、security mode、search pathだけです。既存Migration 0000〜0005を変更または再適用しません。
+Migration 0006の完了済みreleaseでは、対象を`drizzle/0006_usage_status_plan_snapshot.sql`へ固定しました。このMigrationは4つのversion付き利用枠関数を追加し、旧`reserve_usage_limits`を互換wrapperへ置換し、ACL preflight後に旧関数のowner、ACL、security modeをversion付き関数へ継承して、固定`search_path`とPUBLIC実行権限なしを検証するものです。既存Migration 0000〜0005は変更または再適用していません。
 
-Migration 0006のpreflightでは履歴が0000〜0005の6件、pendingが0006だけ、0006が未適用であることを確認します。適用後は履歴が0000〜0006の7件となり、0006が1回だけ記録され、version付き関数と互換wrapperの定義・権限がMigration SQLおよび関連検証scriptと一致することを確認します。旧Productionコードが互換wrapperを通して動作可能であることもrelease gateに残します。
+適用前preflightでは履歴0000〜0005の6件とpending 0006の1件を確認し、適用後は履歴0000〜0006の7件、0006 exact 1件、version付き関数と互換wrapperの定義・権限、旧Productionコード互換性を確認しました。この記録は完了済み監査履歴であり、Migration 0006の再実行を許可しません。
 
 ### 失敗・結果不明時の停止
 
@@ -259,21 +299,21 @@ Productionへダミーや検証専用のデータを作成してはいけませ�
 
 実績：本人による単一Googleログイン、callback HTTP 302、直後のトップページHTTP 200を確認しました。Auth.jsエラー、DB認証失敗、Neon / PostgreSQL接続エラー、HTTP 5xxは確認されず、例外を終了しました。
 
-認証済みスモークテスト、AI提案、利用枠消費、週次改善項目の作成・更新はまだ行いません。
+この旧接続障害の完了後、別のproject owner明示承認に基づく2026-07-27の動画あり最終スモークで、所有チャンネル1件の自動選択、通常動画2本、Shorts 1本、分析1回、AI提案1回、履歴保存、利用枠の各1回分だけの消費、スモーク専用改善項目1件の永続化を確認しました。改善項目はplanned／進行中で残存し、編集、結果メモ、skipped、削除は行っていません。
 
 Productionでは検証専用データの作成や、その後片付けを前提とした削除を行いません。意図しないデータが作成された場合は独断で削除せず、その場で停止して対象と影響を報告してください。
 
 ## 共通停止条件
 
-以下の場合は変更操作へ進まず、進行中なら直ちに停止します。Migration 0005は適用済みのため再実行しません。従来のProduction DB保護条件も引き続き有効です。
+以下の場合は変更操作へ進まず、進行中なら直ちに停止します。Migration 0000〜0006は適用済みであり、再実行しません。従来のProduction DB保護条件も引き続き有効です。
 
 - `main`、`origin/main`、Production deploymentまたはsource commitが前提と不一致（全条件を満たすdocs-onlyスナップショット差を除く）
 - 必読文書とGit・Vercel・Neonの実状態が不一致（全条件を満たすdocs-onlyスナップショット差を除く）
 - 作業開始前に意図しないGit差分が存在
 
 - Endpoint ID不一致
-- Migration 0006適用前のpreflightでMigration履歴が0000〜0005の6件ではない、または適用後に0000〜0006の7件・0006の記録1件を確認できない
-- 0005が未適用、複数回記録、またはjournalの順序・timestampと不一致。Migration 0006を承認対象とする場合は0006の順序・timestampも同様に確認する
+- 現在のMigration履歴が0000〜0006の7件でない、または0006の記録がexact 1件でない
+- 0005または0006の記録、journal順序、timestampが期待状態と不一致
 - 既存データ件数が想定と不一致
 - 承認済みProduction Migrationで必要なsnapshotまたはbackupが一意に存在しない、利用可能状態でない、またはsourceを確認できない
 - DB変更を伴う将来作業で、必要な新規snapshotまたはbackupの作成試行、利用可能状態、source確認に失敗または結果不明
@@ -282,12 +322,12 @@ Productionでは検証専用データの作成や、その後片付けを前提�
 - 既存データ件数が変化
 - ActusTube管理対象のSchema drift
 - `playing_with_neon` がアプリから参照される、または管理Schemaと衝突する
-- Production HTTPエラー
-- Productionに新しい500
+- 復旧済みの`/api/usage/status`または`/api/weekly-cycle`がHTTP 200でない、またはPersistenceErrorが再発
+- Productionで新しいHTTPエラーまたは500
 - 意図しないProduction環境変数またはデプロイの変化
 - 意図しないGit差分
 
-Migration 0005を含む適用済みMigrationは再実行しないでください。エラー後に独自判断でSQLを編集・実行せず、Migrationファイルも編集しないでください。
+Migration 0000〜0006を再実行しないでください。エラー後に独自判断でSQLを編集・実行せず、Migrationファイルも編集しないでください。
 
 ## Phase 2・3停止条件（復旧時の監査履歴）
 
@@ -320,11 +360,11 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - パスワード、APIキー、OAuthトークン、Cookie、セッション値の表示
 - Production DBの削除・リセット
 - Productionへの未検証SQLの直接実行
-- 0000〜0005の再適用
+- 0000〜0006の再適用
 - Migrationの場当たり的な編集
 - DB関数、schema、権限の任意変更。上記の全条件を満たす明示承認済みversion管理Migrationに定義された変更だけを限定例外とする
 - Neon branchの任意作成・削除。上記の全条件を満たす明示承認済みProduction Migration直前のbackup branch最大1件・作成試行最大1回だけを限定例外とし、削除は許可しない
-- Vercel環境変数の変更。終了済みの今回限定例外は再利用しない
+- Vercel環境変数の変更。2026-07-27に終了したincident remediationの許可を将来の変更へ流用しない
 - Google Cloud設定の変更
 - 認証検証の緩和
 - 自動または複数回のGoogleログイン試行
@@ -333,7 +373,7 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - DB準備前の `main` push
 - 問題発生時の独断による連続操作
 
-## 完了条件
+## 2026-07-22旧接続障害の監査記録
 
 2026-07-22のProduction DB接続復旧は、以下をすべて満たして正式完了しました。
 
@@ -354,4 +394,31 @@ Migration 0005を含む適用済みMigrationは再実行しないでください
 - 今回限定の環境変数変更例外を終了し、通常の変更禁止規則を全面再適用
 - rollback不要
 
-第1回UI改修は `7ef73ed` としてmain統合・Production公開済みです。Production Migration限定手順の文書整合化、独立レビュー、文書commit、release candidate branchへのpush、Preview確認はProduction releaseと分離します。新しいrelease candidate確定後も、対象branch、完全SHA、対象Migration、承認範囲を固定した別のproject owner明示承認があるまでmain、Production、DB、Migration、Neon、Vercel設定・環境変数を変更しません。
+上記は終了済みの別障害に関する履歴です。2026-07-27のPersistence 500 incidentは、次節のとおり別の限定remediationとして完了しました。
+
+## 2026-07-27 Persistence 500復旧・動画あり最終スモーク完了記録
+
+次をすべて確認し、incident remediationと今回のreleaseで対象としたProduction主要導線を完了と判定しました。この記録は未実装または未確認の将来機能、Standard / Proの完成を示しません。
+
+- Productionだけの既存`DATABASE_URL`を正式Production branchの公式pooled接続へ1回更新し、Sensitiveを維持
+- Previewの`DATABASE_URL`を1件削除して0件。Developmentの`DATABASE_URL`は0件のまま変更せず、その他の環境変数変更なし
+- source commit `08ec587f7a242b40ada53a0eb69acb33ebb9253b`のRedeploy 1回。追加Redeployなし
+- build成功、READY / Current、ProductionトップHTTP 200
+- `/api/usage/status`と`/api/weekly-cycle`がHTTP 200
+- PersistenceError、runtime error、fatal、HTTP 5xxなし
+- 正式Production branchへのruntime activityを確認
+- 所有チャンネル1件を取得・自動選択し、通常動画2本、Shorts 1本を取得
+- 分析1回がHTTP 200。分析履歴0件→1件。分析時のAI同時生成・消費なし
+- AI提案1回がHTTP 200。AI提案履歴0件→1件
+- 分析の日次利用枠：使用0→1、上限2、残り2→1
+- 分析の月次利用枠：使用0→1、上限5、残り5→4
+- AI提案の日次利用枠：使用0→1、上限1、残り1→0
+- AI提案の月次利用枠：使用0→1、上限3、残り3→2
+- 処理上限：通常動画10本、Shorts 10本
+- `【Production Smoke】動画あり最終確認 2026-07-27`を1件作成し、planned／進行中と再取得後の永続化を確認。編集、結果メモ、skipped、削除なし
+- 重複request、重複利用枠消費、Browser Console error / warning：なし
+- Git、code、DB、Migration、Neon branch、backup / rehearsal branchに変更なし
+- Promote、Rollback、restore、alias手動変更なし
+- 秘密情報露出なし
+- incident限定remediationは終了し、通常のVercel環境変数変更禁止を再適用
+- 復旧後のCurrent Production状態と動画あり最終スモーク結果を正式文書へ同期

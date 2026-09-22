@@ -29,6 +29,7 @@ import { fetchOwnedYouTubeChannels } from "@/app/lib/youtube-owned-channels";
 import { finalizeChannelAnalysis } from "@/db/weekly-cycle";
 
 const FETCH_POOL_SIZE = 50;
+const NO_ANALYZABLE_VIDEOS_CODE = "NO_ANALYZABLE_VIDEOS";
 
 type YouTubeChannelListResponse = {
   items?: Array<{
@@ -294,6 +295,8 @@ export async function GET(request: NextRequest) {
         } satisfies ChannelAnalysisSnapshot;
       },
       {
+        releaseWhen: (snapshot) =>
+          snapshot.regularVideos.length === 0 && snapshot.shortVideos.length === 0,
         finalize: async (snapshot) => {
           analysisRunId = await finalizeChannelAnalysis({
             reservationId: usageResult.reservation.reservationId,
@@ -304,6 +307,16 @@ export async function GET(request: NextRequest) {
         },
       }
     );
+
+    if (result.regularVideos.length === 0 && result.shortVideos.length === 0) {
+      return NextResponse.json({
+        code: NO_ANALYZABLE_VIDEOS_CODE,
+        channelId: result.channelId,
+        channelTitle: result.channelTitle,
+        regularVideos: [],
+        shortVideos: [],
+      });
+    }
 
     if (!analysisRunId) {
       throw new Error("AnalysisHistoryFinalizationFailed");

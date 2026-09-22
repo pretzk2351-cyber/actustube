@@ -1,6 +1,7 @@
 import { auth } from "../../auth";
+import Link from "next/link";
+
 import { SignInButton, SignOutButton } from "./components/auth-buttons";
-import { YouTubeForm } from "./components/youtube-form";
 
 const publicFeatures = [
   "通常動画 10本の分析",
@@ -103,8 +104,28 @@ export default async function Home() {
             </article>
           </section>
         ) : (
-          <section aria-label="チャンネル分析と改善サイクル">
-            <YouTubeForm />
+          <section className="public-grid" aria-label="ActusTubeアプリを開く">
+            <article className="surface-card surface-card--accent">
+              <span className="eyebrow-badge">SIGNED IN</span>
+              <h2 className="surface-card__title" style={{ marginTop: "16px" }}>
+                改善ワークスペースを開く
+              </h2>
+              <p className="surface-card__copy">
+                ダッシュボードから、分析、AI提案、週次改善、履歴を画面ごとに進められます。
+              </p>
+              <Link className="workspace-button workspace-button--primary" href="/app/dashboard">
+                アプリを開く
+              </Link>
+            </article>
+            <article className="surface-card">
+              <span className="eyebrow-badge">SAFE BY DEFAULT</span>
+              <h2 className="surface-card__title" style={{ marginTop: "16px" }}>
+                所有チャンネルだけを分析
+              </h2>
+              <p className="surface-card__copy">
+                ログイン中の本人が所有するチャンネルを確認してから分析します。ページ移動だけで利用枠は消費しません。
+              </p>
+            </article>
           </section>
         )}
       </div>

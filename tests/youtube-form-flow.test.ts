@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   canRequestAIConsult,
   evaluateChannelAnalysisResponse,
+  getSafeClientApiErrorFeedback,
   getSafeClientApiErrorMessage,
+  getSafeClientNetworkErrorFeedback,
   hasUsageRemaining,
   isAIConsultButtonDisabled,
   parseOwnedChannelsResponse,
@@ -148,7 +150,7 @@ describe("YouTube form flow", () => {
     ).toBeNull();
   });
 
-  it.each([400, 401, 403, 429, 500])(
+  it.each([400, 401, 403, 409, 429, 500, 502, 504])(
     "stops after a channel analysis %s response without permitting AI consult",
     (status) => {
       const decision = evaluateChannelAnalysisResponse(status, {
@@ -192,7 +194,7 @@ describe("YouTube form flow", () => {
       analysisRunId: "3ecce3e0-2dd5-4b57-9a4a-f26b4c7793b3",
       channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
       channelTitle: "Test Channel",
-      regularVideos: [],
+      regularVideos: [{ id: "regular0001" }],
       shortVideos: [],
     });
     const requestAIConsult = vi.fn();
@@ -204,6 +206,31 @@ describe("YouTube form flow", () => {
 
     expect(decision.accepted).toBe(true);
     expect(requestAIConsult).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies a valid zero-video response as an empty result, not an error", () => {
+    const decision = evaluateChannelAnalysisResponse(200, {
+      code: "NO_ANALYZABLE_VIDEOS",
+      channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
+      channelTitle: "Test Channel",
+      regularVideos: [],
+      shortVideos: [],
+    });
+
+    expect(decision).toMatchObject({ accepted: false, kind: "empty" });
+    expect(decision.accepted ? true : decision.kind).not.toBe("error");
+  });
+
+  it("does not accept an empty successful payload without the explicit empty code", () => {
+    const decision = evaluateChannelAnalysisResponse(200, {
+      analysisRunId: "3ecce3e0-2dd5-4b57-9a4a-f26b4c7793b3",
+      channelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
+      channelTitle: "Test Channel",
+      regularVideos: [],
+      shortVideos: [],
+    });
+
+    expect(decision).toMatchObject({ accepted: false, kind: "error" });
   });
 
   it.each([
@@ -286,5 +313,43 @@ describe("YouTube form flow", () => {
     );
     expect(message).not.toContain(internalMessage);
     expect(message).not.toContain("aiSummary.channelTitle");
+  });
+
+  it.each([
+    [401, "ログインが必要です", "再ログイン"],
+    [403, "所有チャンネルとして確認できません", "所有・管理権限"],
+    [409, "同じ処理が実行中です", "操作を繰り返さず"],
+    [500, "処理を完了できませんでした", "データ保存または内部処理"],
+    [502, "外部サービスに接続できませんでした", "動画が0件の状態とは異なります"],
+    [504, "通信が完了しませんでした", "利用枠の状態を自動確認"],
+  ] as const)(
+    "maps %s without exposing internal or secret values",
+    (status, title, expectedMessage) => {
+      const feedback = getSafeClientApiErrorFeedback(
+        status,
+        {
+          error: "SQLSTATE 23505 postgresql://role:password@example.test/db",
+          token: "secret-token",
+        },
+        "channel_analysis"
+      );
+
+      expect(feedback.title).toBe(title);
+      expect(feedback.message).toContain(expectedMessage);
+      expect(JSON.stringify(feedback)).not.toMatch(
+        /SQLSTATE|postgresql|password|secret-token|23505/i
+      );
+    }
+  );
+
+  it.each([
+    ["network", true, "利用枠の現在値は自動確認しました。"],
+    ["timeout", false, "利用枠の現在値を確認できませんでした。"],
+  ] as const)("maps a %s failure using the usage refresh result", (kind, confirmed, expected) => {
+    const feedback = getSafeClientNetworkErrorFeedback(kind, confirmed);
+
+    expect(feedback.message).toContain(expected);
+    expect(feedback.message).toContain("同じ操作を連打せず");
+    expect(feedback.retry).toBe("none");
   });
 });

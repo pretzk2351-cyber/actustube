@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { BetaOnboardingGuide } from "@/app/components/beta-onboarding-guide";
 import { WeeklyImprovementCycle } from "@/app/components/weekly-improvement-cycle";
 import {
   AnalysisFlowGuide,
@@ -12,12 +13,14 @@ import {
 import {
   canRequestAIConsult,
   evaluateChannelAnalysisResponse,
-  getSafeClientApiErrorMessage,
+  getSafeClientApiErrorFeedback,
+  getSafeClientNetworkErrorFeedback,
   hasUsageRemaining,
   isAIConsultButtonDisabled,
   parseOwnedChannelsResponse,
   parseUsageStatusResponse,
   type ClientUsageStatus,
+  type ClientErrorFeedback,
   type OwnedChannelOption,
 } from "@/app/lib/youtube-form-flow";
 
@@ -62,6 +65,13 @@ type ChannelAnalysisResult = {
   regularVideos: Video[];
   shortVideos: Video[];
 };
+
+type AnalysisProgressPhase =
+  | "idle"
+  | "preparing"
+  | "requesting"
+  | "applying"
+  | "complete";
 
 const EMPTY_VIDEOS: Video[] = [];
 
@@ -612,11 +622,22 @@ export function YouTubeForm() {
   const [loading, setLoading] = useState(false);
   const [analysisResult, setAnalysisResult] =
     useState<ChannelAnalysisResult | null>(null);
-  const [error, setError] = useState("");
+  const [analysisEmpty, setAnalysisEmpty] = useState<{
+    channelTitle: string;
+  } | null>(null);
+  const [analysisProgress, setAnalysisProgress] =
+    useState<AnalysisProgressPhase>("idle");
+  const [analysisHistoryCount, setAnalysisHistoryCount] = useState<
+    number | null
+  >(null);
+  const [error, setError] = useState<ClientErrorFeedback | null>(null);
   const [consultLoading, setConsultLoading] = useState(false);
-  const [consultError, setConsultError] = useState("");
+  const [consultError, setConsultError] =
+    useState<ClientErrorFeedback | null>(null);
   const [consult, setConsult] = useState<AIConsultResult | null>(null);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
+  const analysisRequestInFlight = useRef(false);
+  const consultRequestInFlight = useRef(false);
 
   const channelTitle = analysisResult?.channelTitle ?? "";
   const regularVideos = analysisResult?.regularVideos ?? EMPTY_VIDEOS;
@@ -631,19 +652,30 @@ export function YouTubeForm() {
         cache: "no-store",
         signal,
       });
-      const data = (await response.json()) as unknown;
+      const data = (await response.json().catch(() => null)) as unknown;
       const parsed = response.ok ? parseUsageStatusResponse(data) : null;
-      if (!parsed) throw new Error("UsageStatusUnavailable");
-      if (signal?.aborted) return false;
+      if (!parsed) {
+        if (signal?.aborted) return null;
+        setUsageStatus(null);
+        setUsageError(
+          getSafeClientApiErrorFeedback(
+            response.status,
+            data,
+            "usage_status"
+          ).message
+        );
+        return null;
+      }
+      if (signal?.aborted) return null;
       setUsageStatus(parsed);
-      return true;
+      return parsed;
     } catch {
-      if (signal?.aborted) return false;
+      if (signal?.aborted) return null;
       setUsageStatus(null);
       setUsageError(
-        "利用枠を確認できませんでした。安全のため分析とAI提案を停止しています。"
+        "利用枠を確認できませんでした。安全のため分析とAI提案を停止しています。再読み込みしてから確認してください。"
       );
-      return false;
+      return null;
     } finally {
       if (!signal?.aborted) setUsageLoading(false);
     }
@@ -658,9 +690,21 @@ export function YouTubeForm() {
         cache: "no-store",
         signal,
       });
-      const data = (await response.json()) as unknown;
+      const data = (await response.json().catch(() => null)) as unknown;
       const channels = response.ok ? parseOwnedChannelsResponse(data) : null;
-      if (!channels) throw new Error("OwnedChannelsUnavailable");
+      if (!channels) {
+        if (signal?.aborted) return;
+        setOwnedChannels([]);
+        setSelectedOwnedChannelId("");
+        setChannelsError(
+          getSafeClientApiErrorFeedback(
+            response.status,
+            data,
+            "owned_channels"
+          ).message
+        );
+        return;
+      }
       if (signal?.aborted) return;
       setOwnedChannels(channels);
       setSelectedOwnedChannelId(channels.length === 1 ? channels[0].id : "");
@@ -684,28 +728,41 @@ export function YouTubeForm() {
   }, [loadOwnedChannels, loadUsageStatus]);
 
   const handleOwnedChannelChange = (channelId: string) => {
+    if (analysisRequestInFlight.current || consultRequestInFlight.current) return;
     setSelectedOwnedChannelId(channelId);
     setAnalysisResult(null);
+    setAnalysisEmpty(null);
+    setAnalysisProgress("idle");
     setConsult(null);
-    setError("");
-    setConsultError("");
+    setError(null);
+    setConsultError(null);
   };
 
   const handleFetch = async () => {
+    if (analysisRequestInFlight.current) return;
+
     if (!selectedOwnedChannelId || !usageStatus) {
-      setError(
-        "所有チャンネルと利用枠を確認できるまで分析を開始できません。"
-      );
+      setError({
+        title: "分析を開始できません",
+        message:
+          "所有チャンネルと利用枠を確認できるまで分析を開始できません。画面を再読み込みして確認してください。",
+        requiresUsageRefresh: false,
+        retry: "none",
+      });
       return;
     }
 
+    analysisRequestInFlight.current = true;
     setLoading(true);
-    setError("");
+    setAnalysisProgress("preparing");
+    setError(null);
     setAnalysisResult(null);
+    setAnalysisEmpty(null);
     setConsult(null);
-    setConsultError("");
+    setConsultError(null);
 
     try {
+      setAnalysisProgress("requesting");
       const res = await fetch(
         `/api/youtube/channel?channelId=${encodeURIComponent(selectedOwnedChannelId)}`
       );
@@ -716,16 +773,31 @@ export function YouTubeForm() {
       try {
         data = JSON.parse(text) as unknown;
       } catch {
-        setError("チャンネル分析に失敗しました。時間をおいてもう一度お試しください。");
+        const feedback = getSafeClientApiErrorFeedback(
+          res.status || 500,
+          null,
+          "channel_analysis"
+        );
+        setError(feedback);
+        if (feedback.requiresUsageRefresh) await loadUsageStatus();
+        setAnalysisProgress("idle");
         return;
       }
 
       const decision = evaluateChannelAnalysisResponse(res.status, data);
       if (!decision.accepted) {
-        setError(decision.message);
+        if (decision.kind === "empty") {
+          setAnalysisEmpty({ channelTitle: decision.empty.channelTitle.trim() });
+          await loadUsageStatus();
+        } else {
+          setError(decision.feedback);
+          if (decision.feedback.requiresUsageRefresh) await loadUsageStatus();
+        }
+        setAnalysisProgress("idle");
         return;
       }
 
+      setAnalysisProgress("applying");
       setAnalysisResult({
         analysisRunId: decision.analysis.analysisRunId,
         channelId: decision.analysis.channelId,
@@ -735,10 +807,22 @@ export function YouTubeForm() {
       });
       setHistoryRefreshKey((current) => current + 1);
       await loadUsageStatus();
-    } catch {
-      setError("チャンネル分析に失敗しました。時間をおいてもう一度お試しください。");
+      setAnalysisProgress("complete");
+    } catch (caught) {
+      const refreshedUsage = await loadUsageStatus();
+      setError(
+        getSafeClientNetworkErrorFeedback(
+          caught instanceof DOMException &&
+            (caught.name === "AbortError" || caught.name === "TimeoutError")
+            ? "timeout"
+            : "network",
+          refreshedUsage !== null
+        )
+      );
+      setAnalysisProgress("idle");
     } finally {
       setLoading(false);
+      analysisRequestInFlight.current = false;
     }
   };
 
@@ -770,19 +854,26 @@ export function YouTubeForm() {
   );
 
   const handleConsult = async () => {
+    if (consultRequestInFlight.current) return;
+
     if (
       !consultPayload ||
       !usageStatus ||
       !hasUsageRemaining(usageStatus.usage.aiConsult)
     ) {
-      setConsultError(
-        "有効な分析結果と利用可能なAI提案枠を確認できません。"
-      );
+      setConsultError({
+        title: "AI提案を開始できません",
+        message:
+          "有効な分析結果と利用可能なAI提案枠を確認できません。分析結果と利用枠を確認してください。",
+        requiresUsageRefresh: false,
+        retry: "none",
+      });
       return;
     }
 
+    consultRequestInFlight.current = true;
     setConsultLoading(true);
-    setConsultError("");
+    setConsultError(null);
     setConsult(null);
 
     try {
@@ -803,28 +894,44 @@ export function YouTubeForm() {
       try {
         data = JSON.parse(text) as unknown;
       } catch {
-        setConsultError(
-          "AI提案の生成に失敗しました。時間をおいてもう一度お試しください。"
+        const feedback = getSafeClientApiErrorFeedback(
+          res.status || 500,
+          null,
+          "ai_consult"
         );
+        setConsultError(feedback);
+        if (feedback.requiresUsageRefresh) await loadUsageStatus();
         return;
       }
 
       if (!res.ok) {
-        setConsultError(
-          getSafeClientApiErrorMessage(res.status, data, "ai_consult")
+        const feedback = getSafeClientApiErrorFeedback(
+          res.status,
+          data,
+          "ai_consult"
         );
+        setConsultError(feedback);
+        if (feedback.requiresUsageRefresh) await loadUsageStatus();
         return;
       }
 
       setConsult(data as AIConsultResult);
       setHistoryRefreshKey((current) => current + 1);
       await loadUsageStatus();
-    } catch {
+    } catch (caught) {
+      const refreshedUsage = await loadUsageStatus();
       setConsultError(
-        "AI提案の生成に失敗しました。時間をおいてもう一度お試しください。"
+        getSafeClientNetworkErrorFeedback(
+          caught instanceof DOMException &&
+            (caught.name === "AbortError" || caught.name === "TimeoutError")
+            ? "timeout"
+            : "network",
+          refreshedUsage !== null
+        )
       );
     } finally {
       setConsultLoading(false);
+      consultRequestInFlight.current = false;
     }
   };
 
@@ -871,9 +978,21 @@ export function YouTubeForm() {
     usageReady: !usageLoading && usageStatus !== null,
     hasAIUsageRemaining: aiUsageRemaining,
   });
+  const analysisProgressTitle =
+    analysisProgress === "preparing"
+      ? "分析を準備しています"
+      : analysisProgress === "requesting"
+        ? "動画の取得と分析を行っています"
+        : analysisProgress === "applying"
+          ? "結果を反映しています"
+          : analysisProgress === "complete"
+            ? "分析が完了しました"
+            : "";
 
   return (
     <div style={styles.page}>
+      <BetaOnboardingGuide analysisHistoryCount={analysisHistoryCount} />
+
       <section
         className="youtube-preflight-grid"
         aria-label="分析前の利用枠と所有チャンネル確認"
@@ -1016,13 +1135,39 @@ export function YouTubeForm() {
               : "選択した所有チャンネルだけを分析します。"}
       </p>
 
-      {channelsError && <StatusPanel tone="error" title={channelsError} />}
-      {usageError && <StatusPanel tone="error" title={usageError} />}
-      {error && <StatusPanel tone="error" title={error} />}
-      {consultError && <StatusPanel tone="error" title={consultError} />}
-      {loading && (
-        <StatusPanel tone="loading" title="チャンネルを分析しています">
-          通常動画とショートの取得、集計、履歴保存を行っています。このままお待ちください。
+      {channelsError && <StatusPanel tone="error" title="所有チャンネルを確認できません">{channelsError}</StatusPanel>}
+      {usageError && <StatusPanel tone="error" title="利用枠を確認できません">{usageError}</StatusPanel>}
+      {error && (
+        <StatusPanel tone="error" title={error.title}>
+          {error.message}
+        </StatusPanel>
+      )}
+      {consultError && (
+        <StatusPanel tone="error" title={consultError.title}>
+          {consultError.message}
+        </StatusPanel>
+      )}
+      {analysisEmpty && !loading && (
+        <StatusPanel
+          tone="empty"
+          title="分析できる動画が見つかりませんでした"
+        >
+          <p>
+            {analysisEmpty.channelTitle}には、現在ActusTubeが取得できる通常動画またはShortsがありません。
+          </p>
+          <p>
+            YouTubeへ動画を投稿した後、もう一度分析してください。動画が0件の場合は、分析・AI提案の利用枠を消費せず、分析履歴も作成しません。
+          </p>
+        </StatusPanel>
+      )}
+      {loading && analysisProgressTitle && (
+        <StatusPanel tone="loading" title={analysisProgressTitle}>
+          リクエストの応答を待っています。表示は確認できたUI状態を示すもので、サーバー内部の細かな処理段階や進捗率を示すものではありません。
+        </StatusPanel>
+      )}
+      {!loading && analysisProgress === "complete" && analysisResult && (
+        <StatusPanel tone="success" title={analysisProgressTitle}>
+          分析結果と現在の利用枠を画面へ反映しました。
         </StatusPanel>
       )}
       {consultLoading && (
@@ -1030,11 +1175,27 @@ export function YouTubeForm() {
           現在の分析データをもとに改善候補を整理しています。
         </StatusPanel>
       )}
-      {!channelTitle && !loading && !error && !channelsError && (
-        <StatusPanel tone="info" title="所有チャンネルを確認してください">
-          所有チャンネルを選び「分析する」を選ぶと、現状と根拠データを確認できます。
-        </StatusPanel>
-      )}
+      {!channelTitle &&
+        !analysisEmpty &&
+        !loading &&
+        !error &&
+        !channelsError &&
+        selectedOwnedChannel &&
+        analysisHistoryCount === 0 && (
+          <StatusPanel tone="info" title="分析を始める準備ができました">
+            所有チャンネルは確認済みです。「分析する」を押すと通常動画とShortsを取得します。どちらか一方だけでも分析でき、両方とも見つからない場合は利用枠を消費せずに案内を表示します。
+          </StatusPanel>
+        )}
+      {!channelTitle &&
+        !analysisEmpty &&
+        !loading &&
+        !error &&
+        !channelsError &&
+        (!selectedOwnedChannel || analysisHistoryCount !== 0) && (
+          <StatusPanel tone="info" title="所有チャンネルを確認してください">
+            所有チャンネルを選び「分析する」を押すと、現状と根拠データを確認できます。
+          </StatusPanel>
+        )}
 
       {channelTitle && <AnalysisFlowGuide hasRecommendation={consult !== null} />}
 
@@ -1224,6 +1385,7 @@ export function YouTubeForm() {
           consult?.currentImprovements[0] ?? consult?.nextSuggestions[0] ?? ""
         }
         refreshKey={historyRefreshKey}
+        onHistoryCountChange={setAnalysisHistoryCount}
       />
 
       {channelTitle && (
